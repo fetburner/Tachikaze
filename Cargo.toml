@@ -1,0 +1,9 @@
+[package]
+name = "tachikaze"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.4", features = ["derive"] }
+mp4-atom = "0.14"
