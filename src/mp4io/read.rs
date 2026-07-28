@@ -93,24 +93,25 @@ mod tests {
     use super::*;
 
     /// フィクスチャ: H.264 (Avc1) + Opus, GOP 120, 30000/1001fps の mp4。
-    /// 生成手順は issue #15 で整備される想定（tests/fixtures/sample.mp4）。
-    ///
-    /// 実行環境にフィクスチャが無いため #[ignore] にしている。手元では以下の
-    /// ffmpeg コマンドで生成した一時ファイルに対して実行し、通ることを確認済み:
-    ///
-    /// ```sh
-    /// ffmpeg -y -f lavfi -i "testsrc=size=320x240:rate=30000/1001:duration=5" \
-    ///   -f lavfi -i "sine=frequency=1000:duration=5" \
-    ///   -c:v libx264 -pix_fmt yuv420p -g 120 -keyint_min 120 -sc_threshold 0 \
-    ///   -c:a libopus \
-    ///   tests/fixtures/sample.mp4
-    /// ```
-    ///
-    /// フィクスチャが揃ったら #[ignore] を外す。
+    /// `tests/fixtures/gen.sh`（issue #15）で生成する。無ければスキップする。
+    const FIXTURE: &str = "tests/fixtures/sample.mp4";
+
+    fn skip_if_fixture_missing() -> bool {
+        if std::path::Path::new(FIXTURE).exists() {
+            return false;
+        }
+        eprintln!(
+            "{FIXTURE} が無いためスキップします。`tests/fixtures/gen.sh` を実行してください。"
+        );
+        true
+    }
+
     #[test]
-    #[ignore = "tests/fixtures/sample.mp4 が未整備（issue #15 待ち）"]
     fn finds_video_and_audio_tracks_with_distinct_timescales() {
-        let moov = read_moov("tests/fixtures/sample.mp4").expect("moov を読めること");
+        if skip_if_fixture_missing() {
+            return;
+        }
+        let moov = read_moov(FIXTURE).expect("moov を読めること");
 
         let (_video_trak, video_info) =
             find_video_track(&moov).expect("映像トラックが 1 本見つかること");
@@ -124,9 +125,11 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "tests/fixtures/sample.mp4 が未整備（issue #15 待ち）"]
     fn codec_kinds_match_expected_material() {
-        let moov = read_moov("tests/fixtures/sample.mp4").expect("moov を読めること");
+        if skip_if_fixture_missing() {
+            return;
+        }
+        let moov = read_moov(FIXTURE).expect("moov を読めること");
 
         let (video_trak, _) = find_video_track(&moov).expect("映像トラックが見つかること");
         let (audio_trak, _) = find_audio_track(&moov).expect("音声トラックが見つかること");
