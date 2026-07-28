@@ -13,9 +13,16 @@ mod trim;
 mod verify;
 mod workdir;
 
+use clap::Parser;
+use cli::{Cli, Commands};
+
 fn main() -> anyhow::Result<()> {
-    println!("Hello, world!");
-    Ok(())
+    let cli = Cli::parse();
+
+    match cli.command {
+        Commands::Analyze { .. } => unimplemented!(),
+        Commands::Cut { .. } => unimplemented!(),
+    }
 }
 
 #[cfg(test)]
@@ -27,7 +34,12 @@ mod tests {
         let ftyp = Ftyp {
             major_brand: b"isom".into(),
             minor_version: 512,
-            compatible_brands: vec![b"isom".into(), b"iso2".into(), b"avc1".into(), b"mp41".into()],
+            compatible_brands: vec![
+                b"isom".into(),
+                b"iso2".into(),
+                b"avc1".into(),
+                b"mp41".into(),
+            ],
         };
 
         let mut buf = Vec::new();
