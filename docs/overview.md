@@ -18,7 +18,7 @@ Amatsukaze は MPEG2-TS を入力して CM カットとエンコードを行い 
 | mp4 の読み書きコードを書く | [mp4-atom.md](mp4-atom.md) |
 | 外部ツールを macOS でビルドする | [toolchain-macos.md](toolchain-macos.md) |
 | 実測値（GOP 長・カット精度・検出品質）を見る | [measurements.md](measurements.md) |
-| 次に何を実装すべきか知る | [implementation-plan.md](implementation-plan.md) |
+| 次に何を実装すべきか知る / **実装タスクの issue を辿る** | [implementation-plan.md](implementation-plan.md) |
 
 ## スコープ
 

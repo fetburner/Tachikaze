@@ -2,7 +2,7 @@
 
 mp4 に変換済みの録画ファイルを、**再エンコードせずに CM カット**するツール。CM 検出は既存ツール（chapter_exe → join_logo_scp）に任せ、本ツールは「Trim リスト → ロスレス出力」だけを担う。
 
-**状態**: 設計と実現可能性の検証は完了。実装は未着手。言語は Rust、mp4 の読み書きは `mp4-atom` クレート。
+**状態**: 設計と実現可能性の検証は完了。実装は未着手だが**タスク分解は完了して issue になっている**（下記）。言語は Rust、mp4 の読み書きは `mp4-atom` クレート。
 
 ## ドキュメント
 
@@ -18,8 +18,29 @@ docs/lossless-cut.md        カット処理の実装知識
 docs/mp4-atom.md            mp4 読み書きの検証済みコードと落とし穴
 docs/toolchain-macos.md     外部ツールのビルド手順
 docs/measurements.md        実測データ
-docs/implementation-plan.md 実装計画と未解決事項
+docs/implementation-plan.md 実装計画と未解決事項 + issue 一覧と並列実行の波
 ```
+
+## 実装タスク（issue）
+
+**実装するときはエピック issue ではなくサブ issue を 1 件受け取り、その本文だけを読んで作業する。**
+各サブ issue に「読む文書」「先行」「同時可」「触るファイル」が書いてあるので、他の issue や
+docs を横断して読む必要はない。
+
+| エピック | 内容 | サブ issue | lane |
+|---|---|---|---|
+| [#3](../../issues/3) | プロジェクト基盤と CLI 骨格 | #11〜#15 | `lane:infra` |
+| [#4](../../issues/4) | 共通型と入出力フォーマットのパーサ | #16〜#19 | `lane:base` |
+| [#5](../../issues/5) | analyze コマンド（外部ツールの起動と `--report`） | #20〜#24 | `lane:analyze` |
+| [#6](../../issues/6) | mp4 サンプル表の読み込みと整合性検証 | #25〜#28 | `lane:mp4` |
+| [#7](../../issues/7) | cut の映像パス | #29〜#32 | `lane:mp4` |
+| [#8](../../issues/8) | cut の音声パス | #33〜#35 | `lane:mp4` |
+| [#9](../../issues/9) | 自己検証 | #36〜#37 | `lane:mp4` |
+| [#10](../../issues/10) | 本番品質の mp4 出力（`backlog`） | #38〜#41 | `lane:mp4` |
+
+**着手順**: #11 を単独で通す → 残りは `lane:analyze`（解析側）と `lane:mp4`（カット側）を
+並行して進められる。依存関係と並列実行の波は
+[docs/implementation-plan.md](docs/implementation-plan.md) の「issue とレーン」節。
 
 ## 静かに壊れる 3 つの罠
 

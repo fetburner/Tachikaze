@@ -33,15 +33,29 @@ tachikaze cut IN.mp4 --trim trim.avs -o OUT.mp4 [--snap outward|inward]
 
 ## モジュール分割
 
-| モジュール | 責務 | 参照 |
-|---|---|---|
-| `external` | 外部プロセスの起動と出力の回収 | [pipeline.md](pipeline.md) |
-| `trim` | `Trim(a,b)++…` のパース / 生成 | 半開区間に正規化する（`Trim(s,e)` → `[s, e+1)`） |
-| `dtvi` | `.dtvi` のパース（タブ区切りテキスト） | [pipeline.md](pipeline.md) |
-| `mp4io` | サンプル表の読み込みと書き出し | [mp4-atom.md](mp4-atom.md) |
-| `plan` | キーフレーム境界へのスナップ、区間の計画 | [lossless-cut.md](lossless-cut.md) |
-| `audio` | 音声パケットの選択とドリフト補正 | [lossless-cut.md](lossless-cut.md) |
-| `verify` | 自己検証 | 下記 |
+**この分割は並列実装のためのファイル所有権の単位でもある。** 1 ファイルを触る issue が
+なるべく 1 つに収まるよう決めてあるので、勝手に統合・分割しないこと。
+
+| ファイル | 責務 | 担当 issue | 参照 |
+|---|---|---|---|
+| `cli.rs` | サブコマンドとオプションの定義 | #12 | — |
+| `tools.rs` | 外部ツールと JL ファイルの探索 | #13 | [toolchain-macos.md](toolchain-macos.md) |
+| `external.rs` | 外部プロセスの起動と出力の回収 | #20 | [pipeline.md](pipeline.md) |
+| `workdir.rs` | 作業ディレクトリと symlink | #21 | [toolchain-macos.md](toolchain-macos.md) |
+| `order.rs` | `DisplayIdx` / `DecodeIdx` | #16 | 下記「型設計の要点」 |
+| `trim.rs` | `Trim(a,b)++…` のパース / 生成 | #17 | 半開区間に正規化する（`Trim(s,e)` → `[s, e+1)`） |
+| `dtvi.rs` | `.dtvi` のパース（タブ区切りテキスト） | #18 | [pipeline.md](pipeline.md) |
+| `jls.rs` | `detail.jls` のパース | #19 | [pipeline.md](pipeline.md) |
+| `analyze.rs` | analyze コマンドの組み立て | #22 | [jls-settings.md](jls-settings.md) |
+| `report/mod.rs` | `--report` の出力 | #23 | [measurements.md](measurements.md) |
+| `report/missed.rs` | 見逃し候補の警告 | #24 | [jls-settings.md](jls-settings.md) |
+| `mp4io/read.rs` | サンプル表の読み込み | #25 #26 | [mp4-atom.md](mp4-atom.md) |
+| `mp4io/order_map.rs` | 表示順↔デコード順の写像 | #27 | [pipeline.md](pipeline.md) |
+| `mp4io/support.rs` | 未対応構成の判定 | #28 | 下記「未解決事項」 |
+| `mp4io/write.rs` | mp4 の書き出し | #31 | [mp4-atom.md](mp4-atom.md) |
+| `plan.rs` | キーフレーム境界へのスナップ、区間の計画 | #29 #30 | [lossless-cut.md](lossless-cut.md) |
+| `audio.rs` | 音声パケットの選択とドリフト補正 | #33 #34 | [lossless-cut.md](lossless-cut.md) |
+| `verify.rs` | 自己検証 | #36 #37 | 下記 |
 
 ## 型設計の要点
 
@@ -76,6 +90,62 @@ struct DecodeIdx(u32);    // デコード順（mp4 のサンプル番号 / .dtvi
 4. **自己検証を組み込む**
 
 手順 2 の骨格は検証コード 153 行として既に存在する（[mp4-atom.md](mp4-atom.md) に転記済み）。
+
+## issue とレーン
+
+タスク分解は GitHub issue にしてある（**エピック 8 件 + サブ issue 31 件**）。
+エピックは進捗の入れ物なので、**実装はサブ issue 単位で受け取る。**
+各サブ issue に「読む文書」「先行」「同時可」「触るファイル」が書いてあり、
+それだけ読めば作業できるようになっている。
+
+| エピック | サブ issue | lane |
+|---|---|---|
+| [#3](../../../issues/3) プロジェクト基盤と CLI 骨格 | #11 cargo 初期化 / #12 CLI 骨格 / #13 ツール探索 / #14 CI / #15 フィクスチャ | `lane:infra` |
+| [#4](../../../issues/4) 共通型と入出力パーサ | #16 `DisplayIdx`/`DecodeIdx` / #17 Trim / #18 `.dtvi` / #19 `detail.jls` | `lane:base` |
+| [#5](../../../issues/5) analyze コマンド | #20 プロセス起動 / #21 作業ディレクトリ / #22 3 ツール実行 / #23 `--report` / #24 見逃し警告 | `lane:analyze` |
+| [#6](../../../issues/6) mp4 の読み込み | #25 moov / #26 サンプル表 / #27 順序写像と `.dtvi` 突き合わせ / #28 未対応構成 | `lane:mp4` |
+| [#7](../../../issues/7) cut の映像パス | #29 スナップ / #30 keep リスト / #31 書き出し / #32 CRC32 検証 | `lane:mp4` |
+| [#8](../../../issues/8) cut の音声パス | #33 ドリフト補正 / #34 A/V ずれ統計 / #35 集合比較検証 | `lane:mp4` |
+| [#9](../../../issues/9) 自己検証 | #36 区間 assert と出力破棄 / #37 `--verify` | `lane:mp4` |
+| [#10](../../../issues/10) 本番品質の mp4 出力 | #38 stts/ctts 圧縮 / #39 インターリーブ / #40 co64 / #41 elst・複数 stsd | `lane:mp4` `backlog` |
+
+### レーン
+
+| lane | 意味 |
+|---|---|
+| `lane:base` | 両レーンの土台（#11 #16 #17 #18）。ここが詰まると全体が止まる |
+| `lane:infra` | 他と独立。好きな時に差し込める |
+| `lane:analyze` | 解析レーン（外部ツール側） |
+| `lane:mp4` | mp4 レーン（カット処理側） |
+
+**解析レーンと mp4 レーンは並行して進められる。** `--report` が必要とするキーフレーム位置を
+`.dtvi` から取る設計にしてあり（#23）、analyze 側が mp4 の読み込みに一切依存しないため。
+**この性質を崩さないこと**（キーフレーム位置を mp4 から取る実装に変えると 2 レーンが直列化する）。
+
+### 並列実行の波
+
+| 波 | 同時に着手できる issue |
+|---|---|
+| 1 | **#11 のみ**（`Cargo.toml` を占有する。以降の全依存元） |
+| 2 | #12 #14 #15 #16 #19 #20 **#25** |
+| 3 | #13 #17 #18 #21 **#26** |
+| 4 | #22 #23 #24 **#27** #28 |
+| 5 | **#29** #31 |
+| 6 | **#30** #33 |
+| 7 | #32 #34 #35 |
+| 8 | **#36** → #37 |
+| 9 | #38 → #39 → #40（直列）, #41（独立） |
+
+太字が臨界パス: **#11 → #25 → #26 → #27 → #29 → #30 → #36 → #37 の 8 段。**
+
+### 直列にせざるを得ない箇所
+
+- **#11 は単独。** 依存クレートをここで全部入れて、後続に `Cargo.toml` を触らせない
+- **#36 → #37** は `verify.rs` を共有する
+- **#38 → #39 → #40** はいずれも `mp4io/write.rs` の同じ書き出し関数を書き換える。
+  worktree を分けても衝突するので並列にしない
+- **#31 は #30 を待たない。** 入力は `Vec<DecodeIdx>` なので手書きの keep リストで実装できる。
+  前倒しすると臨界パスが 1 段短くなる
 
 ## スコープ外（再掲）
 
