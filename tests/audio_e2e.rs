@@ -1213,6 +1213,44 @@ fn aac_cut_is_bitwise_copy_and_preserves_segment_positions_and_av_sync() {
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }
 
+/// #47: Opus / AAC 以外の実コーデックとして FLAC を smoke E2E する。
+///
+/// `--verify` 付きで複数区間を cut し、認識・自己検証・音声 CRC32 比較までを通す。
+/// FLAC 固有の復号や再構成は行わず、入力の `fLaC` サンプルエントリを clone して
+/// パケット列だけをビットコピーできることを確認する。
+#[test]
+#[ignore = "tests/fixtures/sample_flac.mp4 と ffmpeg/ffprobe が必要。tests/fixtures/gen.sh を先に実行すること"]
+fn flac_cut_smoke_is_bitwise_copy() {
+    let fixture = common::fixture_path_named("sample_flac.mp4");
+    if common::skip_if_fixture_missing_at(&fixture)
+        || skip_if_missing("ffmpeg")
+        || skip_if_missing("ffprobe")
+    {
+        return;
+    }
+
+    let (tmp_dir, out_path) = run_cut_with_fixture(&fixture, "flac");
+
+    let src_codec = ffprobe_scalar_stream_entry(&fixture, "a:0", "stream=codec_name");
+    let out_codec = ffprobe_scalar_stream_entry(&out_path, "a:0", "stream=codec_name");
+    assert_eq!(src_codec, "flac");
+    assert_eq!(out_codec, src_codec);
+
+    let src_set = ffprobe_audio_crc_set(&fixture);
+    let out_set = ffprobe_audio_crc_set(&out_path);
+    let diff = packets_only_in_output(&out_set, &src_set);
+    assert!(diff.is_empty(), "{}", describe_diff(&diff));
+
+    let out_dts = ffprobe_audio_dts(&out_path);
+    assert!(!out_dts.is_empty(), "FLAC 音声パケットが出力されていない");
+    assert!(
+        is_strictly_increasing(&out_dts),
+        "FLAC 音声パケットの dts が単調増加でない: {out_dts:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
 /// 完了条件3: 意図的に壊した出力で差分が検出されることを確認する。
 ///
 /// `cut` の正常な出力をコピーし、**音声パケット1個のバイトを1つだけ反転**させて

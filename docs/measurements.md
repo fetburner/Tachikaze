@@ -29,9 +29,10 @@ A/V pts 関係を確認したもの。「認識のみ・未検証」は `is_audi
 
 | Codec | 状況 | 備考 |
 |---|---|---|
-| `Opus` | **E2E 済み** | 既存フィクスチャ `sample.mp4`。20ms グリッド、先頭パケットが priming で長い |
-| `Mp4a`（AAC） | **E2E 済み** | フィクスチャ `sample_aac.mp4`。1024 サンプル ≒ 21.3ms @48kHz |
-| `Flac` / `Ac3` / `Eac3` | 認識のみ・未検証 | ffmpeg で生成可能。smoke E2E は #47（backlog） |
+| `Opus` | **E2E 済み** | `sample.mp4`。通常 960 サンプル（20ms @48kHz）、先頭 3852 / 末尾 312 サンプル |
+| `Mp4a`（AAC） | **E2E 済み** | `sample_aac.mp4`。通常 1024 サンプル（約 21.3ms @48kHz）、先頭 3204 サンプル |
+| `Flac` | **smoke E2E 済み** | `sample_flac.mp4`。通常 4608 サンプル（96ms @48kHz）、先頭 7812 サンプル。複数区間 cut + `--verify` CRC32 一致 |
+| `Ac3` / `Eac3` | 認識のみ・未検証 | ffmpeg で生成可能だが、実カットは未確認 |
 | `Samr` / `Ipcm` / `Fpcm` / `Sowt` / `Twos` / `Lpcm` / `In24` / `In32` / `Fl32` / `Fl64` / `S16l` | 認識のみ・未検証 | mp4 コンテナでのフィクスチャ生成が容易でないものを含む。認識はするが実カットは未確認 |
 
 ## ファイル別

@@ -6,8 +6,9 @@
 # IDRなし・オープンGOPなし)を持つ小さな mp4 を、音声コーデック別に合成する。
 #
 # 生成物:
-#   sample.mp4      H.264 + Opus（既存 E2E 用）
-#   sample_aac.mp4  H.264 + AAC / Mp4a（#42 非 Opus E2E 用）
+#   sample.mp4       H.264 + Opus（既存 E2E 用）
+#   sample_aac.mp4   H.264 + AAC / Mp4a（#42 非 Opus E2E 用）
+#   sample_flac.mp4  H.264 + FLAC（#47 追加 Codec smoke E2E 用）
 #
 # 使い方: bash tests/fixtures/gen.sh
 set -euo pipefail
@@ -45,3 +46,4 @@ generate_fixture() {
 
 generate_fixture sample.mp4 libopus -b:a 96k
 generate_fixture sample_aac.mp4 aac -b:a 128k
+generate_fixture sample_flac.mp4 flac
