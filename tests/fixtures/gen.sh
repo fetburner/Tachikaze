@@ -9,6 +9,9 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
+# -use_editlist 0: ffmpeg は既定で Opus のプリスキップ分を edit list (elst) で
+# 補正するが、対象の実素材には elst が無い想定（mp4io::support が elst を
+# 未検証として拒否する）。付けないとこのフィクスチャ自身が拒否されてしまう。
 ffmpeg -y \
   -f lavfi -i "testsrc2=size=640x360:rate=30000/1001" \
   -f lavfi -i "sine=frequency=440:sample_rate=48000" \
@@ -16,4 +19,5 @@ ffmpeg -y \
   -c:v libx264 -pix_fmt yuv420p \
   -g 120 -keyint_min 120 -sc_threshold 0 -bf 2 -x264-params open-gop=0 \
   -c:a libopus -b:a 96k \
+  -use_editlist 0 \
   sample.mp4
