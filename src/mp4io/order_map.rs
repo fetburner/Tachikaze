@@ -105,6 +105,25 @@ impl DisplayDecodeMap {
             .checked_sub(1)
             .map(|idx| self.sync_decode_indices[idx])
     }
+
+    /// 同期サンプルの `DisplayIdx` を昇順に並べたもの。
+    ///
+    /// 閉じた GOP では GOP は決定順・表示順のどちらで見ても同じフレーム集合の
+    /// 塊になる（GOP 内の並べ替えは GOP をまたがない）。そのため同期サンプル
+    /// （＝各 GOP の先頭）どうしの相対順序はデコード順でも表示順でも一致し、
+    /// `sync_decode_indices` を表示順に変換するだけで表示順のリストが得られる
+    /// （念のため昇順ソートしてから返す）。
+    ///
+    /// `plan`（#29）がキーフレーム境界スナップを表示順で行うために使う。
+    pub fn sync_display_indices(&self) -> Vec<DisplayIdx> {
+        let mut indices: Vec<DisplayIdx> = self
+            .sync_decode_indices
+            .iter()
+            .filter_map(|&decode| self.order.to_display(decode))
+            .collect();
+        indices.sort();
+        indices
+    }
 }
 
 /// `.dtvi`（`dtvi`）の全行が自前導出（`map`）と一致するか検証する。
@@ -377,6 +396,58 @@ mod tests {
         assert!(
             message.contains('3'),
             "同値だったデコード順インデックス3を含むこと: {message}"
+        );
+    }
+
+    #[test]
+    fn sync_display_indices_are_sorted_ascending_across_gops() {
+        // 2 GOP、それぞれ I P b b（デコード順）。GOP内の並べ替えは既存の
+        // reordered_samples() と同じパターンだが、GOPをまたいだ相対順序は
+        // デコード順・表示順のどちらで見ても一致するはず。
+        fn gop(base_offset: u64) -> Vec<SampleInfo> {
+            vec![
+                SampleInfo {
+                    file_offset: base_offset,
+                    size: 10,
+                    duration: 1000,
+                    cts_offset: 0,
+                    is_sync: true,
+                },
+                SampleInfo {
+                    file_offset: base_offset + 10,
+                    size: 10,
+                    duration: 1000,
+                    // 元の reordered_samples() では 3000 だが、それだと合成時刻が
+                    // 次の GOP の先頭 (dts の切れ目) と衝突するため、GOP の
+                    // duration 合計 (4000) を超えない値に下げる。
+                    cts_offset: 2500,
+                    is_sync: false,
+                },
+                SampleInfo {
+                    file_offset: base_offset + 20,
+                    size: 10,
+                    duration: 1000,
+                    cts_offset: -1000,
+                    is_sync: false,
+                },
+                SampleInfo {
+                    file_offset: base_offset + 30,
+                    size: 10,
+                    duration: 1000,
+                    cts_offset: -1000,
+                    is_sync: false,
+                },
+            ]
+        }
+
+        let mut samples = gop(0);
+        samples.extend(gop(40));
+
+        let map = DisplayDecodeMap::build(&samples).expect("同値は無いはず");
+        assert_eq!(
+            map.sync_display_indices(),
+            vec![DisplayIdx(0), DisplayIdx(4)],
+            "GOPをまたいでも同期サンプルの表示順は昇順のはず"
         );
     }
 
