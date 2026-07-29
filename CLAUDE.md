@@ -37,7 +37,7 @@ $ cargo test -- --ignored     # E2E（要 ffmpeg / ffprobe とフィクスチャ
 $ bash tests/fixtures/gen.sh   # フィクスチャ生成（コミットされていない）
 ```
 
-フィクスチャの**音声は時間変化する信号**にしてある（定常サイン波では全 Opus パケットが同一バイト列になり、罠 4 を検出できない）。映像側のパラメータを変えると `tests/data/sample.dtvi` が使えなくなるので変えないこと。
+フィクスチャの**音声は時間変化する信号**にしてある（定常サイン波ではコーデックによって音声パケットが同一バイト列になり、罠 4 を検出できない）。`gen.sh` は Opus 版 `sample.mp4` と AAC 版 `sample_aac.mp4` を同じ映像条件で生成する。映像側のパラメータを変えると `tests/data/sample.dtvi` が使えなくなるので変えないこと。
 
 ## 静かに壊れる 4 つの罠
 
@@ -66,6 +66,6 @@ $ bash tests/fixtures/gen.sh   # フィクスチャ生成（コミットされ�
 
 ## 前提
 
-- 対象ファイルは H.264 + **Opus**（AAC ではない）、GOP は 120 フレーム固定でシーンチェンジ由来の IDR なし
+- 映像は H.264、音声は `mp4-atom` が認識する音声 Codec 全般（代表例 Opus / AAC=`Mp4a`。判定は `src/mp4io/read.rs::is_audio_codec`、対応一覧と検証状況は [docs/mp4-atom.md](docs/mp4-atom.md)）。GOP は 120 フレーム固定でシーンチェンジ由来の IDR なし
 - キーフレーム境界に丸めるため**カット境界あたり平均 2.1〜2.5 秒の CM が残る**。これは許容する方針で決定済み
 - 開発・実行は macOS arm64。Amatsukaze 本体は移植しない（Windows API を 500 箇所以上使用）
