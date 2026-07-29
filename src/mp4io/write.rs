@@ -50,6 +50,47 @@ fn mdat_body_start(ftyp_len: u64, mdat_body_len: u64) -> anyhow::Result<u64> {
     Ok(start)
 }
 
+/// `kept` の `duration` 列をランレングス圧縮して `stts` のエントリ列にする。
+///
+/// 1サンプル1エントリだと10万サンプルで `stts` が800KBになる
+/// (docs/mp4-atom.md「本実装で直すべき点」)。固定フレームレートの映像・音声では
+/// 同じ `duration` が連続するため、連続区間をまとめれば大幅に小さくなる。
+fn run_length_encode_stts(kept: &[SampleInfo]) -> Vec<SttsEntry> {
+    let mut entries: Vec<SttsEntry> = Vec::new();
+    for s in kept {
+        match entries.last_mut() {
+            Some(last) if last.sample_delta == s.duration => {
+                last.sample_count += 1;
+            }
+            _ => entries.push(SttsEntry {
+                sample_count: 1,
+                sample_delta: s.duration,
+            }),
+        }
+    }
+    entries
+}
+
+/// `kept` の `cts_offset` 列をランレングス圧縮して `ctts` のエントリ列にする。
+///
+/// `stts` と同じ理由で圧縮する。`sample_offset` は負値も取り得るが、
+/// グループ判定は単純な等値比較でよい。
+fn run_length_encode_ctts(kept: &[SampleInfo]) -> Vec<CttsEntry> {
+    let mut entries: Vec<CttsEntry> = Vec::new();
+    for s in kept {
+        match entries.last_mut() {
+            Some(last) if last.sample_offset == s.cts_offset => {
+                last.sample_count += 1;
+            }
+            _ => entries.push(CttsEntry {
+                sample_count: 1,
+                sample_offset: s.cts_offset,
+            }),
+        }
+    }
+    entries
+}
+
 /// トラックごとの keep リスト(出力に含める順の `DecodeIdx`)から実際の
 /// `SampleInfo` を引く。範囲外の `DecodeIdx` はエラーにする。
 fn resolve_kept_samples(
@@ -191,22 +232,10 @@ pub fn write_mp4<P: AsRef<Path>>(
             },
         };
         stbl.stts = Stts {
-            entries: kept
-                .iter()
-                .map(|s| SttsEntry {
-                    sample_count: 1,
-                    sample_delta: s.duration,
-                })
-                .collect(),
+            entries: run_length_encode_stts(kept),
         };
         stbl.ctts = original_stbl.ctts.as_ref().map(|_| Ctts {
-            entries: kept
-                .iter()
-                .map(|s| CttsEntry {
-                    sample_count: 1,
-                    sample_offset: s.cts_offset,
-                })
-                .collect(),
+            entries: run_length_encode_ctts(kept),
         });
         // stss は1始まりの「出力側」サンプル番号。
         stbl.stss = original_stbl.stss.as_ref().map(|_| Stss {
@@ -609,6 +638,221 @@ mod tests {
             assert_eq!(
                 got, want,
                 "{selector} のパケットが CRC32 単位で完全一致すること(無劣化の検証)"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    // --- run_length_encode_stts / run_length_encode_ctts: ランレングス圧縮 ---
+
+    /// テスト用に `SampleInfo` を作る。`file_offset`/`size`/`is_sync` は
+    /// このテストの主眼(duration/cts_offset の圧縮)に関係しないので固定値でよい。
+    fn sample_info(duration: u32, cts_offset: i64) -> SampleInfo {
+        SampleInfo {
+            file_offset: 0,
+            size: 0,
+            duration,
+            cts_offset,
+            is_sync: false,
+        }
+    }
+
+    /// 圧縮済みの `stts` エントリ列を展開して、サンプルごとの `duration` 列に戻す。
+    fn expand_stts(entries: &[SttsEntry]) -> Vec<u32> {
+        entries
+            .iter()
+            .flat_map(|e| std::iter::repeat_n(e.sample_delta, e.sample_count as usize))
+            .collect()
+    }
+
+    /// 圧縮済みの `ctts` エントリ列を展開して、サンプルごとの `cts_offset` 列に戻す。
+    fn expand_ctts(entries: &[CttsEntry]) -> Vec<i64> {
+        entries
+            .iter()
+            .flat_map(|e| std::iter::repeat_n(e.sample_offset, e.sample_count as usize))
+            .collect()
+    }
+
+    #[test]
+    fn run_length_encode_stts_expands_back_to_original_durations() {
+        // 固定フレームレート区間(3001が10個)のあとに1個だけ違う値、
+        // その後また同じ値が続く、という典型的な構成。
+        let durations = [3001, 3001, 3001, 3001, 3001, 3002, 3001, 3001, 3001, 3001];
+        let kept: Vec<SampleInfo> = durations.iter().map(|&d| sample_info(d, 0)).collect();
+
+        let encoded = run_length_encode_stts(&kept);
+
+        // 3区間(3001が5個、3002が1個、3001が4個)にまとまっているはず。
+        assert_eq!(encoded.len(), 3);
+
+        let expanded = expand_stts(&encoded);
+        assert_eq!(expanded, durations.to_vec());
+    }
+
+    #[test]
+    fn run_length_encode_stts_handles_all_same_duration() {
+        let kept: Vec<SampleInfo> = (0..50).map(|_| sample_info(3003, 0)).collect();
+        let encoded = run_length_encode_stts(&kept);
+
+        assert_eq!(encoded.len(), 1);
+        assert_eq!(encoded[0].sample_count, 50);
+        assert_eq!(encoded[0].sample_delta, 3003);
+
+        let expanded = expand_stts(&encoded);
+        assert_eq!(expanded, vec![3003; 50]);
+    }
+
+    #[test]
+    fn run_length_encode_stts_handles_empty_input() {
+        let kept: Vec<SampleInfo> = Vec::new();
+        let encoded = run_length_encode_stts(&kept);
+        assert!(encoded.is_empty());
+    }
+
+    #[test]
+    fn run_length_encode_ctts_expands_back_to_original_offsets_including_negative() {
+        // 罠: sample_offset は i64 で負値も含む。B フレームの並べ替えで
+        // 表示順がデコード順より前に来るケースがあるため、負値を必ずテストする。
+        let offsets: Vec<i64> = vec![0, 0, 0, -1024, -1024, 512, 512, 512, -3, 0, 0];
+        let kept: Vec<SampleInfo> = offsets.iter().map(|&o| sample_info(3001, o)).collect();
+
+        let encoded = run_length_encode_ctts(&kept);
+
+        // 連続する値ごとにまとまっているので、5区間になるはず
+        // (0x3, -1024x2, 512x3, -3x1, 0x2)。
+        assert_eq!(encoded.len(), 5);
+
+        let expanded = expand_ctts(&encoded);
+        assert_eq!(expanded, offsets);
+    }
+
+    #[test]
+    fn run_length_encode_ctts_handles_all_same_offset() {
+        let kept: Vec<SampleInfo> = (0..50).map(|_| sample_info(3003, -7)).collect();
+        let encoded = run_length_encode_ctts(&kept);
+
+        assert_eq!(encoded.len(), 1);
+        assert_eq!(encoded[0].sample_count, 50);
+        assert_eq!(encoded[0].sample_offset, -7);
+
+        let expanded = expand_ctts(&encoded);
+        assert_eq!(expanded, vec![-7; 50]);
+    }
+
+    #[test]
+    fn run_length_encode_stts_compresses_hundred_thousand_constant_fps_samples() {
+        // 55分素材相当: 30fps なら約60fps基準のtimescaleで3001刻み、
+        // 約10万サンプル。すべて同じ duration の合成データ。
+        const N: usize = 100_000;
+        let kept: Vec<SampleInfo> = (0..N).map(|_| sample_info(3001, 0)).collect();
+
+        let encoded = run_length_encode_stts(&kept);
+
+        assert!(
+            encoded.len() <= 50,
+            "固定フレームレートの10万サンプルなら数十エントリ以下になるはず(実際: {})",
+            encoded.len()
+        );
+        assert_eq!(
+            encoded.len(),
+            1,
+            "全サンプル同じ duration なら1エントリになるはず"
+        );
+
+        let expanded = expand_stts(&encoded);
+        assert_eq!(expanded.len(), N);
+        assert!(expanded.iter().all(|&d| d == 3001));
+    }
+
+    #[test]
+    fn run_length_encode_ctts_compresses_hundred_thousand_samples_with_few_distinct_offsets() {
+        // 55分素材相当の10万サンプルで、cts_offset は数種類の値が
+        // ある程度長い連続区間を作りながら繰り返す、という現実的な合成データ
+        // (B フレームの並べ替えパターンが周期的に繰り返される想定)。
+        const N: usize = 100_000;
+        let pattern: [i64; 4] = [0, 3001, -3001, 0];
+        let mut kept: Vec<SampleInfo> = Vec::with_capacity(N);
+        let mut i = 0;
+        while kept.len() < N {
+            let offset = pattern[i % pattern.len()];
+            // 各値を1000サンプル連続させる(GOP相当のまとまりを模す)。
+            for _ in 0..1000 {
+                if kept.len() >= N {
+                    break;
+                }
+                kept.push(sample_info(3001, offset));
+            }
+            i += 1;
+        }
+
+        let encoded = run_length_encode_ctts(&kept);
+
+        assert!(
+            encoded.len() <= 200,
+            "1000サンプルごとにしか値が変わらないなら数百エントリ以下になるはず(実際: {})",
+            encoded.len()
+        );
+
+        let expanded = expand_ctts(&encoded);
+        let original: Vec<i64> = kept.iter().map(|s| s.cts_offset).collect();
+        assert_eq!(expanded, original);
+    }
+
+    /// フィクスチャで実際に `write_mp4` を呼び、圧縮後の `moov` サイズが
+    /// サンプル数に対して小さいことを確認する。完了条件は「圧縮前の実装との
+    /// 比較」ではなく「エントリ数がサンプル数より大幅に少ない」こと。
+    #[test]
+    fn write_mp4_compresses_stts_ctts_entry_count_far_below_sample_count() {
+        if skip_if_fixture_missing() {
+            return;
+        }
+
+        let moov = crate::mp4io::read::read_moov(FIXTURE).expect("moov を読めること");
+        let (video_trak, _) =
+            crate::mp4io::read::find_video_track(&moov).expect("映像トラックがあること");
+        let video_samples = samples(&video_trak.mdia.minf.stbl);
+
+        let keep_per_track: Vec<Vec<DecodeIdx>> = moov
+            .trak
+            .iter()
+            .map(|trak| {
+                let n = samples(&trak.mdia.minf.stbl).len();
+                (0..n as u32).map(DecodeIdx).collect()
+            })
+            .collect();
+
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "tachikaze-write-mp4-test-moov-size-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&tmp_dir).expect("一時ディレクトリを作れること");
+        let out_path = tmp_dir.join("out_moov_size.mp4");
+
+        write_mp4(FIXTURE, out_path.to_str().unwrap(), &moov, &keep_per_track)
+            .expect("write_mp4 が成功すること");
+
+        let out_moov = crate::mp4io::read::read_moov(&out_path).expect("出力の moov を読めること");
+        let (out_video_trak, _) =
+            crate::mp4io::read::find_video_track(&out_moov).expect("映像トラックがあること");
+        let out_stbl = &out_video_trak.mdia.minf.stbl;
+
+        assert!(
+            !video_samples.is_empty(),
+            "フィクスチャに映像サンプルがあること(テストの前提)"
+        );
+        assert!(
+            out_stbl.stts.entries.len() < video_samples.len(),
+            "stts のエントリ数({})がサンプル数({})より大幅に少ないこと",
+            out_stbl.stts.entries.len(),
+            video_samples.len()
+        );
+        if let Some(ctts) = &out_stbl.ctts {
+            assert!(
+                ctts.entries.len() < video_samples.len(),
+                "ctts のエントリ数({})がサンプル数({})より大幅に少ないこと",
+                ctts.entries.len(),
+                video_samples.len()
             );
         }
 
