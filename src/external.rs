@@ -136,9 +136,8 @@ fn absolutize_program(program: &str) -> anyhow::Result<PathBuf> {
     if path.is_absolute() || path.components().count() == 1 {
         return Ok(path.to_path_buf());
     }
-    absolutize_path(path).with_context(|| {
-        format!("実行ファイルの絶対パス解決に失敗しました: {program}")
-    })
+    absolutize_path(path)
+        .with_context(|| format!("実行ファイルの絶対パス解決に失敗しました: {program}"))
 }
 
 #[cfg(test)]
@@ -191,10 +190,8 @@ mod tests {
         // 呼び出し元 cwd 基準で解決できることを確認する。
         let _guard = CWD_LOCK.lock().unwrap();
 
-        let root = std::env::temp_dir().join(format!(
-            "tachikaze-external-rel-{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("tachikaze-external-rel-{}", std::process::id()));
         let tool_dir = root.join("tools");
         let work_dir = root.join("work");
         fs::create_dir_all(&tool_dir).unwrap();
