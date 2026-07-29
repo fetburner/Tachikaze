@@ -5,7 +5,7 @@
 //! 壊れる」可能性がある未検証パスであり、`--force` のような続行フラグは
 //! 用意しない(誤った出力を作れる経路を残さないため)。
 //!
-//! 検出する5条件は docs/implementation-plan.md の「未解決事項」に対応する:
+//! 検出する5条件は docs/architecture.md の「未対応の入力」に対応する:
 //!
 //! - `elst`(edit list)の存在 — サンプルを削った後にタイムラインが整合する
 //!   とは限らない
@@ -20,7 +20,7 @@
 //! ## `elst` と複数 `stsd` エントリを明示エラーのまま残す理由(#41 で調査済み)
 //!
 //! どちらも「対応する実装を書く」より「明示エラーを維持する」方針に決めた。
-//! 根拠は docs/implementation-plan.md の「未解決事項」に書いてあるが、要点だけ:
+//! 根拠は docs/architecture.md の「未対応の入力」に書いてあるが、要点だけ:
 //!
 //! - `elst`: `ffmpeg`(既定設定、`-use_editlist 0` を付けない)で実際に elst 付き
 //!   mp4 を作り、`check_supported` をバイパスして `write_mp4` に通す実験をした。
@@ -139,7 +139,7 @@ fn check_track_counts(moov: &Moov) -> Result<(), UnsupportedInput> {
 /// 先頭の正当なフレームを数フレーム分スキップする(実機で確認)。削除して先頭を
 /// 0 に正規化する対応も、サンプル削除に合わせて再計算する対応も、対象素材
 /// (elst を持たない配信系トランスコード)には需要がないため見送り、明示エラーを
-/// 維持する。詳細は docs/implementation-plan.md の「未解決事項」。
+/// 維持する。詳細は docs/architecture.md の「未対応の入力」。
 fn check_no_edit_list(moov: &Moov) -> Result<(), UnsupportedInput> {
     let has_elst = moov
         .trak

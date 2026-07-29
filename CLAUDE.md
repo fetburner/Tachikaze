@@ -2,7 +2,15 @@
 
 mp4 に変換済みの録画ファイルを、**再エンコードせずに CM カット**するツール。CM 検出は既存ツール（chapter_exe → join_logo_scp）に任せ、本ツールは「Trim リスト → ロスレス出力」だけを担う。
 
-**状態**: 設計と実現可能性の検証は完了。実装は未着手だが**タスク分解は完了して issue になっている**（下記）。言語は Rust、mp4 の読み書きは `mp4-atom` クレート。
+**状態**: **実装完了**（当初のエピック 8 件・サブ issue 31 件はすべてクローズ済み。経緯は `git log` の `[E1-1]`〜`[E8-4]`）。言語は Rust、mp4 の読み書きは `mp4-atom` クレート。
+
+```console
+$ tachikaze analyze IN.mp4 -o trim.avs --report --work-dir work
+$ tachikaze cut IN.mp4 --trim trim.avs -o OUT.mp4 --dtvi work/work.mp4.dtvi
+```
+
+現在のコマンド構成・モジュール構成・自己検証の一覧は
+[docs/architecture.md](docs/architecture.md)。
 
 ## ドキュメント
 
@@ -18,31 +26,20 @@ docs/lossless-cut.md        カット処理の実装知識
 docs/mp4-atom.md            mp4 読み書きの検証済みコードと落とし穴
 docs/toolchain-macos.md     外部ツールのビルド手順
 docs/measurements.md        実測データ
-docs/implementation-plan.md 実装計画と未解決事項 + issue 一覧と並列実行の波
+docs/architecture.md        現在の構成・自己検証・未対応の入力・未解決事項
 ```
 
-## 実装タスク（issue）
+## テスト
 
-**実装するときはエピック issue ではなくサブ issue を 1 件受け取り、その本文だけを読んで作業する。**
-各サブ issue に「読む文書」「先行」「同時可」「触るファイル」が書いてあるので、他の issue や
-docs を横断して読む必要はない。
+```console
+$ cargo test                  # 単体テスト
+$ cargo test -- --ignored     # E2E（要 ffmpeg / ffprobe とフィクスチャ）
+$ bash tests/fixtures/gen.sh   # フィクスチャ生成（コミットされていない）
+```
 
-| エピック | 内容 | サブ issue | lane |
-|---|---|---|---|
-| [#3](../../issues/3) | プロジェクト基盤と CLI 骨格 | #11〜#15 | `lane:infra` |
-| [#4](../../issues/4) | 共通型と入出力フォーマットのパーサ | #16〜#19 | `lane:base` |
-| [#5](../../issues/5) | analyze コマンド（外部ツールの起動と `--report`） | #20〜#24 | `lane:analyze` |
-| [#6](../../issues/6) | mp4 サンプル表の読み込みと整合性検証 | #25〜#28 | `lane:mp4` |
-| [#7](../../issues/7) | cut の映像パス | #29〜#32 | `lane:mp4` |
-| [#8](../../issues/8) | cut の音声パス | #33〜#35 | `lane:mp4` |
-| [#9](../../issues/9) | 自己検証 | #36〜#37 | `lane:mp4` |
-| [#10](../../issues/10) | 本番品質の mp4 出力（`backlog`） | #38〜#41 | `lane:mp4` |
+フィクスチャの**音声は時間変化する信号**にしてある（定常サイン波では全 Opus パケットが同一バイト列になり、罠 4 を検出できない）。映像側のパラメータを変えると `tests/data/sample.dtvi` が使えなくなるので変えないこと。
 
-**着手順**: #11 を単独で通す → 残りは `lane:analyze`（解析側）と `lane:mp4`（カット側）を
-並行して進められる。依存関係と並列実行の波は
-[docs/implementation-plan.md](docs/implementation-plan.md) の「issue とレーン」節。
-
-## 静かに壊れる 3 つの罠
+## 静かに壊れる 4 つの罠
 
 いずれも**エラーを出さずに間違った結果を生む**。コードを書く前に必ず確認すること。
 
@@ -50,7 +47,22 @@ docs を横断して読む必要はない。
 
 2. **無劣化の検証に md5 を使わない。** `h264_mp4toannexb` が IDR ごとに SPS/PPS を再挿入するため、バイト数が一致してもハッシュがずれる。ffprobe の `-show_data_hash CRC32` でパケット単位に比較する。→ [docs/lossless-cut.md](docs/lossless-cut.md)
 
-3. **表示順とデコード順を型で分ける。** 混同が唯一の重大バグ源で、間違った位置で切っても例外は飛ばない。`.dtvi` のフレーム番号と自前導出の一致を assert する。→ [docs/implementation-plan.md](docs/implementation-plan.md)
+3. **表示順とデコード順を型で分ける。** 混同が唯一の重大バグ源で、間違った位置で切っても例外は飛ばない。`.dtvi` のフレーム番号と自前導出の一致を assert する。→ [docs/architecture.md](docs/architecture.md)
+
+4. **音声パケットは「区間先頭サンプルのソース上の DTS」から引き当てる。** 出力側の累積時間を起点に詰めると**長さは合うのに中身が別の位置の音声になる**。合成時刻（pts）を使うと `cts_offset`（並べ替え深度 = 実測 67ms）ぶん**音声が映像より先行する**。どちらも実際に起きた。パケットの集合比較も区間ごとの長さ比較も素通りするので、「元ファイルと出力で『映像 pts − 音声 pts』が保たれているか」を見る検査が必要。→ [docs/lossless-cut.md](docs/lossless-cut.md)
+
+## ドキュメントと issue を最新に保つ
+
+**コードを変えたら同じ変更でドキュメントを直す。** 実装が全部終わった後も「未実装」「〜すべき」が複数残っていた実例がある（`stts`/`ctts` の圧縮、co64、見逃し候補の警告はいずれも実装済みなのに「本実装で直すべき点」として残っていた）。次に読む人が既にあるものを作りかける。
+
+- **ドキュメントとコードが食い違ったらコードが正。** 直すのはドキュメント側。ただし「なぜそうしたか」はコードに書けないので、判断の根拠だけはドキュメントに残す
+- **「未実装」「未検証」「〜すべき」と書いた行は、実装したら消す。** 残す価値があるのは「**なぜ実装しないと決めたか**」（[docs/architecture.md](docs/architecture.md) の「未対応の入力」がその形）
+- **実測値は歴史的記録なので消さない。** ただし**その測定で何を見ていなかったか**を併記する（「合計値しか見ていない」と書いてあったおかげで音声の位置ずれの原因を特定できた）
+- **静かに壊れた実例は再現手順ごと残す**（[docs/lossless-cut.md](docs/lossless-cut.md) の「実際に起きた誤り」）。上の「罠」の節に足すのは**実際に壊れたもの**だけにする。仮説は足さない
+- **新しく判明した未対応事項は [docs/architecture.md](docs/architecture.md) の「未解決事項」に足す。** issue は実装が終わったらクローズし、方針を変えたときは該当コードの doc comment とドキュメントの両方に書く
+- **ドキュメントを改名・移動したら `grep -rn '<旧ファイル名>' --include='*.rs' --include='*.md'` で参照を直す。** `src/` のコメントがドキュメントを節名つきで参照している箇所がある
+
+**実測** / **未検証** の使い分けは [docs/overview.md](docs/overview.md) の「記述の約束」。
 
 ## 前提
 
