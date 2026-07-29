@@ -18,7 +18,7 @@
 use anyhow::{bail, Result};
 
 use crate::cli::Snap;
-use crate::order::DisplayIdx;
+use crate::order::{DecodeIdx, DisplayIdx, OrderMap};
 use crate::trim::TrimList;
 
 /// スナップ前後の1境界（開始または終了）。
@@ -107,6 +107,47 @@ pub fn snap(
     }
 
     Ok(snapped)
+}
+
+/// スナップ済み区間から、出力に含める映像サンプルの `DecodeIdx` の列を作る。
+///
+/// 唯一の規則（docs/lossless-cut.md「【最重要】切り出しはパケット数で行う」節）:
+///
+/// > S の同期サンプルから、デコード順にちょうど `E - S` パケット取る
+///
+/// 閉じた GOP なら常に成立する（2 つの IDR の間にあるデコード順パケットの集合 ==
+/// その間に表示されるフレームの集合）。並べ替え深度を知る必要はなく、時間指定
+/// （`ffmpeg -t` 相当）も一切使わない。区間ごとに:
+///
+/// 1. 開始 `S`（表示順。`snap()` により同期サンプル上にあることが保証されている）に
+///    対応する `DecodeIdx` を [`OrderMap::to_decode`] で引く。
+/// 2. そこからデコード順に連番で `E - S` 個取る。
+///
+/// 全区間分を連結したものを返す。
+pub fn keep_list(snapped: &[SnappedRange], order: &OrderMap) -> Result<Vec<DecodeIdx>> {
+    let mut result = Vec::new();
+
+    for range in snapped {
+        let start_display = range.start.snapped;
+        let end_display = range.end.snapped;
+        let count = end_display - start_display; // DisplayIdx の Sub -> u32（フレーム数）
+
+        let start_decode = order.to_decode(start_display).ok_or_else(|| {
+            anyhow::anyhow!(
+                "表示順インデックス {} に対応するデコード順インデックスが見つかりません",
+                start_display.0
+            )
+        })?;
+
+        for offset in 0..count {
+            let decode = start_decode.checked_add(offset).ok_or_else(|| {
+                anyhow::anyhow!("デコード順インデックスの計算がオーバーフローしました")
+            })?;
+            result.push(decode);
+        }
+    }
+
+    Ok(result)
 }
 
 /// `sync` のうち `value` **以下で最大**の要素を返す（無ければ `None`）。
@@ -294,5 +335,134 @@ mod tests {
 
         let result = snap(&trim, &sync, 300, Snap::Outward).expect("should not overlap");
         assert_eq!(as_pairs(&result), vec![(0, 100), (200, 300)]);
+    }
+
+    use std::collections::BTreeSet;
+
+    /// 3 GOP（各 4 フレーム）分の `OrderMap` を合成する。各 GOP は
+    /// 表示順 `I B B P`・デコード順 `I P B B` という典型的な B フレーム並べ替えを
+    /// 模している（`order.rs` のテストにある並べ替えパターンを GOP 単位に拡張したもの）。
+    /// 各 GOP は閉じている（デコード順のブロックが GOP をまたがない）ので、
+    /// GOP の先頭（同期サンプル）だけがデコード順ブロックの先頭になる。
+    fn three_gop_order_map() -> OrderMap {
+        let mut pairs = Vec::new();
+        for gop in 0..3u32 {
+            let d = gop * 4; // display の GOP 先頭
+            let c = gop * 4; // decode の GOP 先頭
+            pairs.push((DisplayIdx(d), DecodeIdx(c))); // I（同期サンプル）
+            pairs.push((DisplayIdx(d + 3), DecodeIdx(c + 1))); // P（2 番目にデコード）
+            pairs.push((DisplayIdx(d + 1), DecodeIdx(c + 2))); // B（3 番目にデコード、2 番目に表示）
+            pairs.push((DisplayIdx(d + 2), DecodeIdx(c + 3))); // B（4 番目にデコード、3 番目に表示）
+        }
+        OrderMap::new(pairs)
+    }
+
+    fn three_gop_sync_display() -> Vec<DisplayIdx> {
+        vec![DisplayIdx(0), DisplayIdx(4), DisplayIdx(8)]
+    }
+
+    /// snap() を経由せず、同期サンプル上にある区間を直接 `SnappedRange` として組み立てる
+    /// （`snap()` が「S は同期サンプル上」を保証するという前提を直接利用する）。
+    fn range_on_sync(start: u32, end: u32) -> SnappedRange {
+        SnappedRange {
+            start: SnappedBoundary::new(DisplayIdx(start), DisplayIdx(start)),
+            end: SnappedBoundary::new(DisplayIdx(end), DisplayIdx(end)),
+        }
+    }
+
+    #[test]
+    fn keep_list_packet_count_matches_e_minus_s_per_range() {
+        let order = three_gop_order_map();
+        // GOP0 を保持し GOP1（CM 相当）を捨て、GOP2 を保持する。
+        let ranges = vec![range_on_sync(0, 4), range_on_sync(8, 12)];
+
+        let keep = keep_list(&ranges, &order).expect("keep_list should succeed");
+
+        assert_eq!(keep.len(), 8);
+        // 区間ごとの内訳（4 パケット + 4 パケット）も確認する。
+        let first_range_count: u32 = 4;
+        let second_range_count: u32 = 12 - 8;
+        assert_eq!(first_range_count + second_range_count, keep.len() as u32);
+    }
+
+    #[test]
+    fn keep_list_first_packet_of_each_range_is_a_sync_sample() {
+        let order = three_gop_order_map();
+        let sync_display = three_gop_sync_display();
+        let ranges = vec![range_on_sync(0, 4), range_on_sync(8, 12)];
+
+        let keep = keep_list(&ranges, &order).expect("keep_list should succeed");
+
+        // 各区間の先頭パケット（オフセット 0）が同期サンプルであることを確認する。
+        // 区間0はkeep[0]、区間1はkeep[4]から始まる（各区間4パケット）。
+        let first_of_range0 = keep[0];
+        let first_of_range1 = keep[4];
+
+        for decode in [first_of_range0, first_of_range1] {
+            let display = order
+                .to_display(decode)
+                .expect("decode index should map back to a display index");
+            assert!(
+                sync_display.contains(&display),
+                "先頭パケット (decode={:?}, display={:?}) が同期サンプルではありません",
+                decode,
+                display
+            );
+        }
+    }
+
+    #[test]
+    fn keep_list_display_order_has_no_gaps_within_each_range() {
+        let order = three_gop_order_map();
+        let ranges = vec![range_on_sync(0, 4), range_on_sync(8, 12)];
+
+        let keep = keep_list(&ranges, &order).expect("keep_list should succeed");
+
+        // 区間0 (decode 0..4 相当) の表示順集合が [0,4) と一致することを確認する。
+        let range0_display: BTreeSet<u32> = keep[0..4]
+            .iter()
+            .map(|&d| order.to_display(d).expect("should map to display").0)
+            .collect();
+        let expected0: BTreeSet<u32> = (0..4).collect();
+        assert_eq!(range0_display, expected0);
+
+        // 区間1 (decode 8..12 相当) の表示順集合が [8,12) と一致することを確認する。
+        let range1_display: BTreeSet<u32> = keep[4..8]
+            .iter()
+            .map(|&d| order.to_display(d).expect("should map to display").0)
+            .collect();
+        let expected1: BTreeSet<u32> = (8..12).collect();
+        assert_eq!(range1_display, expected1);
+    }
+
+    #[test]
+    fn keep_list_has_no_duplicate_decode_indices_across_ranges() {
+        let order = three_gop_order_map();
+        // 3 GOP すべてを別々の区間として保持し、区間をまたいだ重複が無いことを確認する。
+        let ranges = vec![
+            range_on_sync(0, 4),
+            range_on_sync(4, 8),
+            range_on_sync(8, 12),
+        ];
+
+        let keep = keep_list(&ranges, &order).expect("keep_list should succeed");
+
+        let unique: BTreeSet<DecodeIdx> = keep.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            keep.len(),
+            "区間をまたいで DecodeIdx が重複しています"
+        );
+        assert_eq!(keep.len(), 12);
+    }
+
+    #[test]
+    fn keep_list_errors_when_start_has_no_decode_mapping() {
+        // OrderMap に存在しない表示順インデックスを起点にした区間はエラーになる。
+        let order = OrderMap::new(vec![(DisplayIdx(0), DecodeIdx(0))]);
+        let ranges = vec![range_on_sync(5, 10)];
+
+        let err = keep_list(&ranges, &order).unwrap_err();
+        assert!(err.to_string().contains("デコード順インデックス"));
     }
 }
