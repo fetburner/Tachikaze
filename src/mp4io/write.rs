@@ -91,6 +91,86 @@ fn run_length_encode_ctts(kept: &[SampleInfo]) -> Vec<CttsEntry> {
     entries
 }
 
+/// トラックを1秒(そのトラックの `timescale`)程度の単位でチャンクに分割した
+/// ときの、1チャンク分の情報。
+///
+/// `start_time_secs` はトラックをまたいで開始時刻順にマージするための
+/// キーで、映像・音声の `timescale` が異なっていても比較できるように
+/// 秒単位に正規化してある。
+struct Chunk {
+    /// `moov.trak` の何番目のトラックか。
+    track_index: usize,
+    /// そのトラックの `kept` 内でのチャンク先頭サンプルのインデックス。
+    start_sample: usize,
+    /// チャンクに含まれるサンプル数。
+    sample_count: u32,
+    /// チャンク先頭の表示時刻(秒)。クロストラックの時刻順ソートに使う。
+    start_time_secs: f64,
+}
+
+/// 1トラックの `kept` サンプル列を、`duration` の累積が `timescale`
+/// (≒1秒)を超えるたびに切ってチャンク列にする。
+///
+/// docs/mp4-atom.md「本実装で直すべき点」: トラックごとに1チャンクだと
+/// `mdat` が「映像全部→音声全部」の順になりプレイヤが大きくシークするため、
+/// 1秒程度でチャンクを切ってトラック間でインターリーブする土台になる。
+/// 最後に閾値未満で余ったサンプルは1つの短いチャンクにまとめる。
+fn chunk_track(kept: &[SampleInfo], timescale: u32, track_index: usize) -> Vec<Chunk> {
+    // timescale が 0 の異常な入力では閾値判定ができないため、
+    // 全体を1チャンクとして扱う(サンプルを取りこぼさないための保険)。
+    let threshold = if timescale == 0 {
+        u64::MAX
+    } else {
+        timescale as u64
+    };
+
+    let mut chunks = Vec::new();
+    let mut start_sample = 0usize;
+    let mut cumulative_before_chunk = 0u64;
+    let mut cumulative_in_chunk = 0u64;
+
+    for (i, s) in kept.iter().enumerate() {
+        cumulative_in_chunk += s.duration as u64;
+        let is_last_sample = i + 1 == kept.len();
+
+        if cumulative_in_chunk >= threshold || is_last_sample {
+            chunks.push(Chunk {
+                track_index,
+                start_sample,
+                sample_count: (i - start_sample + 1) as u32,
+                start_time_secs: cumulative_before_chunk as f64 / threshold as f64,
+            });
+            cumulative_before_chunk += cumulative_in_chunk;
+            cumulative_in_chunk = 0;
+            start_sample = i + 1;
+        }
+    }
+
+    chunks
+}
+
+/// チャンクごとのサンプル数列から `stsc` のエントリ列をランレングス圧縮で
+/// 組み立てる。
+///
+/// `StscEntry` は「このエントリの `first_chunk` から次のエントリの
+/// `first_chunk` の前まで、`samples_per_chunk` 個ずつ」を表すため、値が
+/// 変わった時だけ新しいエントリを追加すれば自然に RLE になる。
+fn build_stsc_entries(chunk_sample_counts: &[u32]) -> Vec<StscEntry> {
+    let mut entries: Vec<StscEntry> = Vec::new();
+    for (i, &count) in chunk_sample_counts.iter().enumerate() {
+        let chunk_number = (i + 1) as u32; // 1始まり
+        match entries.last() {
+            Some(last) if last.samples_per_chunk == count => {}
+            _ => entries.push(StscEntry {
+                first_chunk: chunk_number,
+                samples_per_chunk: count,
+                sample_description_index: 1,
+            }),
+        }
+    }
+    entries
+}
+
 /// トラックごとの keep リスト(出力に含める順の `DecodeIdx`)から実際の
 /// `SampleInfo` を引く。範囲外の `DecodeIdx` はエラーにする。
 fn resolve_kept_samples(
@@ -188,15 +268,33 @@ pub fn write_mp4<P: AsRef<Path>>(
     out.write_all(&mdat_total_len_u32.to_be_bytes())?;
     out.write_all(b"mdat")?;
 
+    // トラックごとに1秒程度でチャンクに分割し、開始時刻でグローバルに
+    // マージする。これがそのまま「映像→音声→映像→…」という mdat 上の
+    // 書き出し順になる(同一トラック内ではチャンクは元々時刻順なので、
+    // 複数のソート済み列を1列にマージする操作になる)。
+    let mut all_chunks: Vec<Chunk> = Vec::new();
+    for &ti in &included {
+        let timescale = moov.trak[ti].mdia.mdhd.timescale;
+        all_chunks.extend(chunk_track(&kept_samples[ti], timescale, ti));
+    }
+    all_chunks.sort_by(|a, b| a.start_time_secs.total_cmp(&b.start_time_secs));
+
     let mut input = BufReader::new(File::open(input_path)?);
     let mut new_offsets: Vec<Vec<u64>> = vec![Vec::new(); moov.trak.len()];
+    let mut chunk_sample_counts: Vec<Vec<u32>> = vec![Vec::new(); moov.trak.len()];
     let mut cursor = mdat_body_start;
     let mut copy_buf: Vec<u8> = Vec::new();
 
-    for &ti in &included {
-        for s in &kept_samples[ti] {
-            new_offsets[ti].push(cursor);
+    for chunk in &all_chunks {
+        let ti = chunk.track_index;
+        // 同一トラック内ではチャンクはマージ前の時刻順が保たれるため、
+        // マージ順に追記していけばそのまま正しいチャンク順の
+        // オフセット列/サンプル数列になる。
+        new_offsets[ti].push(cursor);
+        chunk_sample_counts[ti].push(chunk.sample_count);
 
+        let end_sample = chunk.start_sample + chunk.sample_count as usize;
+        for s in &kept_samples[ti][chunk.start_sample..end_sample] {
             input.seek(SeekFrom::Start(s.file_offset))?;
             copy_buf.resize(s.size as usize, 0);
             input.read_exact(&mut copy_buf)?;
@@ -247,22 +345,13 @@ pub fn write_mp4<P: AsRef<Path>>(
                 .collect(),
         });
         stbl.stsc = Stsc {
-            entries: vec![StscEntry {
-                first_chunk: 1,
-                samples_per_chunk: kept.len() as u32,
-                sample_description_index: 1,
-            }],
+            entries: build_stsc_entries(&chunk_sample_counts[ti]),
         };
-        // このバージョンではトラックごとに1チャンクとする前提のため、
-        // チャンクの先頭オフセットは offs[0] だけでよい。
-        let first_offset = offs[0];
-        anyhow::ensure!(
-            first_offset <= u32::MAX as u64,
-            "track {ti}: stco オフセットが u32::MAX を超えています(mdat_body_start の計算で\
-             既に検出されているはずなので、ここに来るのは内部バグです)"
-        );
+        // 各チャンクの先頭オフセット列そのものが stco になる。個々のオフセットが
+        // u32::MAX を超えないことは mdat_body_start が mdat 全体のサイズで
+        // 既にチェックしているので、ここで個別に確認する必要はない。
         stbl.stco = Some(Stco {
-            entries: vec![first_offset as u32],
+            entries: offs.iter().map(|&o| o as u32).collect(),
         });
         stbl.co64 = None::<Co64>;
 
@@ -853,6 +942,289 @@ mod tests {
                 "ctts のエントリ数({})がサンプル数({})より大幅に少ないこと",
                 ctts.entries.len(),
                 video_samples.len()
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    // --- #39: チャンクのインターリーブ ---
+
+    /// 指定パスの指定範囲を読んでバイト列を返す(往復テスト用の生読み出し)。
+    fn read_bytes_at(path: &Path, offset: u64, size: u32) -> Vec<u8> {
+        let mut f = File::open(path).expect("開けること");
+        f.seek(SeekFrom::Start(offset)).expect("seek できること");
+        let mut buf = vec![0u8; size as usize];
+        f.read_exact(&mut buf).expect("read_exact できること");
+        buf
+    }
+
+    /// 出力の `stsc`/`stco` から再構成した `file_offset`/`size` が、実際に
+    /// `mdat` へ書き込んだ内容と一致することを確認する(往復テスト)。
+    ///
+    /// 完了条件: 「各サンプルの file_offset が stsc/stco から正しく
+    /// 再構成できることを、#26 の読み込み器(samples())で自分の出力を
+    /// 読み直して確認する」。ここでは keep リストが全サンプルかつ元の順序
+    /// なので、出力側で読み直したサンプル `i` のバイト列が入力ファイル側の
+    /// サンプル `i` のバイト列とまったく同じであることまで検証する
+    /// (offset がズレていればここで内容不一致として検出できる)。
+    #[test]
+    fn write_mp4_chunk_offsets_roundtrip_via_read_samples() {
+        if skip_if_fixture_missing() || skip_if_missing("ffmpeg") || skip_if_missing("ffprobe") {
+            return;
+        }
+
+        let moov = crate::mp4io::read::read_moov(FIXTURE).expect("moov を読めること");
+        let (video_trak, _) =
+            crate::mp4io::read::find_video_track(&moov).expect("映像トラックがあること");
+        let (audio_trak, _) =
+            crate::mp4io::read::find_audio_track(&moov).expect("音声トラックがあること");
+        let orig_video_samples = samples(&video_trak.mdia.minf.stbl);
+        let orig_audio_samples = samples(&audio_trak.mdia.minf.stbl);
+
+        let keep_per_track: Vec<Vec<DecodeIdx>> = moov
+            .trak
+            .iter()
+            .map(|trak| {
+                let n = samples(&trak.mdia.minf.stbl).len();
+                (0..n as u32).map(DecodeIdx).collect()
+            })
+            .collect();
+
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "tachikaze-write-mp4-test-chunk-roundtrip-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&tmp_dir).expect("一時ディレクトリを作れること");
+        let out_path = tmp_dir.join("out_chunk_roundtrip.mp4");
+
+        write_mp4(FIXTURE, out_path.to_str().unwrap(), &moov, &keep_per_track)
+            .expect("write_mp4 が成功すること");
+
+        let out_moov = crate::mp4io::read::read_moov(&out_path).expect("出力の moov を読めること");
+        let (out_video_trak, _) =
+            crate::mp4io::read::find_video_track(&out_moov).expect("映像トラックがあること");
+        let (out_audio_trak, _) =
+            crate::mp4io::read::find_audio_track(&out_moov).expect("音声トラックがあること");
+        let out_video_samples = samples(&out_video_trak.mdia.minf.stbl);
+        let out_audio_samples = samples(&out_audio_trak.mdia.minf.stbl);
+
+        assert_eq!(out_video_samples.len(), orig_video_samples.len());
+        assert_eq!(out_audio_samples.len(), orig_audio_samples.len());
+
+        for (i, (orig, got)) in orig_video_samples
+            .iter()
+            .zip(out_video_samples.iter())
+            .enumerate()
+        {
+            assert_eq!(got.size, orig.size, "video sample {i}: size が一致すること");
+            let want_bytes = read_bytes_at(Path::new(FIXTURE), orig.file_offset, orig.size);
+            let got_bytes = read_bytes_at(&out_path, got.file_offset, got.size);
+            assert_eq!(
+                got_bytes, want_bytes,
+                "video sample {i}: stsc/stco から再構成した file_offset の内容が\
+                 実際に書き込んだ内容と一致すること"
+            );
+        }
+
+        for (i, (orig, got)) in orig_audio_samples
+            .iter()
+            .zip(out_audio_samples.iter())
+            .enumerate()
+        {
+            assert_eq!(got.size, orig.size, "audio sample {i}: size が一致すること");
+            let want_bytes = read_bytes_at(Path::new(FIXTURE), orig.file_offset, orig.size);
+            let got_bytes = read_bytes_at(&out_path, got.file_offset, got.size);
+            assert_eq!(
+                got_bytes, want_bytes,
+                "audio sample {i}: stsc/stco から再構成した file_offset の内容が\
+                 実際に書き込んだ内容と一致すること"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    /// `mdat` 内で映像と音声のチャンクが時刻順に交互になっていることを、
+    /// 出力を読み直した `stco`(チャンク先頭オフセット列)から確認する。
+    ///
+    /// 完了条件: 「映像だけがまとまって先に来る→その後音声だけ、のような
+    /// 偏りがないこと」。ここでは全チャンクをオフセット順に並べたときの
+    /// 最長の同一トラック連続長(run)が全体のチャンク数よりずっと小さい
+    /// ことを確認する(完全に分離していれば run の長さ = チャンク数になる)。
+    #[test]
+    fn write_mp4_interleaves_video_and_audio_chunks_in_mdat() {
+        if skip_if_fixture_missing() || skip_if_missing("ffmpeg") || skip_if_missing("ffprobe") {
+            return;
+        }
+
+        let moov = crate::mp4io::read::read_moov(FIXTURE).expect("moov を読めること");
+        let keep_per_track: Vec<Vec<DecodeIdx>> = moov
+            .trak
+            .iter()
+            .map(|trak| {
+                let n = samples(&trak.mdia.minf.stbl).len();
+                (0..n as u32).map(DecodeIdx).collect()
+            })
+            .collect();
+
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "tachikaze-write-mp4-test-interleave-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&tmp_dir).expect("一時ディレクトリを作れること");
+        let out_path = tmp_dir.join("out_interleave.mp4");
+
+        write_mp4(FIXTURE, out_path.to_str().unwrap(), &moov, &keep_per_track)
+            .expect("write_mp4 が成功すること");
+
+        let out_moov = crate::mp4io::read::read_moov(&out_path).expect("出力の moov を読めること");
+        let (out_video_trak, _) =
+            crate::mp4io::read::find_video_track(&out_moov).expect("映像トラックがあること");
+        let (out_audio_trak, _) =
+            crate::mp4io::read::find_audio_track(&out_moov).expect("音声トラックがあること");
+
+        let video_offsets: Vec<u32> = out_video_trak
+            .mdia
+            .minf
+            .stbl
+            .stco
+            .as_ref()
+            .expect("映像トラックに stco があること")
+            .entries
+            .clone();
+        let audio_offsets: Vec<u32> = out_audio_trak
+            .mdia
+            .minf
+            .stbl
+            .stco
+            .as_ref()
+            .expect("音声トラックに stco があること")
+            .entries
+            .clone();
+
+        assert!(
+            video_offsets.len() > 1,
+            "映像トラックが複数チャンクに分割されていること(実際: {})",
+            video_offsets.len()
+        );
+        assert!(
+            audio_offsets.len() > 1,
+            "音声トラックが複数チャンクに分割されていること(実際: {})",
+            audio_offsets.len()
+        );
+
+        // 時刻(≒オフセット順、mdat には時刻順に書いているのでオフセット順が
+        // そのまま時刻順になる)でマージし、トラック種別のタグ付きシーケンスを作る。
+        let mut tagged: Vec<(u32, &str)> = Vec::new();
+        tagged.extend(video_offsets.iter().map(|&o| (o, "video")));
+        tagged.extend(audio_offsets.iter().map(|&o| (o, "audio")));
+        tagged.sort_by_key(|&(o, _)| o);
+
+        let total_chunks = tagged.len();
+
+        // 最長の同一トラック連続長を求める。
+        let mut longest_run = 1usize;
+        let mut current_run = 1usize;
+        for i in 1..tagged.len() {
+            if tagged[i].1 == tagged[i - 1].1 {
+                current_run += 1;
+                longest_run = longest_run.max(current_run);
+            } else {
+                current_run = 1;
+            }
+        }
+
+        assert!(
+            longest_run < total_chunks / 2,
+            "映像/音声チャンクがインターリーブされていること\
+             (最長の同一トラック連続長 {longest_run} が全チャンク数 {total_chunks} の半分未満であるはず)"
+        );
+
+        // 最初の数チャンクの出現順にも両トラックが混在していることを確認する。
+        let head_len = tagged.len().min(10);
+        let head_tags: std::collections::HashSet<&str> =
+            tagged[..head_len].iter().map(|&(_, t)| t).collect();
+        assert_eq!(
+            head_tags.len(),
+            2,
+            "先頭 {head_len} チャンクに映像と音声の両方が混在していること(実際: {:?})",
+            &tagged[..head_len]
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    /// チャンク数が「出力の秒数」程度になっていることを確認する
+    /// (1秒程度でインターリーブする、という設計の直接確認)。
+    #[test]
+    fn write_mp4_chunk_count_is_close_to_output_duration_in_seconds() {
+        if skip_if_fixture_missing() || skip_if_missing("ffmpeg") || skip_if_missing("ffprobe") {
+            return;
+        }
+
+        let moov = crate::mp4io::read::read_moov(FIXTURE).expect("moov を読めること");
+        let keep_per_track: Vec<Vec<DecodeIdx>> = moov
+            .trak
+            .iter()
+            .map(|trak| {
+                let n = samples(&trak.mdia.minf.stbl).len();
+                (0..n as u32).map(DecodeIdx).collect()
+            })
+            .collect();
+
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "tachikaze-write-mp4-test-chunk-count-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&tmp_dir).expect("一時ディレクトリを作れること");
+        let out_path = tmp_dir.join("out_chunk_count.mp4");
+
+        write_mp4(FIXTURE, out_path.to_str().unwrap(), &moov, &keep_per_track)
+            .expect("write_mp4 が成功すること");
+
+        let out_moov = crate::mp4io::read::read_moov(&out_path).expect("出力の moov を読めること");
+        let (out_video_trak, _) =
+            crate::mp4io::read::find_video_track(&out_moov).expect("映像トラックがあること");
+        let (out_audio_trak, _) =
+            crate::mp4io::read::find_audio_track(&out_moov).expect("音声トラックがあること");
+
+        let video_duration_secs =
+            out_video_trak.mdia.mdhd.duration as f64 / out_video_trak.mdia.mdhd.timescale as f64;
+        let audio_duration_secs =
+            out_audio_trak.mdia.mdhd.duration as f64 / out_audio_trak.mdia.mdhd.timescale as f64;
+
+        let video_chunk_count = out_video_trak
+            .mdia
+            .minf
+            .stbl
+            .stco
+            .as_ref()
+            .expect("映像トラックに stco があること")
+            .entries
+            .len();
+        let audio_chunk_count = out_audio_trak
+            .mdia
+            .minf
+            .stbl
+            .stco
+            .as_ref()
+            .expect("音声トラックに stco があること")
+            .entries
+            .len();
+
+        // フィクスチャは20秒程度(tests/fixtures/gen.sh)。「1秒程度」という
+        // 目安に対して大きく外れていないことだけを確認する(半分〜2倍)。
+        for (name, duration_secs, chunk_count) in [
+            ("video", video_duration_secs, video_chunk_count),
+            ("audio", audio_duration_secs, audio_chunk_count),
+        ] {
+            let lower = (duration_secs * 0.5).floor() as usize;
+            let upper = (duration_secs * 2.0).ceil() as usize;
+            assert!(
+                chunk_count >= lower.max(1) && chunk_count <= upper,
+                "{name}: チャンク数({chunk_count})が出力の秒数({duration_secs:.1}s)の\
+                 半分〜2倍の範囲内であるはず"
             );
         }
 
