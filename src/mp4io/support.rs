@@ -16,6 +16,26 @@
 //!
 //! `stco`/`co64` のどちらであるか自体はここでは判定しない(読み込みは両方通す。
 //! 出力側の `co64` 対応は別issue)。
+//!
+//! ## `elst` と複数 `stsd` エントリを明示エラーのまま残す理由(#41 で調査済み)
+//!
+//! どちらも「対応する実装を書く」より「明示エラーを維持する」方針に決めた。
+//! 根拠は docs/implementation-plan.md の「未解決事項」に書いてあるが、要点だけ:
+//!
+//! - `elst`: `ffmpeg`(既定設定、`-use_editlist 0` を付けない)で実際に elst 付き
+//!   mp4 を作り、`check_supported` をバイパスして `write_mp4` に通す実験をした。
+//!   結果、clone された `elst` の `segment_duration` が新しいトラック長(カット後、
+//!   元の約2/3)を超えたまま出力され、`media_time` が新しい先頭の正当なフレーム
+//!   を数フレーム分スキップした。「エラーは出ないが結果が壊れる」の実例であり、
+//!   対応(削除して正規化 / 再計算)よりも明示エラー継続の方が安全と判断した。
+//!   代わりに既存の回避策(ffmpeg での事前除去)を提示している
+//!   ([`check_no_edit_list`] のエラーメッセージ)。この回避策はCRC32でパケットが
+//!   ビット一致することを確認済み。
+//! - `stsd` 複数エントリ: 対象素材(配信系トランスコード、エンコード設定固定)では
+//!   発生しないと判断した。仮に発生した場合の正しい対応(サンプルごとに
+//!   `sample_description_index` を保持する)は `mp4io/write.rs` の `stsc` 構築
+//!   ロジックの変更を要し、このモジュール(未対応構成を早期に落とす役割)の
+//!   スコープを超えるため、実装は別issue送りとし、ここでは明示エラーを維持する。
 
 use mp4_atom::{Codec, Moov};
 
@@ -113,6 +133,13 @@ fn check_track_counts(moov: &Moov) -> Result<(), UnsupportedInput> {
 }
 
 /// `elst`(edit list)が存在しないことを確認する。
+///
+/// #41 で調査済み: `elst` を `moov.clone()` で引き継いだまま `write_mp4` に通すと、
+/// `segment_duration` が新しいトラック長を超えたまま残り、`media_time` が新しい
+/// 先頭の正当なフレームを数フレーム分スキップする(実機で確認)。削除して先頭を
+/// 0 に正規化する対応も、サンプル削除に合わせて再計算する対応も、対象素材
+/// (elst を持たない配信系トランスコード)には需要がないため見送り、明示エラーを
+/// 維持する。詳細は docs/implementation-plan.md の「未解決事項」。
 fn check_no_edit_list(moov: &Moov) -> Result<(), UnsupportedInput> {
     let has_elst = moov
         .trak
@@ -121,7 +148,8 @@ fn check_no_edit_list(moov: &Moov) -> Result<(), UnsupportedInput> {
 
     if has_elst {
         return Err(UnsupportedInput::with_suggestion(
-            "入力に edit list (elst) があります。この構成は未検証のため処理を中止しました。",
+            "入力に edit list (elst) があります。この構成は対応していないため処理を中止しました\
+             (#41: サンプル削除後に edit list のタイムラインが不整合になることを確認済み)。",
             "ffmpeg で edit list を除去してから再試行してください(動作確認済み):\n         \
              ffmpeg -i IN.mp4 -c copy -use_editlist 0 -movflags +faststart OUT.mp4",
         ));
@@ -131,6 +159,14 @@ fn check_no_edit_list(moov: &Moov) -> Result<(), UnsupportedInput> {
 }
 
 /// どのトラックの `stsd` も1エントリであることを確認する。
+///
+/// #41 で調査済み: 対象素材(配信系トランスコード、エンコード設定固定)では複数
+/// エントリは発生しないと判断した。仮に発生した場合の正しい対応(サンプルごとに
+/// `sample_description_index` を保持する)は `mp4io/write.rs` の `stsc` 構築
+/// ロジックの変更を要し、このファイルの役割(早期の明示エラー化)を超えるため、
+/// 実装は別issue送りとし、ここでは明示エラーを維持する。ffmpeg の無劣化 remux
+/// では複数エントリの原因(実体のパラメータ差異)自体を解消できないため、elst の
+/// ような事前除去の回避策は提示できない。
 fn check_single_stsd_entry(moov: &Moov) -> Result<(), UnsupportedInput> {
     let has_multiple_entries = moov
         .trak
@@ -139,8 +175,9 @@ fn check_single_stsd_entry(moov: &Moov) -> Result<(), UnsupportedInput> {
 
     if has_multiple_entries {
         return Err(UnsupportedInput::new(
-            "stsd に複数のサンプルエントリを持つトラックがあります。この構成は未検証のため\
-             処理を中止しました(sample_description_index を1固定にしているため)。",
+            "stsd に複数のサンプルエントリを持つトラックがあります。この構成は対応していない\
+             ため処理を中止しました(#41: sample_description_index を1固定にしているため。\
+             対応にはサンプルごとの index 保持が必要で、write.rs の変更を要するため見送り)。",
         ));
     }
 

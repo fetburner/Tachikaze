@@ -162,8 +162,8 @@ struct DecodeIdx(u32);    // デコード順（mp4 のサンプル番号 / .dtvi
 
 | 項目 | 状況 |
 |---|---|
-| `elst`（edit list）の扱い | **未検証。** 元ファイルに edit list があるとサンプルを削った後に整合しない可能性がある |
-| `stsd` が複数エントリの場合 | **未検証。** `sample_description_index` を 1 固定にしている |
+| `elst`（edit list）の扱い | **非対応（明示エラーを維持、#41 で調査済み）。** `ffmpeg`（既定設定、`-use_editlist 0` を付けない）で実際に elst 付き mp4 を作り、`check_supported` をバイパスして `write_mp4` に通す実験をした。結果、`moov.clone()` で引き継がれた `elst` の `segment_duration` が新しいトラック長（カット後）を超えたまま出力され、`media_time` が新しい先頭の正当なフレームを数フレーム分スキップした——「エラーは出ないが結果が壊れる」の実例。対象素材（配信系トランスコード）は elst を持たないため、削除して先頭を0に正規化する対応・サンプル削除に合わせて再計算する対応のどちらも実装せず、既存の明示エラー＋回避策を維持する。回避策（`ffmpeg -i IN.mp4 -c copy -use_editlist 0 -movflags +faststart OUT.mp4`）は elst 除去後の映像・音声パケットが元ファイルと ffprobe の CRC32 でビット一致することを確認済み。実装: `src/mp4io/support.rs::check_no_edit_list` |
+| `stsd` が複数エントリの場合 | **非対応（明示エラーを維持、#41 で調査済み）。** 対象素材はエンコード設定固定の配信系トランスコードであり、CLAUDE.md の前提（H.264 + Opus、GOP 120 固定）から途中で解像度やパラメータセットが変わることは想定されないため、実際には発生しないと判断した。仮に発生した場合の正しい対応（`stsc` の `sample_description_index` をサンプルごとに保持する）は `mp4io/write.rs`（現状 `sample_description_index: 1` 固定で `stsc` を1エントリに再構築している）と `mp4io/read.rs` の `SampleInfo`（現状 index を持たない）の両方に変更を要し、`support.rs`（未対応構成を早期に落とす役割）のスコープを超えるため、実装は別issue送りとする。無劣化 remux ではパラメータ差異という原因自体を解消できないため、elst のような事前除去の回避策は提示できない。実装: `src/mp4io/support.rs::check_single_stsd_entry` |
 | 4 GB 超の出力（`co64`） | **未実装。** 現状 `stco` 固定 |
 | `stts` / `ctts` のランレングス圧縮 | **未実装。** 1 サンプル 1 エントリだと 10 万サンプルで 800 KB になる |
 | チャンクのインターリーブ | **未実装。** 現状トラックごとに 1 チャンク。プレイヤが大きくシークする |
