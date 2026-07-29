@@ -18,13 +18,32 @@ use std::ops::{Add, Sub};
 ///
 /// `DecodeIdx` を要求する場所に誤って渡すとコンパイルエラーになる。
 ///
-/// ```compile_fail
-/// # use tachikaze::order::{DisplayIdx, DecodeIdx};
+/// まず、正しい型を渡せばコンパイルできる:
+///
+/// ```
+/// use tachikaze::order::DecodeIdx;
 /// fn wants_decode(_: DecodeIdx) {}
 ///
-/// let d = DisplayIdx(0);
-/// wants_decode(d); // 型が違うのでコンパイルできない
+/// wants_decode(DecodeIdx(0)); // 型が合っているのでコンパイルできる
 /// ```
+///
+/// 上と**型以外は同じ**コードで、`DisplayIdx` を渡すとコンパイルに失敗する:
+///
+/// ```compile_fail
+/// use tachikaze::order::{DecodeIdx, DisplayIdx};
+/// fn wants_decode(_: DecodeIdx) {}
+///
+/// wants_decode(DisplayIdx(0)); // 型が違うのでコンパイルできない
+/// ```
+///
+/// 上の2つを対にしているのは、`compile_fail` が**失敗した理由を区別しない**ため。
+/// import ミスや構文エラーでも `compile_fail` は成立してしまうので、
+/// 「型以外を同じにした版がコンパイルできる」ことを並べて示すことで、失敗の原因が
+/// 型の取り違えであることを担保する。
+///
+/// なお `compile_fail,E0308` のようにエラーコードを添える書き方もあるが、
+/// **stable の rustdoc はコードを検証しない**（無関係なコードを書いても通る。実際に
+/// `E0425` に変えても通ることを確認した）。そのため書かずに上の対照方式を採っている。
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Hash)]
 pub struct DisplayIdx(pub u32);
 
@@ -33,12 +52,23 @@ pub struct DisplayIdx(pub u32);
 ///
 /// `DisplayIdx` を要求する場所に誤って渡すとコンパイルエラーになる。
 ///
-/// ```compile_fail
-/// # use tachikaze::order::{DisplayIdx, DecodeIdx};
+/// 正しい型を渡せばコンパイルできる（下の `compile_fail` の対照。対にしている理由は
+/// [`DisplayIdx`] のドキュメント参照）:
+///
+/// ```
+/// use tachikaze::order::DisplayIdx;
 /// fn wants_display(_: DisplayIdx) {}
 ///
-/// let d = DecodeIdx(0);
-/// wants_display(d); // 型が違うのでコンパイルできない
+/// wants_display(DisplayIdx(0)); // 型が合っているのでコンパイルできる
+/// ```
+///
+/// 上と**型以外は同じ**コードで、`DecodeIdx` を渡すとコンパイルに失敗する:
+///
+/// ```compile_fail
+/// use tachikaze::order::{DecodeIdx, DisplayIdx};
+/// fn wants_display(_: DisplayIdx) {}
+///
+/// wants_display(DecodeIdx(0)); // 型が違うのでコンパイルできない
 /// ```
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Hash)]
 pub struct DecodeIdx(pub u32);
