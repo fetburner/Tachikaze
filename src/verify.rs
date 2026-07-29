@@ -1334,10 +1334,13 @@ mod tests {
             .trak
             .iter()
             .position(|t| {
-                matches!(
-                    t.mdia.minf.stbl.stsd.codecs.first(),
-                    Some(mp4_atom::Codec::Opus(_))
-                )
+                t.mdia
+                    .minf
+                    .stbl
+                    .stsd
+                    .codecs
+                    .first()
+                    .is_some_and(crate::mp4io::read::is_audio_codec)
             })
             .expect("音声トラックのインデックスが見つかること");
 

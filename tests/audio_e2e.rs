@@ -758,10 +758,9 @@ fn dtvi_path() -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/sample.dtvi")
 }
 
-/// フィクスチャに対して `tachikaze cut` を実行し、`(一時ディレクトリ, 出力パス)` を返す。
-fn run_cut(label: &str) -> (std::path::PathBuf, std::path::PathBuf) {
-    let fixture = common::fixture_path();
-
+/// 指定したフィクスチャに対して `tachikaze cut` を実行し、
+/// `(一時ディレクトリ, 出力パス)` を返す。
+fn run_cut_with_fixture(fixture: &Path, label: &str) -> (std::path::PathBuf, std::path::PathBuf) {
     let tmp_dir = std::env::temp_dir().join(format!(
         "tachikaze-audio-e2e-{label}-{}",
         std::process::id()
@@ -773,13 +772,14 @@ fn run_cut(label: &str) -> (std::path::PathBuf, std::path::PathBuf) {
 
     let output = Command::new(env!("CARGO_BIN_EXE_tachikaze"))
         .arg("cut")
-        .arg(&fixture)
+        .arg(fixture)
         .arg("--trim")
         .arg(&trim_path)
         .arg("-o")
         .arg(&out_path)
         .arg("--dtvi")
         .arg(dtvi_path())
+        .arg("--verify")
         .output()
         .expect("tachikaze cut の起動に失敗した");
     assert!(
@@ -791,6 +791,11 @@ fn run_cut(label: &str) -> (std::path::PathBuf, std::path::PathBuf) {
     );
 
     (tmp_dir, out_path)
+}
+
+/// 既存の Opus フィクスチャに対して `tachikaze cut` を実行する。
+fn run_cut(label: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+    run_cut_with_fixture(&common::fixture_path(), label)
 }
 
 /// フィクスチャ・区間定義から `reference_position_based_audio_packet_ranges` に渡す
@@ -931,7 +936,7 @@ fn cut_audio_is_bitwise_copy_and_matches_expected_count() {
 /// 一致すること。
 ///
 /// フィクスチャの音声は周波数スイープ（`tests/fixtures/gen.sh` 参照）にしてある。
-/// 一定周波数のサイン波だと全 Opus パケットの中身がほぼ同一バイト列になり、
+/// 一定周波数のサイン波だとコーデックによっては音声パケットの中身がほぼ同一バイト列になり、
 /// 「音声パケットをソースのどの位置から取ったか」という位置ずれを CRC32 比較で
 /// 検出できない（同じ値ばかりで一致してしまう）ため、パケットごとに中身が変わる
 /// 信号が必須。
@@ -1095,6 +1100,109 @@ fn output_video_and_audio_first_packet_stay_in_av_sync_with_source() {
              出力の(映像pts-音声pts)={out_av_offset_sec:.6}s で、{drift_sec:.6}s \
              (許容{tolerance_sec:.6}s)ずれている。音声が映像より先行/遅延していないか \
              確認すること(docs/lossless-cut.md「実際に起きた誤り」参照)",
+            seg_idx + 1
+        );
+
+        out_video_frame += SNAPPED_FRAMES_PER_SEGMENT[seg_idx] as usize;
+        out_audio_packet += (src_audio_end - src_audio_start) as usize;
+    }
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+/// #42 / #45: AAC(`Mp4a`)でも複数区間 cut・パケット CRC32・音声位置・A/V pts 関係が
+/// Opus と同じ規則で保たれることをまとめて確認する。
+///
+/// `run_cut_with_fixture` は `--verify` を付けるため、本体の自己検証（検査1〜6）と
+/// ffprobe CRC32 検証も同じ実行内で通る。ここではさらに実装と独立したテスト側
+/// オラクルで、区間先頭の音声位置と `(映像pts - 音声pts)` を検査する。
+#[test]
+#[ignore = "tests/fixtures/sample_aac.mp4 と ffmpeg/ffprobe が必要。tests/fixtures/gen.sh を先に実行すること"]
+fn aac_cut_is_bitwise_copy_and_preserves_segment_positions_and_av_sync() {
+    let fixture = common::aac_fixture_path();
+    if common::skip_if_fixture_missing_at(&fixture)
+        || skip_if_missing("ffmpeg")
+        || skip_if_missing("ffprobe")
+    {
+        return;
+    }
+
+    let (tmp_dir, out_path) = run_cut_with_fixture(&fixture, "aac");
+
+    // stsd は入力から clone するため、出力の音声 Codec は入力と同じ AAC のまま。
+    let src_codec = ffprobe_scalar_stream_entry(&fixture, "a:0", "stream=codec_name");
+    let out_codec = ffprobe_scalar_stream_entry(&out_path, "a:0", "stream=codec_name");
+    assert_eq!(src_codec, "aac");
+    assert_eq!(out_codec, src_codec);
+
+    // 出力の音声パケットはすべて入力に存在する（再エンコードなしのビットコピー）。
+    let src_set = ffprobe_audio_crc_set(&fixture);
+    let out_set = ffprobe_audio_crc_set(&out_path);
+    let diff = packets_only_in_output(&out_set, &src_set);
+    assert!(diff.is_empty(), "{}", describe_diff(&diff));
+
+    let (video_segment_durations, video_segment_source_starts, video_timescale) =
+        expected_video_segments(&fixture);
+    let audio_timescale: u32 = ffprobe_scalar_stream_entry(&fixture, "a:0", "stream=sample_rate")
+        .parse()
+        .expect("sample_rate が整数としてパースできない");
+    let audio_packet_durations = ffprobe_audio_packet_durations(&fixture);
+    let expected_ranges = reference_position_based_audio_packet_ranges(
+        &video_segment_durations,
+        &video_segment_source_starts,
+        video_timescale,
+        &audio_packet_durations,
+        audio_timescale,
+    );
+    assert_eq!(expected_ranges.len(), 2, "区間は2つのはず");
+
+    let expected_packet_count: usize = expected_ranges
+        .iter()
+        .map(|&(start, end)| (end - start) as usize)
+        .sum();
+    let out_dts = ffprobe_audio_dts(&out_path);
+    assert_eq!(out_dts.len(), expected_packet_count);
+    assert!(is_strictly_increasing(&out_dts));
+
+    // 各区間の先頭3パケットをソース上の正しい位置と比較する。
+    let src_crc = ffprobe_audio_crc_ordered(&fixture);
+    let out_crc = ffprobe_audio_crc_ordered(&out_path);
+    let mut out_audio_packet = 0usize;
+    for (seg_idx, &(src_start, src_end)) in expected_ranges.iter().enumerate() {
+        let seg_len = (src_end - src_start) as usize;
+        for k in 0..seg_len.min(3) {
+            assert_eq!(
+                out_crc[out_audio_packet + k],
+                src_crc[src_start as usize + k],
+                "AAC 区間{}のパケット{k}がソース位置と一致しない",
+                seg_idx + 1
+            );
+        }
+        out_audio_packet += seg_len;
+    }
+
+    // 区間ごとに元と出力の「映像 pts - 音声 pts」を比較する（罠4の独立検査）。
+    let src_video_pts = ffprobe_video_pts(&fixture);
+    let out_video_pts = ffprobe_video_pts(&out_path);
+    let src_audio_pts = ffprobe_audio_pts(&fixture);
+    let out_audio_pts = ffprobe_audio_pts(&out_path);
+    let mut out_video_frame = 0usize;
+    let mut out_audio_packet = 0usize;
+    for (seg_idx, (&src_frame, &(src_audio_start, src_audio_end))) in SNAPPED_START_DISPLAY_FRAMES
+        .iter()
+        .zip(expected_ranges.iter())
+        .enumerate()
+    {
+        let src_av_offset = src_video_pts[src_frame] as f64 / video_timescale as f64
+            - src_audio_pts[src_audio_start as usize] as f64 / audio_timescale as f64;
+        let out_av_offset = out_video_pts[out_video_frame] as f64 / video_timescale as f64
+            - out_audio_pts[out_audio_packet] as f64 / audio_timescale as f64;
+        let tolerance =
+            audio_packet_durations[src_audio_start as usize] as f64 / audio_timescale as f64;
+        assert!(
+            (src_av_offset - out_av_offset).abs() <= tolerance,
+            "AAC 区間{}のA/V pts関係が保持されていない: src={src_av_offset:.6}s, \
+             out={out_av_offset:.6}s, tolerance={tolerance:.6}s",
             seg_idx + 1
         );
 

@@ -442,13 +442,17 @@ enum TrackKind {
 
 /// `moov.trak` の中から、`stsd` の先頭コーデックが目的の種別に一致する
 /// 最初のトラックのインデックスを返す。
+///
+/// 音声判定は `mp4io::read::is_audio_codec` に集約している（Opus / AAC など
+/// mp4-atom が認識する音声 Codec 全般。詳細は同関数の doc comment）。
 fn track_index(moov: &Moov, kind: TrackKind) -> Option<usize> {
-    moov.trak.iter().position(|trak| {
-        matches!(
-            (kind, trak.mdia.minf.stbl.stsd.codecs.first()),
-            (TrackKind::Video, Some(Codec::Avc1(_))) | (TrackKind::Audio, Some(Codec::Opus(_)))
-        )
-    })
+    moov.trak.iter().position(
+        |trak| match (kind, trak.mdia.minf.stbl.stsd.codecs.first()) {
+            (TrackKind::Video, Some(Codec::Avc1(_))) => true,
+            (TrackKind::Audio, Some(codec)) => mp4io::read::is_audio_codec(codec),
+            _ => false,
+        },
+    )
 }
 
 /// スナップ済み区間ごとに、その区間の**ソース上の絶対開始時刻（DTS 基準）**（映像
