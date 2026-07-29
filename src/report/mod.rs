@@ -1,6 +1,3 @@
-// CLI (--report) からの配線待ち。配線されたら外す。
-#![allow(dead_code)]
-
 //! analyze --report: カット境界とキーフレームの距離を報告する。
 //!
 //! **mp4 は一切読まない。** 入力は `.dtvi`（[`crate::dtvi::Dtvi`]）と `trim.avs` の

@@ -1,6 +1,3 @@
-// cut パイプラインから消費されるまで未使用。配線されたら外す。
-#![allow(dead_code)]
-
 //! 出力する各映像区間に対応する音声パケットの範囲を決める。
 //!
 //! 音声（Opus, 20ms グリッド）と映像（例: 30000/1001 fps, 33.37ms グリッド）は
@@ -43,16 +40,22 @@ pub struct DriftStats {
 ///
 /// # 設計
 /// 区間 `k` が終わった時点までの、出力タイムライン上の累積映像時間を `T_k`
-/// （`T_0 = 0`）とする。`T_k` を音声の timescale に変換し、`round(T_k' / frame_size)`
-/// で「区間 `k` の終わりまでに消費されているべき音声パケット数」を毎回 `T_k` から
-/// 計算し直す。区間 `k` に割り当てるパケットは境界 `k-1` と境界 `k` の半開区間。
+/// （`T_0 = 0`）とする。`T_k` を音声の timescale に変換した目標時刻に対して、
+/// **音声サンプルの実際の duration を先頭から累積した値**が最も近くなる
+/// パケット数を毎回 `T_k` から計算し直す（二分探索）。区間 `k` に割り当てる
+/// パケットは境界 `k-1` と境界 `k` の半開区間。
 ///
 /// 区間の長さだけを見て毎回独立に丸める方式と異なり、境界のパケット数は常に
-/// 「これまでの累積時間」に対して最も近い値に丸められるため、丸め誤差が継ぎ目を
-/// 越えて蓄積しない（誤差は常に高々 0.5 パケット）。
+/// 「これまでの累積時間」に対して最も近い値に選ばれるため、丸め誤差が継ぎ目を
+/// 越えて蓄積しない。
 ///
-/// `frame_size`（音声 1 パケットあたりの timescale 単位の長さ）は `audio_samples`
-/// の先頭サンプルの `duration` から求める（対象素材では全サンプルで一定である前提）。
+/// **固定の `frame_size`（1パケットあたりの長さ）を仮定しない。** 実データでは
+/// 先頭パケットがエンコーダのプライミング分だけ他のパケットより大幅に長い
+/// ことがある（実測: 20ms 相当のパケットが並ぶ中、先頭だけ 80ms 相当）。
+/// `audio_samples[0].duration` を frame_size とみなして除算する実装だと、
+/// この1個の外れ値のせいで全パケットの境界がズレてしまう（実際にこの不具合を
+/// 実ファイルの E2E テストで検出した）。そのため、各サンプルの実際の
+/// duration を毎回合計してから最近傍を探す方式にしている。
 ///
 /// 区間の終端が音声サンプル総数を超える場合は音声サンプル総数で止める。
 pub fn select_audio_segments(
@@ -79,13 +82,19 @@ pub fn select_audio_segments(
         "audio_timescale はゼロより大きい必要があります"
     );
 
-    let frame_size = audio_samples[0].duration;
-    anyhow::ensure!(
-        frame_size > 0,
-        "音声サンプルの duration（frame_size）はゼロより大きい必要があります"
-    );
-
+    // 累積実測時間（音声 timescale 単位）。cumulative[i] は samples[0..i] の
+    // duration 合計（cumulative[0] == 0、cumulative[len] == 音声トラック全体の長さ）。
+    let mut cumulative: Vec<u64> = Vec::with_capacity(audio_samples.len() + 1);
+    cumulative.push(0);
+    for s in audio_samples {
+        cumulative.push(cumulative.last().copied().unwrap_or(0) + s.duration as u64);
+    }
     let total_audio_samples = audio_samples.len() as u64;
+
+    // 誤差をパケット単位で報告するための正規化係数（典型的な1パケットの長さ）。
+    // 実データは先頭パケットが外れ値になりうるので、全体の平均を使う
+    // （選択アルゴリズム自体はこの値を使わない。ログ・テスト向けの目安）。
+    let average_frame_size = *cumulative.last().unwrap() as f64 / total_audio_samples as f64;
 
     let mut segments = Vec::with_capacity(video_segment_durations.len());
     let mut max_abs_error_packets = 0.0f64;
@@ -96,19 +105,17 @@ pub fn select_audio_segments(
     for &duration in video_segment_durations {
         cumulative_video_time += duration;
 
-        // T_k を音声パケット数に変換する。一度の乗除算にまとめることで、
-        // 「映像 timescale → 音声 timescale」「時間 → パケット数」の 2 段階に
-        // 分けた場合よりも丸め誤差の混入を抑える。
-        let ideal_packets = (cumulative_video_time as f64 * audio_timescale as f64)
-            / (video_timescale as f64 * frame_size as f64);
+        // T_k を音声 timescale 単位の目標時刻に変換する。
+        let target =
+            (cumulative_video_time as f64 * audio_timescale as f64) / video_timescale as f64;
 
-        let rounded_packets = ideal_packets.round();
-        let error = (ideal_packets - rounded_packets).abs();
-        if error > max_abs_error_packets {
-            max_abs_error_packets = error;
+        let packet_count = nearest_cumulative_index(&cumulative, target).min(total_audio_samples);
+
+        let actual = cumulative[packet_count as usize] as f64;
+        let error_packets = (actual - target).abs() / average_frame_size;
+        if error_packets > max_abs_error_packets {
+            max_abs_error_packets = error_packets;
         }
-
-        let packet_count = (rounded_packets as u64).min(total_audio_samples);
 
         let start = prev_packet_count.min(total_audio_samples);
         // 累積値は非減少なので理論上 packet_count >= start だが、丸め誤差に対して
@@ -129,6 +136,24 @@ pub fn select_audio_segments(
             max_abs_error_packets,
         },
     ))
+}
+
+/// 昇順の `cumulative` の中から `target` に最も近い要素のインデックスを返す。
+fn nearest_cumulative_index(cumulative: &[u64], target: f64) -> u64 {
+    let idx = cumulative.partition_point(|&c| (c as f64) < target);
+    if idx == 0 {
+        return 0;
+    }
+    if idx >= cumulative.len() {
+        return (cumulative.len() - 1) as u64;
+    }
+    let before = cumulative[idx - 1] as f64;
+    let after = cumulative[idx] as f64;
+    if (target - before).abs() <= (after - target).abs() {
+        (idx - 1) as u64
+    } else {
+        idx as u64
+    }
 }
 
 /// 継ぎ目（出力区間）ごとの A/V ずれ 1 件分。
@@ -451,6 +476,51 @@ mod tests {
             assert_eq!(seg.start.0, prev_end);
             assert!(seg.end.0 >= seg.start.0);
             prev_end = seg.end.0;
+        }
+    }
+
+    /// 回帰テスト: 実ファイルの E2E テストで実際に踏んだ不具合の再現。
+    ///
+    /// libopus でエンコードした音声の先頭パケットは、エンコーダのプライミング分
+    /// だけ他の20msパケットより大幅に長くなることがある（実測: 80.25ms）。
+    /// `frame_size = audio_samples[0].duration` と仮定する実装だと、この1個の
+    /// 外れ値のせいで全パケットの境界が大きくズレる（実測で音声時間が映像時間の
+    /// 1/4程度になった）。累積の実測 duration から最近傍を探す本実装ではこれが
+    /// 起きないことを確認する。
+    #[test]
+    fn handles_outlier_first_packet_duration_without_derailing() {
+        let video_timescale = 30000u32;
+        let frame_duration = 1001u64;
+        let audio_timescale = 48000u32;
+        let normal_frame_size = 960u32; // 20ms @ 48kHz
+        let outlier_first_frame_size = 3852u32; // 実測(80.25ms相当)に近い外れ値
+
+        // 20秒ぶんの映像を2区間に分ける(実際のE2Eテストと同じ形)。
+        let video_segment_durations = vec![8 * frame_duration * 30, 8 * frame_duration * 30];
+
+        let mut audio_samples = make_audio_samples(1000, normal_frame_size);
+        audio_samples[0].duration = outlier_first_frame_size;
+
+        let (segments, _stats) = select_audio_segments(
+            &video_segment_durations,
+            video_timescale,
+            &audio_samples,
+            audio_timescale,
+        )
+        .unwrap();
+
+        for (i, seg) in segments.iter().enumerate() {
+            let audio_duration: u64 = audio_samples[seg.start.0 as usize..seg.end.0 as usize]
+                .iter()
+                .map(|s| s.duration as u64)
+                .sum();
+            let video_seconds = video_segment_durations[i] as f64 / video_timescale as f64;
+            let audio_seconds = audio_duration as f64 / audio_timescale as f64;
+            assert!(
+                (audio_seconds - video_seconds).abs() < 0.1,
+                "区間{i}: 映像{video_seconds:.3}s に対して音声{audio_seconds:.3}s\
+                 (外れ値パケットに引きずられて大きくズレてはいけない)"
+            );
         }
     }
 

@@ -1,6 +1,3 @@
-// #22 で analyze.rs から消費されるまで未使用。配線されたら外す。
-#![allow(dead_code)]
-
 //! 外部ツール（chapter_exe / join_logo_scp / dtvindex / ffprobe）と
 //! JL コマンドファイルの探索。
 //!

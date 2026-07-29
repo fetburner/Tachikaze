@@ -27,6 +27,15 @@ pub enum Commands {
 
         #[arg(long)]
         work_dir: Option<PathBuf>,
+
+        /// join_logo_scp の `-set KEY VALUE` を上書き・追加する（`KEY=VALUE` 形式、繰り返し可）。
+        /// 同じキーを指定すると既定値を置き換える。
+        #[arg(long = "jls-set")]
+        jls_set: Vec<String>,
+
+        /// JL コマンドファイル（既定は `JL_標準.txt`）を差し替える。
+        #[arg(long = "jl-file")]
+        jl_file: Option<PathBuf>,
     },
     Cut {
         input: PathBuf,
@@ -45,6 +54,11 @@ pub enum Commands {
 
         #[arg(long)]
         verify: bool,
+
+        /// `dtvindex build` が生成した `.dtvi`（オープン GOP 判定と自己検証に必須）。
+        /// `analyze --work-dir <DIR>` を使うと `<DIR>/work.mp4.dtvi` に残る。
+        #[arg(long)]
+        dtvi: Option<PathBuf>,
     },
 }
 

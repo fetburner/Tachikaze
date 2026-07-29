@@ -1,6 +1,3 @@
-// #22 で analyze.rs から消費されるまで未使用。配線されたら外す。
-#![allow(dead_code)]
-
 //! 外部プロセス（dtvindex / chapter_exe / join_logo_scp）を起動する共通基盤。
 //!
 //! いずれのツールも進捗を大量に stdout/stderr に出すため、素通しにせず

@@ -1,6 +1,3 @@
-// #23 / #24 で report モジュールから消費されるまで未使用。配線されたら外す。
-#![allow(dead_code)]
-
 //! join_logo_scp の `-oscp` 出力（detail.jls）のパーサ。
 //!
 //! 各行は次の6列を空白区切りで持つ（1行目はヘッダで読み飛ばす）:
@@ -41,6 +38,9 @@ impl JlsEntry {
         self.label == ":CM"
     }
 
+    // 現状 --report の出力はCMブロックの一覧のみで、キャンセルされた番宣の
+    // 判別はまだ使っていない（将来 --report を拡張する際の材料として残す）。
+    #[allow(dead_code)]
     /// ラベルが `(cut-cancel)` を含むかどうか。
     /// 設定でキャンセルされた番宣（例: `:Trailer(cut-cancel)`）を判別するために使う。
     pub fn is_trailer_cut_cancel(&self) -> bool {

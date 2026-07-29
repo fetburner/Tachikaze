@@ -1,6 +1,3 @@
-// #27 で order_map.rs から消費されるまで未使用。配線されたら外す。
-#![allow(dead_code)]
-
 //! 表示順（display order）とデコード順（decode order）を型で区別する。
 //!
 //! - [`DisplayIdx`]: Trim の値、`.dtvi` の `frame_number` に対応する表示順のインデックス。
@@ -81,6 +78,10 @@ impl Add<u32> for DecodeIdx {
 }
 
 impl DisplayIdx {
+    // 現状の cut パイプラインは表示順側の加算をオーバーフロー検査なしで行っている
+    // （フレーム数が u32 を溢れる規模にはならない）。DecodeIdx::checked_add と対称に
+    // 保つため、また将来の入力サイズ拡大に備えて残す。
+    #[allow(dead_code)]
     /// オーバーフローしない加算。
     pub fn checked_add(self, rhs: u32) -> Option<DisplayIdx> {
         self.0.checked_add(rhs).map(DisplayIdx)
@@ -128,6 +129,9 @@ impl OrderMap {
         self.pairs.len()
     }
 
+    // len() は verify.rs 等から使われるが、is_empty() 自体を呼ぶ箇所は
+    // まだ無い（`clippy::len_without_is_empty` を避けるための対の実装として残す）。
+    #[allow(dead_code)]
     /// 対応が空かどうか。
     pub fn is_empty(&self) -> bool {
         self.pairs.is_empty()

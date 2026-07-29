@@ -1,6 +1,3 @@
-// CLI からの配線待ち。配線されたら外す。
-#![allow(dead_code)]
-
 //! analyze コマンド: `dtvindex build` → `chapter_exe -v` → `join_logo_scp` の
 //! 3 ツールパイプラインを実行し、`trim.avs` を生成する。
 //!
@@ -23,7 +20,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
 
+use crate::dtvi::{self, Dtvi};
 use crate::external;
+use crate::jls::{self, JlsEntry};
 use crate::tools::{self, CHAPTER_EXE, DTVINDEX, JOIN_LOGO_SCP};
 use crate::trim::TrimList;
 use crate::workdir::WorkDir;
@@ -53,20 +52,36 @@ pub struct AnalyzeConfig {
     pub jl_file: Option<PathBuf>,
 }
 
-/// analyze パイプラインを実行し、生成された `trim.avs` をパースして返す。
+/// analyze パイプライン全体の成果物。
+///
+/// `--report`（境界とキーフレームの距離、見逃し候補の警告）の組み立てに
+/// `.dtvi` と `detail.jls` の内容が必要なため、`work_dir` が片付けられる前に
+/// ここで読み込んでおく。
+#[derive(Debug, Clone)]
+pub struct AnalyzeOutput {
+    /// 生成された `trim.avs` のパース結果。
+    pub trim: TrimList,
+    /// `dtvindex build` が生成した `.dtvi` の内容。
+    pub dtvi: Dtvi,
+    /// `join_logo_scp -oscp` が生成した `detail.jls` の内容。
+    pub jls_entries: Vec<JlsEntry>,
+}
+
+/// analyze パイプラインを実行し、生成された `trim.avs` / `.dtvi` / `detail.jls` を
+/// パースして返す。
 ///
 /// どこかの段階が失敗した場合、以降の段階は実行せずエラーを伝播する
 /// （`external::run` のエラーにはコマンドライン全体と stderr の末尾が
 /// 既に含まれている）。成功・失敗いずれの経路でも `WorkDir::finish` を
 /// 呼ぶため、実際の処理は [`run_pipeline`] に分離している。
-pub fn run(config: &AnalyzeConfig) -> Result<TrimList> {
+pub fn run(config: &AnalyzeConfig) -> Result<AnalyzeOutput> {
     let work_dir = WorkDir::new(config.work_dir.clone())?;
     let result = run_pipeline(config, &work_dir);
     work_dir.finish(result.is_ok());
     result
 }
 
-fn run_pipeline(config: &AnalyzeConfig, work_dir: &WorkDir) -> Result<TrimList> {
+fn run_pipeline(config: &AnalyzeConfig, work_dir: &WorkDir) -> Result<AnalyzeOutput> {
     // ツールの解決を先に行う。見つからない場合は入力ファイルの存在確認や
     // 作業ディレクトリへの symlink 作成より前に、探索場所を列挙したエラーで
     // 早期に失敗させる。
@@ -95,7 +110,7 @@ fn run_pipeline(config: &AnalyzeConfig, work_dir: &WorkDir) -> Result<TrimList> 
         work_dir.path(),
     )?;
 
-    external::run(
+    let chapter_exe_output = external::run(
         require_utf8(&chapter_exe_path)?,
         &[
             "-v",
@@ -105,6 +120,18 @@ fn run_pipeline(config: &AnalyzeConfig, work_dir: &WorkDir) -> Result<TrimList> 
         ],
         work_dir.path(),
     )?;
+    // macOS には AviSynth が無いため、dtvindex 入力経路が有効なビルドである必要がある
+    // （docs/toolchain-macos.md）。無効なビルドを渡されると入力経路が無く静かに
+    // 動かなくなるため、起動ログから読み取れる場合は警告しておく。
+    if tools::dtvindex_enabled_from_output(&chapter_exe_output.stdout) == Some(false)
+        || tools::dtvindex_enabled_from_output(&chapter_exe_output.stderr) == Some(false)
+    {
+        eprintln!(
+            "警告: chapter_exe が dtvindex=disabled で起動しました。\
+             macOS には AviSynth が無いため、dtvindex 入力経路が有効なビルドが必要です\
+             （docs/toolchain-macos.md 参照）。"
+        );
+    }
 
     let jl_file = match &config.jl_file {
         Some(path) => path.clone(),
@@ -144,9 +171,32 @@ fn run_pipeline(config: &AnalyzeConfig, work_dir: &WorkDir) -> Result<TrimList> 
             config.output.display()
         )
     })?;
+    let trim = TrimList::parse(&output_content)
+        .map_err(|err| anyhow!("生成された trim.avs のパースに失敗しました: {err}"))?;
 
-    TrimList::parse(&output_content)
-        .map_err(|err| anyhow!("生成された trim.avs のパースに失敗しました: {err}"))
+    let dtvi_content = fs::read_to_string(&dtvi_path).with_context(|| {
+        format!(
+            "dtvindex が生成した .dtvi の読み込みに失敗しました: {}",
+            dtvi_path.display()
+        )
+    })?;
+    let dtvi = dtvi::parse(&dtvi_content)
+        .map_err(|err| anyhow!("生成された .dtvi のパースに失敗しました: {err}"))?;
+
+    let jls_content = fs::read_to_string(&detail_jls_path).with_context(|| {
+        format!(
+            "join_logo_scp が生成した detail.jls の読み込みに失敗しました: {}",
+            detail_jls_path.display()
+        )
+    })?;
+    let jls_entries = jls::parse(&jls_content)
+        .map_err(|err| anyhow!("生成された detail.jls のパースに失敗しました: {err}"))?;
+
+    Ok(AnalyzeOutput {
+        trim,
+        dtvi,
+        jls_entries,
+    })
 }
 
 /// パスを `&str` として取り出す。UTF-8 でないパスは非対応として扱う。
@@ -440,8 +490,8 @@ mod tests {
             jl_file: None,
         };
 
-        let trim_list = run(&config).expect("analyze パイプラインが成功するはず");
-        assert!(!trim_list.ranges().is_empty());
+        let output = run(&config).expect("analyze パイプラインが成功するはず");
+        assert!(!output.trim.ranges().is_empty());
 
         fs::remove_dir_all(&output_dir).ok();
     }

@@ -1,6 +1,3 @@
-// cut パイプラインの CLI 配線（別 issue）から呼ばれるまで未使用。配線されたら外す。
-#![allow(dead_code)]
-
 //! cut パイプラインの最終段: 区間ごとの assert と、失敗時の出力破棄。
 //!
 //! これまでの issue で作られた部品（`mp4io::read` / `mp4io::order_map` / `plan` /
