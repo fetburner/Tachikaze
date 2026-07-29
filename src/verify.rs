@@ -17,7 +17,12 @@
 //!    `std::fs::rename` で `output_path` へ移動する。
 //!
 //! ffprobe によるパケット単位 CRC32 の一致確認（`--verify` 指定時、CLAUDE.md の罠2）は
-//! 別 issue（#37）が担当し、本モジュールでは実装しない。
+//! [`verify_with_ffprobe`] / [`cut_verify_and_ffprobe_check`] が担当する（#37）。
+//! `cut_and_verify` が `output_path` へ rename した**後**に、ffprobe を使って元ファイルと
+//! 出力ファイルのパケットを突き合わせる。映像は `video_keep`（元ファイルのデコード順
+//! `DecodeIdx` 列、出力に含める順そのもの）から期待される CRC32 列を組み立てて1対1で
+//! 比較し（`-ss` によるタイムスタンプベースの抽出より単純で確実）、音声は `#35` と同じ
+//! 集合比較 + dts 単調増加の assert で補う。不一致なら `output_path` を削除する。
 //!
 //! ## 設計判断1: 検査4は「出力」ではなく「元ファイル」を `.dtvi` と突き合わせる
 //!
@@ -46,7 +51,10 @@
 //! 許容するオプション（例: `--skip-dtvi-check`）は本 issue のスコープ外とし、将来
 //! 必要になった時点で明示的なフラグとして追加する。
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::Instant;
 
 use anyhow::Context;
 use mp4_atom::Moov;
@@ -414,6 +422,298 @@ fn log_audio_drift(
              None にしてください)"
         )),
     }
+}
+
+// ---------------------------------------------------------------------
+// ffprobe によるパケット単位 CRC32 の一致確認（`--verify` 指定時、CLAUDE.md の罠2）。
+// ---------------------------------------------------------------------
+
+/// `ffprobe_path` を使って `path` に対して `args` を実行し、標準出力を文字列で返す。
+/// 終了コードが 0 以外、または起動自体に失敗した場合はエラーを返す。
+fn run_ffprobe_lines(ffprobe_path: &Path, path: &Path, args: &[&str]) -> anyhow::Result<String> {
+    let output = Command::new(ffprobe_path)
+        .args(args)
+        .arg(path)
+        .output()
+        .with_context(|| {
+            format!(
+                "ffprobe({}) の起動に失敗しました(対象: {})",
+                ffprobe_path.display(),
+                path.display()
+            )
+        })?;
+    anyhow::ensure!(
+        output.status.success(),
+        "ffprobe({}) が失敗しました(対象: {}): {}",
+        ffprobe_path.display(),
+        path.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).context("ffprobe の出力が utf-8 ではありません")
+}
+
+/// 映像ストリームの全パケットの CRC32 を、コンテナの格納順
+/// （= デコード順、[`crate::mp4io::read::samples`] が返す `SampleInfo` と同じ順序）で
+/// 取得する。`video_keep`（元ファイルのデコード順 `DecodeIdx` 列）のインデックスと
+/// そのまま対応するので、`-ss` によるタイムスタンプベースのシークが不要になる。
+fn video_packet_crc32_in_decode_order(
+    ffprobe_path: &Path,
+    path: &Path,
+) -> anyhow::Result<Vec<String>> {
+    let text = run_ffprobe_lines(
+        ffprobe_path,
+        path,
+        &[
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "packet=size,data_hash",
+            "-show_data_hash",
+            "CRC32",
+            "-of",
+            "csv=p=0",
+        ],
+    )?;
+    Ok(text
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+/// 音声ストリームの全パケットの CRC32 集合を取得する（`#35` と同じ集合比較のため）。
+fn audio_packet_crc32_set(ffprobe_path: &Path, path: &Path) -> anyhow::Result<HashSet<String>> {
+    let text = run_ffprobe_lines(
+        ffprobe_path,
+        path,
+        &[
+            "-v",
+            "error",
+            "-select_streams",
+            "a:0",
+            "-show_entries",
+            "packet=data_hash",
+            "-show_data_hash",
+            "CRC32",
+            "-of",
+            "csv=p=0",
+        ],
+    )?;
+    Ok(text
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+/// 音声ストリームの全パケットの dts を格納順に取得する（順序検証用。集合比較では
+/// 順序や重複を検出できないため、これで補う）。
+fn audio_packet_dts(ffprobe_path: &Path, path: &Path) -> anyhow::Result<Vec<i64>> {
+    let text = run_ffprobe_lines(
+        ffprobe_path,
+        path,
+        &[
+            "-v",
+            "error",
+            "-select_streams",
+            "a:0",
+            "-show_entries",
+            "packet=dts",
+            "-of",
+            "csv=p=0",
+        ],
+    )?;
+    text.lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            line.parse::<i64>().with_context(|| {
+                format!("音声パケットの dts が整数としてパースできません: {line:?}")
+            })
+        })
+        .collect()
+}
+
+/// 映像: `video_keep` が指す元ファイルのデコード順インデックス列から「期待される
+/// CRC32列」を組み立て、出力の実際のCRC32列と1対1で比較する。不一致なら最初に食い違った
+/// パケット番号を含むエラーを返す。
+fn verify_video_packets_with_ffprobe(
+    ffprobe_path: &Path,
+    input_path: &Path,
+    output_path: &Path,
+    video_keep: &[DecodeIdx],
+) -> anyhow::Result<()> {
+    let original_crc32 = video_packet_crc32_in_decode_order(ffprobe_path, input_path)
+        .context("元ファイルの映像パケットCRC32の取得に失敗しました")?;
+
+    let expected: Vec<&str> = video_keep
+        .iter()
+        .map(|idx| {
+            original_crc32
+                .get(idx.0 as usize)
+                .map(String::as_str)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "video_keep が指すデコード順インデックス({})が元ファイルの映像 \
+                         パケット総数({})の範囲外です",
+                        idx.0,
+                        original_crc32.len()
+                    )
+                })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+
+    let got = video_packet_crc32_in_decode_order(ffprobe_path, output_path)
+        .context("出力ファイルの映像パケットCRC32の取得に失敗しました")?;
+
+    anyhow::ensure!(
+        got.len() == expected.len(),
+        "映像パケットのCRC32比較に失敗: 出力のパケット数({}) が期待値({})と一致しません",
+        got.len(),
+        expected.len()
+    );
+
+    for (i, (g, e)) in got.iter().zip(expected.iter()).enumerate() {
+        anyhow::ensure!(
+            g == e,
+            "映像パケットのCRC32比較に失敗: 最初に食い違ったパケット番号 = {i} \
+             (出力={g:?}, 期待値(元ファイルのデコード順インデックス{})={e:?})",
+            video_keep[i].0
+        );
+    }
+
+    Ok(())
+}
+
+/// 音声: 出力の全パケットが元ファイルのパケット集合に含まれるか（`#35` と同じ集合
+/// 比較）を確認し、加えて出力の音声パケットの dts が単調増加であることを assert する
+/// （集合比較では順序や重複を検出できないため）。
+fn verify_audio_packets_with_ffprobe(
+    ffprobe_path: &Path,
+    input_path: &Path,
+    output_path: &Path,
+) -> anyhow::Result<()> {
+    let src_set = audio_packet_crc32_set(ffprobe_path, input_path)
+        .context("元ファイルの音声パケットCRC32の取得に失敗しました")?;
+    let out_set = audio_packet_crc32_set(ffprobe_path, output_path)
+        .context("出力ファイルの音声パケットCRC32の取得に失敗しました")?;
+
+    let mut diff: Vec<&String> = out_set.difference(&src_set).collect();
+    diff.sort();
+    anyhow::ensure!(
+        diff.is_empty(),
+        "音声パケットの集合比較に失敗: 出力にしか存在しない音声パケットが{}件あります \
+         (先頭5件: {:?})。ビットコピーではない音声パケットが含まれている可能性があります",
+        diff.len(),
+        diff.iter().take(5).collect::<Vec<_>>()
+    );
+
+    let dts = audio_packet_dts(ffprobe_path, output_path)
+        .context("出力の音声パケットのdts取得に失敗しました")?;
+    for (i, w) in dts.windows(2).enumerate() {
+        anyhow::ensure!(
+            w[1] > w[0],
+            "出力の音声パケットのdtsが単調増加ではありません(パケット{i}→{}: {} -> {})",
+            i + 1,
+            w[0],
+            w[1]
+        );
+    }
+
+    Ok(())
+}
+
+/// [`cut_and_verify`] が成功した後（`output_path` へ rename 済み）に呼ぶ。
+///
+/// ffprobe でパケット単位の CRC32 を突き合わせ、不一致なら `output_path` を削除して
+/// エラーを返す（CLAUDE.md 罠2「無劣化の検証にmd5を使わない」の実装）。
+///
+/// - 映像: `video_keep` から期待される CRC32 列を組み立て、出力の実際の CRC32 列と
+///   1対1で比較する。
+/// - 音声: `has_audio` が真の場合、出力の全パケットが元ファイルのパケット集合に
+///   含まれるか（`#35` と同じ集合比較）、および出力の音声パケットの dts が単調増加で
+///   あるかを確認する。
+///
+/// `ffprobe_path` は呼び出し側が [`crate::tools::resolve_tool`] で解決済みのものを渡す
+/// （`--verify` 指定時に ffprobe が見つからない場合にエラーにするのは呼び出し側の責務。
+/// 本関数は解決済みのパスを受け取るだけでよい）。
+///
+/// `-show_data_hash CRC32` は全パケットを読むためファイルサイズなりの時間がかかる。
+/// かかった時間は `eprintln!` でログに出す。
+pub fn verify_with_ffprobe(
+    input_path: &Path,
+    output_path: &Path,
+    video_keep: &[DecodeIdx],
+    has_audio: bool,
+    ffprobe_path: &Path,
+) -> anyhow::Result<()> {
+    let started = Instant::now();
+
+    let outcome: anyhow::Result<()> = (|| {
+        verify_video_packets_with_ffprobe(ffprobe_path, input_path, output_path, video_keep)?;
+        if has_audio {
+            verify_audio_packets_with_ffprobe(ffprobe_path, input_path, output_path)?;
+        }
+        Ok(())
+    })();
+
+    eprintln!(
+        "[verify] ffprobe によるパケット単位のCRC32検証にかかった時間: {:.3}秒 (対象: {})",
+        started.elapsed().as_secs_f64(),
+        output_path.display()
+    );
+
+    if outcome.is_err() {
+        // 1つでも不一致があれば、既に rename 済みの本番出力を破棄する。
+        let _ = std::fs::remove_file(output_path);
+    }
+
+    outcome
+}
+
+/// `--verify` 指定時の一連の流れ: [`cut_and_verify`] → [`verify_with_ffprobe`]。
+///
+/// `ffprobe_path` は呼び出し側が `tools::resolve_tool` で解決済みのものを渡す設計
+/// （見つからない場合に呼び出し側でエラーにする）。
+#[allow(clippy::too_many_arguments)]
+pub fn cut_verify_and_ffprobe_check(
+    input_path: &Path,
+    output_path: &Path,
+    moov: &Moov,
+    video_track_index: usize,
+    audio_track_index: Option<usize>,
+    snapped_video_ranges: &[SnappedRange],
+    video_keep: &[DecodeIdx],
+    audio_segments: Option<&[AudioSegment]>,
+    video_order: &OrderMap,
+    dtvi: Option<&Dtvi>,
+    audio_samples_for_diff: Option<AudioDiffInputs<'_>>,
+    ffprobe_path: &Path,
+) -> anyhow::Result<VerifyReport> {
+    let report = cut_and_verify(
+        input_path,
+        output_path,
+        moov,
+        video_track_index,
+        audio_track_index,
+        snapped_video_ranges,
+        video_keep,
+        audio_segments,
+        video_order,
+        dtvi,
+        audio_samples_for_diff,
+    )?;
+
+    verify_with_ffprobe(
+        input_path,
+        output_path,
+        video_keep,
+        audio_track_index.is_some(),
+        ffprobe_path,
+    )?;
+
+    Ok(report)
 }
 
 #[cfg(test)]
@@ -949,5 +1249,207 @@ mod tests {
             .unwrap()
             .to_string_lossy()
             .starts_with("out.mp4.verify-tmp-"));
+    }
+
+    // ---------------------------------------------------------------
+    // ffprobe によるパケット単位 CRC32 の一致確認（#37）。
+    // ---------------------------------------------------------------
+
+    /// フィクスチャ/ffmpeg/ffprobe に加え、この一連のテストが必要とする ffprobe を
+    /// 解決する。見つからなければ（スキップ理由を出力して）`None` を返す。
+    fn skip_if_ffprobe_missing() -> Option<PathBuf> {
+        match crate::tools::resolve_tool(None, crate::tools::FFPROBE) {
+            Ok(path) => Some(path),
+            Err(err) => {
+                eprintln!("ffprobe が見つからないためスキップします: {err}");
+                None
+            }
+        }
+    }
+
+    /// 完了条件1: フィクスチャで `cut --verify` 相当の処理（`cut_and_verify` →
+    /// `verify_with_ffprobe`）が成功する。
+    #[test]
+    #[ignore = "tests/fixtures/sample.mp4 と ffmpeg/ffprobe が必要。tests/fixtures/gen.sh を先に実行すること"]
+    fn cut_verify_and_ffprobe_check_succeeds_on_well_formed_fixture() {
+        if skip_if_fixture_missing() {
+            return;
+        }
+        let Some(ffprobe_path) = skip_if_ffprobe_missing() else {
+            return;
+        };
+
+        let f = build_fixture();
+        let tmp_dir = make_tmp_dir("ffprobe-happy-path");
+        let output_path = tmp_dir.join("out.mp4");
+
+        let diff_inputs = AudioDiffInputs {
+            video_segment_durations: &f.video_segment_durations,
+            video_timescale: f.video_timescale,
+            audio_samples: &f.audio_samples,
+            audio_timescale: f.audio_timescale,
+        };
+
+        let report = cut_verify_and_ffprobe_check(
+            &f.input_path,
+            &output_path,
+            &f.moov,
+            f.video_track_index,
+            Some(f.audio_track_index),
+            &f.snapped,
+            &f.video_keep,
+            Some(&f.audio_segments),
+            &f.video_order,
+            Some(&f.dtvi),
+            Some(diff_inputs),
+            &ffprobe_path,
+        )
+        .expect("正常なフィクスチャは cut_and_verify + ffprobe 検証を通るはず");
+
+        assert!(
+            output_path.exists(),
+            "ffprobe 検証も通った出力ファイルが残っているはず"
+        );
+        assert_eq!(report.video_packet_count, f.video_keep.len());
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    /// 完了条件2: `ffprobe` 不在の環境で `--verify` 相当を指定するとエラーになる。
+    ///
+    /// `tools::resolve_tool` が「見つからなければエラー」を正しく返すことを確認する。
+    /// 現在のテストプロセスの `PATH` を直接書き換えると、並行に走る他のテスト
+    /// （`tools.rs` 自身が `PATH` を書き換えるテストを持つ）と競合しうるため、
+    /// 自分自身の実行ファイルを子プロセスとして起動し、その子プロセスの環境変数
+    /// だけを空にして検証する（親プロセスの状態には一切触れない）。
+    #[test]
+    fn resolve_tool_ffprobe_not_found_when_path_is_empty() {
+        let exe = std::env::current_exe().expect("自身の実行ファイルパスが取れること");
+
+        let output = std::process::Command::new(&exe)
+            .arg("--exact")
+            .arg("verify::tests::assert_resolve_tool_fails_without_path_child")
+            .arg("--ignored")
+            .arg("--nocapture")
+            .env_remove("TACHIKAZE_TOOL_DIR")
+            .env("PATH", "")
+            .output()
+            .expect("子プロセス(自分自身)を起動できること");
+
+        assert!(
+            output.status.success(),
+            "PATH が空の子プロセスで resolve_tool(FFPROBE) がエラーにならなかった: \
+             stdout={}\nstderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// 上のテストからのみ、子プロセスとして起動される。`--ignored` を付けているのは
+    /// 単体の `cargo test` 実行では走らせず、必ず親経由の隔離された環境で実行するため。
+    #[test]
+    #[ignore = "resolve_tool_ffprobe_not_found_when_path_is_empty からのみ子プロセスとして起動する"]
+    fn assert_resolve_tool_fails_without_path_child() {
+        let result = crate::tools::resolve_tool(None, crate::tools::FFPROBE);
+        assert!(
+            result.is_err(),
+            "PATH が空(かつ tool_dir/TACHIKAZE_TOOL_DIR も無し)なら ffprobe は \
+             見つからないはず: {result:?}"
+        );
+    }
+
+    /// 完了条件3: 意図的に1パケット壊した出力で不一致が検出され、出力が破棄される。
+    #[test]
+    #[ignore = "tests/fixtures/sample.mp4 と ffmpeg/ffprobe が必要。tests/fixtures/gen.sh を先に実行すること"]
+    fn verify_with_ffprobe_detects_and_discards_a_single_corrupted_video_packet() {
+        if skip_if_fixture_missing() {
+            return;
+        }
+        let Some(ffprobe_path) = skip_if_ffprobe_missing() else {
+            return;
+        };
+
+        let f = build_fixture();
+        let tmp_dir = make_tmp_dir("ffprobe-corrupt");
+        let output_path = tmp_dir.join("out.mp4");
+
+        let diff_inputs = AudioDiffInputs {
+            video_segment_durations: &f.video_segment_durations,
+            video_timescale: f.video_timescale,
+            audio_samples: &f.audio_samples,
+            audio_timescale: f.audio_timescale,
+        };
+
+        // まず正常な出力を作る(cut_and_verify のみ。ffprobe 検証はまだ走らせない)。
+        cut_and_verify(
+            &f.input_path,
+            &output_path,
+            &f.moov,
+            f.video_track_index,
+            Some(f.audio_track_index),
+            &f.snapped,
+            &f.video_keep,
+            Some(&f.audio_segments),
+            &f.video_order,
+            Some(&f.dtvi),
+            Some(diff_inputs),
+        )
+        .expect("正常なフィクスチャは cut_and_verify を通るはず");
+
+        // 壊す前提のセルフチェック: 壊す前は ffprobe 検証も通るはず。
+        verify_with_ffprobe(
+            &f.input_path,
+            &output_path,
+            &f.video_keep,
+            true,
+            &ffprobe_path,
+        )
+        .expect("壊す前は ffprobe 検証も通るはず");
+
+        // 出力ファイルの映像パケットのうち1つのペイロードを1バイト壊す
+        // (「意図的に1パケット壊す」の再現)。
+        let output_moov = read_moov(&output_path).expect("出力moovを読めること");
+        let (output_video_trak, _) =
+            find_video_track(&output_moov).expect("出力に映像トラックがあること");
+        let output_samples = samples(&output_video_trak.mdia.minf.stbl);
+        let target = &output_samples[5];
+        assert!(target.size > 4, "壊すのに十分なサイズのサンプルであること");
+
+        {
+            use std::io::{Read, Seek, SeekFrom, Write};
+            let mut file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&output_path)
+                .expect("出力ファイルを開けること");
+            let offset = target.file_offset + u64::from(target.size) / 2;
+            file.seek(SeekFrom::Start(offset)).expect("seek できること");
+            let mut byte = [0u8; 1];
+            file.read_exact(&mut byte).expect("1バイト読めること");
+            byte[0] ^= 0xFF;
+            file.seek(SeekFrom::Start(offset)).expect("seek できること");
+            file.write_all(&byte).expect("1バイト書き込めること");
+        }
+
+        let err = verify_with_ffprobe(
+            &f.input_path,
+            &output_path,
+            &f.video_keep,
+            true,
+            &ffprobe_path,
+        )
+        .expect_err("1パケット壊した出力はffprobe検証で検出されるはず");
+        let message = err.to_string();
+        assert!(
+            message.contains("食い違った"),
+            "最初に食い違ったパケット番号を含むこと: {message}"
+        );
+
+        assert!(
+            !output_path.exists(),
+            "不一致が検出されたら出力ファイルが破棄されているはず"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 }
