@@ -40,6 +40,7 @@
 use mp4_atom::{Codec, Moov};
 
 use crate::dtvi::Dtvi;
+use crate::mp4io::read::is_audio_codec;
 
 /// 対応していない入力構成を検出したときに返すエラー。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -109,7 +110,7 @@ fn check_track_counts(moov: &Moov) -> Result<(), UnsupportedInput> {
     for trak in &moov.trak {
         match track_codec(trak) {
             Some(Codec::Avc1(_)) => video_count += 1,
-            Some(Codec::Opus(_)) => audio_count += 1,
+            Some(codec) if is_audio_codec(codec) => audio_count += 1,
             _ => other_count += 1,
         }
     }
@@ -215,7 +216,10 @@ mod tests {
     use super::*;
     use crate::dtvi::{DtviFrame, FLAG_LEADING_SAMPLE, FLAG_REQUIRES_EARLIER_RAP};
     use crate::order::{DecodeIdx, DisplayIdx};
-    use mp4_atom::{Audio, Avc1, Dops, Edts, Elst, ElstEntry, Mdia, Minf, Opus, Stbl, Stsd, Trak};
+    use mp4_atom::esds::{DecoderConfig, DecoderSpecific, EsDescriptor, SLConfig};
+    use mp4_atom::{
+        Audio, Avc1, Dops, Edts, Elst, ElstEntry, Esds, Mdia, Minf, Mp4a, Opus, Stbl, Stsd, Trak,
+    };
     use std::collections::HashMap;
     use std::path::Path;
 
@@ -246,14 +250,18 @@ mod tests {
         trak_with_codecs(vec![Codec::Avc1(Avc1::default())])
     }
 
+    fn audio_header() -> Audio {
+        Audio {
+            data_reference_index: 1,
+            channel_count: 2,
+            sample_size: 16,
+            sample_rate: 48_000u16.into(),
+        }
+    }
+
     fn audio_trak() -> Trak {
         trak_with_codecs(vec![Codec::Opus(Opus {
-            audio: Audio {
-                data_reference_index: 1,
-                channel_count: 2,
-                sample_size: 16,
-                sample_rate: 48_000u16.into(),
-            },
+            audio: audio_header(),
             dops: Dops {
                 output_channel_count: 2,
                 pre_skip: 0,
@@ -261,6 +269,33 @@ mod tests {
                 output_gain: 0,
             },
             btrt: None,
+        })])
+    }
+
+    fn aac_trak() -> Trak {
+        trak_with_codecs(vec![Codec::Mp4a(Mp4a {
+            audio: audio_header(),
+            esds: Esds {
+                es_desc: EsDescriptor {
+                    es_id: 0,
+                    dec_config: DecoderConfig {
+                        object_type_indication: 0x40,
+                        stream_type: 5,
+                        up_stream: 0,
+                        buffer_size_db: 0u32.try_into().unwrap(),
+                        max_bitrate: 0,
+                        avg_bitrate: 0,
+                        dec_specific: DecoderSpecific {
+                            profile: 2,
+                            freq_index: 3,
+                            chan_conf: 2,
+                        },
+                    },
+                    sl_config: SLConfig {},
+                },
+            },
+            btrt: None,
+            taic: None,
         })])
     }
 
@@ -304,6 +339,16 @@ mod tests {
     #[test]
     fn accepts_normal_input() {
         let moov = valid_moov_from_fixture_or_synthetic();
+        let dtvi = closed_gop_dtvi();
+        assert!(check_supported(&moov, Some(&dtvi)).is_ok());
+    }
+
+    #[test]
+    fn accepts_aac_as_single_audio_track() {
+        let moov = Moov {
+            trak: vec![video_trak(), aac_trak()],
+            ..Default::default()
+        };
         let dtvi = closed_gop_dtvi();
         assert!(check_supported(&moov, Some(&dtvi)).is_ok());
     }
