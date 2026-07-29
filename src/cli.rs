@@ -59,6 +59,13 @@ pub enum Commands {
         /// `analyze --work-dir <DIR>` を使うと `<DIR>/work.mp4.dtvi` に残る。
         #[arg(long)]
         dtvi: Option<PathBuf>,
+
+        /// 保持区間の補集合（CM として除去した区間）を、指定したパスへ別ファイルとして
+        /// 出力する。検出が当たっているか（CM 側に本編が映り込んでいないか）を目視で
+        /// 確認するための機能（docs/lossless-cut.md「CM 側（除去した区間）を別ファイルに
+        /// 出す」節）。`--snap inward` とは併用できない（保持区間が退化しうるため）。
+        #[arg(long = "cm-output")]
+        cm_output: Option<PathBuf>,
     },
 }
 

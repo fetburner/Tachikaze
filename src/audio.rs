@@ -1,9 +1,17 @@
 //! 出力する各映像区間に対応する音声パケットの範囲を決める。
 //!
 //! 音声（Opus, 20ms グリッド）と映像（例: 30000/1001 fps, 33.37ms グリッド）は
-//! フレーム長が一致しないため、区間ごとに端数が出る。区間の境界を個別に丸めると
-//! 端数が継ぎ目ごとに蓄積しうるため、ここでは**出力タイムライン上の累積映像時間**
-//! から毎回パケット数を計算し直す（[`select_audio_segments`] のドキュメント参照）。
+//! フレーム長が一致しないため、区間ごとに端数が出る。
+//!
+//! 【最重要】区間ごとの音声パケットは、その区間の**ソース上の絶対開始時刻**
+//! （出力タイムライン上の累積時間ではない）に最も近いパケットから選ぶ
+//! （[`select_audio_segments`] のドキュメント参照）。
+//!
+//! 過去に「直前の区間の終端パケットを起点に、出力の累積映像時間で終端だけを決める」
+//! 実装になっており、出力の音声が常にソースの先頭から詰められてしまうバグがあった
+//! （docs/lossless-cut.md「実際に起きた誤り」節）。区間ごとにソースの絶対時刻から
+//! 引き直すことで、CM を挟んで区間がソースの途中から始まる場合でも正しい位置の
+//! 音声を選べる。
 //!
 //! `plan.rs`（映像側のスナップ結果）には依存しない。プリミティブな数値だけを
 //! 受け取ることで、音声側の実装・テストを映像側の型から独立させる。
@@ -22,8 +30,12 @@ pub struct AudioSegment {
 /// ドリフトの統計（ログ・レポート用）。
 #[derive(Copy, Clone, PartialEq, Debug)]
 pub struct DriftStats {
-    /// 各境界での理想値（丸める前の浮動小数点パケット数）と実際に丸めた
-    /// パケット数との誤差（パケット単位）の絶対値の最大。
+    /// 各区間の開始・終了それぞれについて、「ソース上の絶対時刻から求めた理想値
+    /// （丸める前の浮動小数点パケット数）」と「実際に選んだパケットの累積時間」との
+    /// 誤差（パケット単位）の絶対値の最大。
+    ///
+    /// 区間ごとにソースの絶対時刻から独立に引き直すため、この誤差は区間をまたいで
+    /// 蓄積しない（各区間・各境界で独立に、高々半パケット程度に収まる）。
     pub max_abs_error_packets: f64,
 }
 
@@ -32,6 +44,14 @@ pub struct DriftStats {
 /// # 引数
 /// - `video_segment_durations`: 出力に並べる順の各映像区間の再生時間（映像トラックの
 ///   timescale 単位）。
+/// - `video_segment_source_starts`: 各映像区間の**ソース上の絶対 DTS**（映像トラック
+///   の timescale 単位。合成時刻/PTS ではない）。`video_segment_durations` と同じ
+///   長さ・同じ順序。CM 除去により区間がソースの先頭から離れた位置（途中）から
+///   始まりうることを表す値であり、出力タイムライン上の累積時間でもない。なぜ
+///   合成時刻ではなく DTS でなければならないかは
+///   `src/commands.rs::segment_video_source_starts` の doc comment を参照
+///   （出力側は `ctts` を引き継ぐため、合成時刻を渡すと音声が `cts_offset` 分だけ
+///   系統的に先行してしまう）。
 /// - `video_timescale`: 映像トラックの timescale。
 /// - `audio_samples`: 音声トラックの全サンプル（デコード順 == 表示順。音声には B
 ///   フレーム相当が無いため並べ替えは無い）。空スライスの場合は音声処理そのものを
@@ -39,15 +59,22 @@ pub struct DriftStats {
 /// - `audio_timescale`: 音声トラックの timescale（sample rate に相当）。
 ///
 /// # 設計
-/// 区間 `k` が終わった時点までの、出力タイムライン上の累積映像時間を `T_k`
-/// （`T_0 = 0`）とする。`T_k` を音声の timescale に変換した目標時刻に対して、
-/// **音声サンプルの実際の duration を先頭から累積した値**が最も近くなる
-/// パケット数を毎回 `T_k` から計算し直す（二分探索）。区間 `k` に割り当てる
-/// パケットは境界 `k-1` と境界 `k` の半開区間。
+/// 【最重要】区間 `k` の開始・終了それぞれについて、**その区間のソース上の絶対時刻**
+/// （開始は `video_segment_source_starts[k]`、終了は `video_segment_source_starts[k] +
+/// video_segment_durations[k]`）を音声 timescale 単位の目標時刻に変換し、
+/// **音声サンプルの実際の duration を先頭から累積した値**が最も近くなるパケット数を
+/// 毎回そのソース時刻から計算し直す（二分探索）。
 ///
-/// 区間の長さだけを見て毎回独立に丸める方式と異なり、境界のパケット数は常に
-/// 「これまでの累積時間」に対して最も近い値に選ばれるため、丸め誤差が継ぎ目を
-/// 越えて蓄積しない。
+/// **出力タイムライン上の累積時間を起点にしてはいけない。** 過去に「直前の区間の
+/// 終端パケットを起点に、出力の累積映像時間で終端だけを決める」実装になっており、
+/// 出力の音声が常にソースの先頭から詰められ、2区間目以降がそれまでに除去した合計
+/// 時間ぶん先行するバグがあった（docs/lossless-cut.md「実際に起きた誤り」節）。
+///
+/// 音声 20ms グリッドと映像 33.37ms グリッドは一致しないため区間ごとに端数が出るが、
+/// 毎回ソースの絶対時刻から引き直すことで、丸め誤差は**区間ごとに独立**し、CM を
+/// 挟んで区間がソースの途中から始まる場合でも継ぎ目を越えて蓄積しない
+/// （`video_segment_source_starts[k]` は「保持する/しない」に関係ないソース先頭
+/// からの絶対時刻なので、CM の有無に影響されない）。
 ///
 /// **固定の `frame_size`（1パケットあたりの長さ）を仮定しない。** 実データでは
 /// 先頭パケットがエンコーダのプライミング分だけ他のパケットより大幅に長い
@@ -60,6 +87,7 @@ pub struct DriftStats {
 /// 区間の終端が音声サンプル総数を超える場合は音声サンプル総数で止める。
 pub fn select_audio_segments(
     video_segment_durations: &[u64],
+    video_segment_source_starts: &[u64],
     video_timescale: u32,
     audio_samples: &[SampleInfo],
     audio_timescale: u32,
@@ -73,6 +101,12 @@ pub fn select_audio_segments(
         ));
     }
 
+    anyhow::ensure!(
+        video_segment_durations.len() == video_segment_source_starts.len(),
+        "video_segment_durations と video_segment_source_starts の長さが一致しません（{} vs {}）",
+        video_segment_durations.len(),
+        video_segment_source_starts.len()
+    );
     anyhow::ensure!(
         video_timescale > 0,
         "video_timescale はゼロより大きい必要があります"
@@ -99,35 +133,35 @@ pub fn select_audio_segments(
     let mut segments = Vec::with_capacity(video_segment_durations.len());
     let mut max_abs_error_packets = 0.0f64;
 
-    let mut cumulative_video_time: u64 = 0;
-    let mut prev_packet_count: u64 = 0;
+    for (&duration, &source_start) in video_segment_durations
+        .iter()
+        .zip(video_segment_source_starts.iter())
+    {
+        let source_end = source_start + duration;
 
-    for &duration in video_segment_durations {
-        cumulative_video_time += duration;
+        // ソースの絶対時刻(映像timescale単位)を音声timescale単位の目標時刻に変換する。
+        // 出力タイムライン上の累積時間は一切使わない。
+        let start_target = (source_start as f64 * audio_timescale as f64) / video_timescale as f64;
+        let end_target = (source_end as f64 * audio_timescale as f64) / video_timescale as f64;
 
-        // T_k を音声 timescale 単位の目標時刻に変換する。
-        let target =
-            (cumulative_video_time as f64 * audio_timescale as f64) / video_timescale as f64;
-
-        let packet_count = nearest_cumulative_index(&cumulative, target).min(total_audio_samples);
-
-        let actual = cumulative[packet_count as usize] as f64;
-        let error_packets = (actual - target).abs() / average_frame_size;
-        if error_packets > max_abs_error_packets {
-            max_abs_error_packets = error_packets;
-        }
-
-        let start = prev_packet_count.min(total_audio_samples);
-        // 累積値は非減少なので理論上 packet_count >= start だが、丸め誤差に対して
+        let start_idx =
+            nearest_cumulative_index(&cumulative, start_target).min(total_audio_samples);
+        let end_idx_raw =
+            nearest_cumulative_index(&cumulative, end_target).min(total_audio_samples);
+        // 累積値は非減少なので理論上 end_idx_raw >= start_idx だが、丸め誤差に対して
         // 空区間（start == end）を返す形で安全側に倒す。
-        let end = packet_count.max(start);
+        let end_idx = end_idx_raw.max(start_idx);
+
+        let start_actual = cumulative[start_idx as usize] as f64;
+        let end_actual = cumulative[end_idx as usize] as f64;
+        let start_error = (start_actual - start_target).abs() / average_frame_size;
+        let end_error = (end_actual - end_target).abs() / average_frame_size;
+        max_abs_error_packets = max_abs_error_packets.max(start_error).max(end_error);
 
         segments.push(AudioSegment {
-            start: DecodeIdx(start as u32),
-            end: DecodeIdx(end as u32),
+            start: DecodeIdx(start_idx as u32),
+            end: DecodeIdx(end_idx as u32),
         });
-
-        prev_packet_count = end;
     }
 
     Ok((
@@ -337,6 +371,19 @@ mod tests {
             .collect()
     }
 
+    /// 区間が（CM を挟まず）ソース先頭から連続しているケースのための
+    /// `video_segment_source_starts` を組み立てる。`durations[k]` の直前までの
+    /// 累積時間が `k` 番目の区間のソース開始時刻になる（`starts[0] == 0`）。
+    fn contiguous_source_starts(durations: &[u64]) -> Vec<u64> {
+        let mut starts = Vec::with_capacity(durations.len());
+        let mut acc = 0u64;
+        for &d in durations {
+            starts.push(acc);
+            acc += d;
+        }
+        starts
+    }
+
     /// 完了条件: 映像 30000/1001 fps、音声 48000Hz / 960 サンプルで 10 区間つないでも
     /// 累積誤差が 1 パケット以内に収まる。
     #[test]
@@ -351,12 +398,14 @@ mod tests {
         let frames_per_segment = 16u64;
         let segment_duration = frames_per_segment * frame_duration;
         let video_segment_durations = vec![segment_duration; 10];
+        let video_segment_source_starts = contiguous_source_starts(&video_segment_durations);
 
         // 十分な数の音声サンプルを用意する。
         let audio_samples = make_audio_samples(1000, frame_size);
 
         let (segments, stats) = select_audio_segments(
             &video_segment_durations,
+            &video_segment_source_starts,
             video_timescale,
             &audio_samples,
             audio_timescale,
@@ -403,11 +452,13 @@ mod tests {
         let segment_duration = frames_per_segment * frame_duration;
         let num_segments = 10usize;
         let video_segment_durations = vec![segment_duration; num_segments];
+        let video_segment_source_starts = contiguous_source_starts(&video_segment_durations);
 
         let audio_samples = make_audio_samples(1000, frame_size);
 
         let (segments, _stats) = select_audio_segments(
             &video_segment_durations,
+            &video_segment_source_starts,
             video_timescale,
             &audio_samples,
             audio_timescale,
@@ -456,11 +507,13 @@ mod tests {
         let frames_per_segment = 20u64;
         let segment_duration = frames_per_segment * frame_duration;
         let video_segment_durations = vec![segment_duration; 6];
+        let video_segment_source_starts = contiguous_source_starts(&video_segment_durations);
 
         let audio_samples = make_audio_samples(500, frame_size);
 
         let (segments, stats) = select_audio_segments(
             &video_segment_durations,
+            &video_segment_source_starts,
             video_timescale,
             &audio_samples,
             audio_timescale,
@@ -497,12 +550,14 @@ mod tests {
 
         // 20秒ぶんの映像を2区間に分ける(実際のE2Eテストと同じ形)。
         let video_segment_durations = vec![8 * frame_duration * 30, 8 * frame_duration * 30];
+        let video_segment_source_starts = contiguous_source_starts(&video_segment_durations);
 
         let mut audio_samples = make_audio_samples(1000, normal_frame_size);
         audio_samples[0].duration = outlier_first_frame_size;
 
         let (segments, _stats) = select_audio_segments(
             &video_segment_durations,
+            &video_segment_source_starts,
             video_timescale,
             &audio_samples,
             audio_timescale,
@@ -529,10 +584,17 @@ mod tests {
     #[test]
     fn empty_audio_samples_returns_empty_result() {
         let video_segment_durations = vec![1001u64 * 30; 5];
+        let video_segment_source_starts = contiguous_source_starts(&video_segment_durations);
         let audio_samples: Vec<SampleInfo> = Vec::new();
 
-        let (segments, stats) =
-            select_audio_segments(&video_segment_durations, 30000, &audio_samples, 48000).unwrap();
+        let (segments, stats) = select_audio_segments(
+            &video_segment_durations,
+            &video_segment_source_starts,
+            30000,
+            &audio_samples,
+            48000,
+        )
+        .unwrap();
 
         assert!(segments.is_empty());
         assert_eq!(stats.max_abs_error_packets, 0.0);
@@ -548,10 +610,12 @@ mod tests {
 
         // 音声サンプルはごく少数しか用意しない一方、映像区間は長く要求する。
         let video_segment_durations = vec![frame_duration * 10_000];
+        let video_segment_source_starts = vec![0u64];
         let audio_samples = make_audio_samples(10, frame_size);
 
         let (segments, _stats) = select_audio_segments(
             &video_segment_durations,
+            &video_segment_source_starts,
             video_timescale,
             &audio_samples,
             audio_timescale,
@@ -566,8 +630,75 @@ mod tests {
     #[test]
     fn rejects_zero_timescale() {
         let audio_samples = make_audio_samples(10, 960);
-        assert!(select_audio_segments(&[1001], 0, &audio_samples, 48000).is_err());
-        assert!(select_audio_segments(&[1001], 30000, &audio_samples, 0).is_err());
+        assert!(select_audio_segments(&[1001], &[0], 0, &audio_samples, 48000).is_err());
+        assert!(select_audio_segments(&[1001], &[0], 30000, &audio_samples, 0).is_err());
+    }
+
+    #[test]
+    fn rejects_mismatched_source_starts_length() {
+        let audio_samples = make_audio_samples(10, 960);
+        // durations が2要素、source_starts が1要素で不一致。
+        let err =
+            select_audio_segments(&[1001, 1001], &[0], 30000, &audio_samples, 48000).unwrap_err();
+        assert!(err.to_string().contains("video_segment_source_starts"));
+    }
+
+    /// 【最重要】区間ごとの音声は「出力の累積時間」ではなく「その区間のソース上の
+    /// 絶対開始時刻」から選ばれること（docs/lossless-cut.md「実際に起きた誤り」の
+    /// 回帰テスト）。
+    ///
+    /// 区間1はソース [0, 120フレーム)、区間2はソース [360, 480フレーム) を保持し、
+    /// その間の [120, 360) はCMとして除去された想定（実際の cut ではよくある形）。
+    /// 修正前の実装（出力の累積時間を起点にする）だと、区間2の音声は
+    /// 「出力側の120フレーム分経過した時点」＝区間1の終端音声パケットに連結される
+    /// (=segments[1].start == segments[0].end) だけになり、本来のソース360フレーム目
+    /// 付近の音声にはならない。
+    #[test]
+    fn select_audio_segments_uses_source_position_not_output_cumulative_time() {
+        let video_timescale = 30000u32;
+        let frame_duration = 1001u64;
+        let audio_timescale = 48000u32;
+        let frame_size = 960u32;
+
+        let frames_per_segment = 120u64;
+        let segment_duration = frames_per_segment * frame_duration;
+        let video_segment_durations = vec![segment_duration, segment_duration];
+        // 区間2はソースの360フレーム目から始まる（区間1の直後ではない）。
+        let video_segment_source_starts = vec![0u64, 360 * frame_duration];
+
+        let audio_samples = make_audio_samples(2000, frame_size);
+
+        let (segments, _stats) = select_audio_segments(
+            &video_segment_durations,
+            &video_segment_source_starts,
+            video_timescale,
+            &audio_samples,
+            audio_timescale,
+        )
+        .unwrap();
+
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0].start.0, 0);
+
+        // 「出力の累積時間」を起点にする修正前の実装が再発していないことを確認する:
+        // 区間2の開始が区間1の終端に連結されていてはいけない。
+        assert_ne!(
+            segments[1].start.0, segments[0].end.0,
+            "区間2の音声開始が区間1の終端(=出力の累積時間)に連結されている(修正前のバグの再現)"
+        );
+
+        // 区間2の開始はソース360フレーム目付近(=360*frame_duration を音声timescaleに
+        // 変換した時刻に最も近いパケット)になっているはず。
+        let expected_start_target = (video_segment_source_starts[1] as f64
+            * audio_timescale as f64)
+            / video_timescale as f64;
+        let expected_start_idx = (expected_start_target / frame_size as f64).round() as i64;
+        assert!(
+            (segments[1].start.0 as i64 - expected_start_idx).abs() <= 1,
+            "区間2の音声開始がソース360フレーム目付近になっていない: got={}, expected≈{}",
+            segments[1].start.0,
+            expected_start_idx
+        );
     }
 
     /// 完了条件: #33 の `select_audio_segments` と組み合わせた合成データで、
@@ -586,6 +717,7 @@ mod tests {
             .iter()
             .map(|&f| f * frame_duration)
             .collect();
+        let video_segment_source_starts = contiguous_source_starts(&video_segment_durations);
 
         let total_frames: u64 = frames_per_segment.iter().sum();
         // 十分な数の音声サンプルを用意する（映像の総尺を確実に上回る）。
@@ -595,6 +727,7 @@ mod tests {
 
         let (audio_segments, _drift_stats) = select_audio_segments(
             &video_segment_durations,
+            &video_segment_source_starts,
             video_timescale,
             &audio_samples,
             audio_timescale,

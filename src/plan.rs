@@ -147,6 +147,67 @@ pub fn keep_list(snapped: &[SnappedRange], order: &OrderMap) -> Result<Vec<Decod
     Ok(result)
 }
 
+/// 保持区間の集合の**補集合**を返す（CM として除去した区間を別ファイルに出す機能で使う）。
+///
+/// docs/lossless-cut.md「CM 側（除去した区間）を別ファイルに出す」節の設計をそのまま
+/// 実装したもの。`snapped` は `snap()` が返す、外側スナップ済み・昇順・非重複な保持区間
+/// の列であることが前提（`snap(..., Snap::Outward)` の結果のみを渡すこと。`Snap::Inward`
+/// では保持区間が退化（`end < start`）しうり、呼び出し側でこの関数を呼ぶ前に拒否する
+/// 設計になっている。[`crate::commands`] 参照）。
+///
+/// 補集合の各区間は `[前の保持区間の終端, 次の保持区間の開始)`（先頭は `[0, 最初の開始)`、
+/// 末尾は `[最後の終端, total_frames)`）。外側スナップ後の保持区間の両端は必ず同期サンプル
+/// 上にあるため、補集合の両端も必ず同期サンプル上に来る。したがって「S の同期サンプルから
+/// デコード順に `E - S` パケット取る」規則が補集合にもそのまま成立し、追加のスナップ処理は
+/// 一切不要（[`keep_list`] にそのまま渡せる）。
+///
+/// # 空区間は捨てる
+///
+/// 次のいずれかに当てはまる場合、その区間は `start >= end` になるため結果から除く
+/// （境界ケースは docs/lossless-cut.md に列挙されている）:
+///
+/// - 先頭の保持区間が `0` から始まる → 先頭の補集合が空
+/// - 最後の保持区間の終端が `total_frames`（ファイル末尾）→ 末尾の補集合が空
+/// - 保持区間同士が隣接している（間に隙間が無い）→ その間の補集合が空
+/// - `snapped` が空 → 補集合は `[0, total_frames)` の1区間のみ
+///
+/// # `original` / `delta_frames` の意味について
+///
+/// [`SnappedBoundary::original`] は本来「Trim リストに書かれていた値」、
+/// [`SnappedBoundary::delta_frames`] は「そこからのスナップ距離」を表す。しかし補集合の
+/// 境界（保持区間の終端や次の保持区間の開始そのもの）は Trim リストの値に由来しないため、
+/// この意味を持たせられない。そのため本関数が返す境界は一律 `original == snapped`
+/// （= スナップ距離 `delta_frames == 0`）にする。「スナップした」のではなく「保持区間の
+/// 境界をそのまま補集合の境界として採用した」ことを表す値であり、レポート表示で
+/// 「スナップでずれた量」として解釈しないよう注意すること。
+pub fn complement_ranges(snapped: &[SnappedRange], total_frames: u32) -> Vec<SnappedRange> {
+    let total = DisplayIdx(total_frames);
+    let mut result = Vec::new();
+    let mut cursor = DisplayIdx(0);
+
+    for range in snapped {
+        push_gap_if_nonempty(&mut result, cursor, range.start.snapped);
+        cursor = range.end.snapped;
+    }
+    push_gap_if_nonempty(&mut result, cursor, total);
+
+    result
+}
+
+/// `[start, end)` が空でなければ（`start < end` なら）`SnappedRange` として `result` に積む。
+///
+/// `original == snapped` / `delta_frames == 0` にする理由は [`complement_ranges`] の
+/// doc comment を参照。
+fn push_gap_if_nonempty(result: &mut Vec<SnappedRange>, start: DisplayIdx, end: DisplayIdx) {
+    if start >= end {
+        return;
+    }
+    result.push(SnappedRange {
+        start: SnappedBoundary::new(start, start),
+        end: SnappedBoundary::new(end, end),
+    });
+}
+
 /// `sync` のうち `value` **以下で最大**の要素を返す（無ければ `None`）。
 fn floor_or_equal(sync: &[DisplayIdx], value: DisplayIdx) -> Option<DisplayIdx> {
     let idx = sync.partition_point(|&s| s <= value);
@@ -451,6 +512,122 @@ mod tests {
             "区間をまたいで DecodeIdx が重複しています"
         );
         assert_eq!(keep.len(), 12);
+    }
+
+    // ---------------------------------------------------------------
+    // complement_ranges のテスト。
+    // ---------------------------------------------------------------
+
+    /// `complement_ranges` の結果を `(start, end)` の組に変換する（`as_pairs` と同じ用途）。
+    fn complement_pairs(snapped: &[SnappedRange], total_frames: u32) -> Vec<(u32, u32)> {
+        as_pairs(&complement_ranges(snapped, total_frames))
+    }
+
+    #[test]
+    fn complement_of_single_middle_range_has_two_gaps() {
+        // 手作業での確認結果（issue本文）と同じ設定: 20秒599フレームのフィクスチャで
+        // Trim(360,479) 相当（半開区間 [360,480)）を保持した場合。
+        let ranges = vec![range_on_sync(360, 480)];
+        assert_eq!(complement_pairs(&ranges, 599), vec![(0, 360), (480, 599)]);
+    }
+
+    #[test]
+    fn complement_is_empty_when_single_range_covers_whole_file() {
+        let ranges = vec![range_on_sync(0, 599)];
+        assert_eq!(complement_pairs(&ranges, 599), Vec::<(u32, u32)>::new());
+    }
+
+    #[test]
+    fn complement_drops_empty_head_when_first_range_starts_at_zero() {
+        // 先頭が0始まり → 先頭の補集合は空になるので、末尾の1区間だけが残る。
+        let ranges = vec![range_on_sync(0, 120)];
+        assert_eq!(complement_pairs(&ranges, 599), vec![(120, 599)]);
+    }
+
+    #[test]
+    fn complement_drops_empty_tail_when_last_range_ends_at_total_frames() {
+        // 末尾がファイル末尾 → 末尾の補集合は空になるので、先頭の1区間だけが残る。
+        let ranges = vec![range_on_sync(480, 599)];
+        assert_eq!(complement_pairs(&ranges, 599), vec![(0, 480)]);
+    }
+
+    #[test]
+    fn complement_drops_both_empty_ends_when_range_covers_middle_only_between_bounds() {
+        // 先頭 (0始まり) と末尾 (ファイル末尾) の両方が空になり、中間の隙間だけが残る
+        // ケース。複数の保持区間で先頭・末尾それぞれが境界に接している。
+        let ranges = vec![range_on_sync(0, 120), range_on_sync(360, 599)];
+        assert_eq!(complement_pairs(&ranges, 599), vec![(120, 360)]);
+    }
+
+    #[test]
+    fn complement_is_empty_when_adjacent_ranges_leave_no_gap() {
+        // 保持区間が隣接している（間に隙間が無い）→ その間の補集合は空になる。
+        let ranges = vec![range_on_sync(0, 120), range_on_sync(120, 599)];
+        assert_eq!(complement_pairs(&ranges, 599), Vec::<(u32, u32)>::new());
+    }
+
+    #[test]
+    fn complement_of_empty_keep_list_is_whole_file() {
+        // 保持区間が空 → 補集合はファイル全体の1区間になる。
+        let ranges: Vec<SnappedRange> = Vec::new();
+        assert_eq!(complement_pairs(&ranges, 599), vec![(0, 599)]);
+    }
+
+    #[test]
+    fn complement_of_multiple_ranges_has_gap_between_each_pair() {
+        let ranges = vec![
+            range_on_sync(0, 100),
+            range_on_sync(200, 300),
+            range_on_sync(400, 500),
+        ];
+        assert_eq!(
+            complement_pairs(&ranges, 599),
+            vec![(100, 200), (300, 400), (500, 599)]
+        );
+    }
+
+    #[test]
+    fn complement_boundaries_have_original_equal_to_snapped_and_zero_delta() {
+        // 補集合の境界は Trim の値に由来しないため、original == snapped / delta_frames == 0
+        // であることを直接確認する(complement_ranges のdoc comment参照)。
+        let ranges = vec![range_on_sync(360, 480)];
+        let result = complement_ranges(&ranges, 599);
+
+        assert_eq!(result.len(), 2);
+        for r in &result {
+            assert_eq!(r.start.original, r.start.snapped);
+            assert_eq!(r.start.delta_frames, 0);
+            assert_eq!(r.end.original, r.end.snapped);
+            assert_eq!(r.end.delta_frames, 0);
+        }
+    }
+
+    #[test]
+    fn complement_then_keep_list_packet_counts_sum_to_total_frames() {
+        // 手作業での確認結果（issue本文）: 保持側120パケット + CM側479パケット = 599。
+        let order = {
+            // 599フレーム分の閉じたGOP相当のOrderMapは重いので、ここではdisplay==decode
+            // の単純な対応で十分（complement_ranges自体はOrderMapを使わないため、
+            // keep_listの入力としての整合性だけ確認できればよい）。
+            let pairs: Vec<(DisplayIdx, DecodeIdx)> =
+                (0..599u32).map(|i| (DisplayIdx(i), DecodeIdx(i))).collect();
+            OrderMap::new(pairs)
+        };
+
+        let ranges = vec![range_on_sync(360, 480)];
+        let complement = complement_ranges(&ranges, 599);
+
+        let keep = keep_list(&ranges, &order).expect("keep_list should succeed");
+        let cm_keep = keep_list(&complement, &order).expect("keep_list should succeed");
+
+        assert_eq!(keep.len(), 120);
+        assert_eq!(cm_keep.len(), 479);
+        assert_eq!(keep.len() + cm_keep.len(), 599);
+
+        // 互いに素であることも合わせて確認する。
+        let keep_set: BTreeSet<DecodeIdx> = keep.iter().copied().collect();
+        let cm_set: BTreeSet<DecodeIdx> = cm_keep.iter().copied().collect();
+        assert!(keep_set.is_disjoint(&cm_set));
     }
 
     #[test]

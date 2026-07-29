@@ -112,15 +112,22 @@ fn describe_diff(diff: &[&str]) -> String {
 /// そのため `src/audio.rs` と同様に、各パケットの実 duration を先頭から累積し、
 /// 目標時刻に最も近い累積位置を探す方式にする。
 ///
-/// 戻り値は各出力区間の終端パケット数（累積、`AudioSegment.end` 相当）の列。
-/// 区間ごとの長さ（`AudioSegment.end - start` の合計）は最後の要素に等しい
-/// （区間が先頭からテレスコープするため）。
-fn reference_cumulative_audio_packet_ends(
+/// # 【最重要】区間ごとの「ソース上の絶対開始時刻」から引き直す
+///
+/// 過去の実装は「出力タイムライン上の累積映像時間」を起点にしており、2区間目以降の
+/// 音声が常にソースの先頭側へ先行するバグがあった
+/// （docs/lossless-cut.md「実際に起きた誤り」節）。この再実装がそのバグを見逃さない
+/// よう、`video_segment_source_starts`（各区間のソース上の絶対開始時刻）を別途受け取り、
+/// 区間ごとに毎回そこから独立に目標時刻を計算する（出力の累積時間は一切使わない）。
+///
+/// 戻り値は各出力区間の音声パケット範囲 `[start, end)` の列（`AudioSegment` 相当）。
+fn reference_position_based_audio_packet_ranges(
     video_segment_durations: &[u64],
+    video_segment_source_starts: &[u64],
     video_timescale: u32,
     audio_packet_durations: &[u64],
     audio_timescale: u32,
-) -> Vec<u64> {
+) -> Vec<(u64, u64)> {
     // cumulative[i] は audio_packet_durations[0..i] の合計（cumulative[0] == 0）。
     let mut cumulative: Vec<u64> = Vec::with_capacity(audio_packet_durations.len() + 1);
     cumulative.push(0);
@@ -129,17 +136,37 @@ fn reference_cumulative_audio_packet_ends(
     }
     let total_audio_samples = audio_packet_durations.len() as u64;
 
-    let mut cumulative_video_time: u64 = 0;
-    let mut ends = Vec::with_capacity(video_segment_durations.len());
-    for &duration in video_segment_durations {
-        cumulative_video_time += duration;
-        let target =
-            (cumulative_video_time as f64 * audio_timescale as f64) / video_timescale as f64;
-        let packet_count =
-            reference_nearest_cumulative_index(&cumulative, target).min(total_audio_samples);
-        ends.push(packet_count);
+    video_segment_durations
+        .iter()
+        .zip(video_segment_source_starts.iter())
+        .map(|(&duration, &source_start)| {
+            let source_end = source_start + duration;
+
+            let start_target =
+                (source_start as f64 * audio_timescale as f64) / video_timescale as f64;
+            let end_target = (source_end as f64 * audio_timescale as f64) / video_timescale as f64;
+
+            let start = reference_nearest_cumulative_index(&cumulative, start_target)
+                .min(total_audio_samples);
+            let end = reference_nearest_cumulative_index(&cumulative, end_target)
+                .min(total_audio_samples)
+                .max(start);
+            (start, end)
+        })
+        .collect()
+}
+
+/// 区間が（CM を挟まず）ソース先頭から連続しているケースのための
+/// `video_segment_source_starts` を組み立てる（`durations[k]` の直前までの累積時間が
+/// `k` 番目の区間のソース開始時刻になる）。`src/audio.rs` の同名ヘルパと同じ考え方。
+fn contiguous_source_starts(durations: &[u64]) -> Vec<u64> {
+    let mut starts = Vec::with_capacity(durations.len());
+    let mut acc = 0u64;
+    for &d in durations {
+        starts.push(acc);
+        acc += d;
     }
-    ends
+    starts
 }
 
 /// 昇順の `cumulative` の中から `target` に最も近い要素のインデックスを返す。
@@ -259,22 +286,24 @@ mod pure_logic_tests {
         let audio_packet_durations = vec![960u64; 10];
 
         let video_segment_durations = vec![frame_duration * 10_000];
+        let video_segment_source_starts = vec![0u64];
 
-        let ends = reference_cumulative_audio_packet_ends(
+        let ranges = reference_position_based_audio_packet_ranges(
             &video_segment_durations,
+            &video_segment_source_starts,
             video_timescale,
             &audio_packet_durations,
             audio_timescale,
         );
 
         // src/audio.rs の同名テストでは segments[0] == { start: 0, end: 10 } になる。
-        assert_eq!(ends, vec![10]);
+        assert_eq!(ranges, vec![(0, 10)]);
     }
 
     /// `src/audio.rs::select_audio_segments` の `works_with_44100_audio_timescale`
-    /// テストと同じ入力（frame_size=882, audio_timescale=44100, 6区間×20フレーム）
-    /// で、累積誤差が1パケット未満に収まる（区間数が一致し、単調非減少である）ことを
-    /// 確認する。
+    /// テストと同じ入力（frame_size=882, audio_timescale=44100, 6区間×20フレーム、
+    /// ソース先頭から連続）で、累積誤差が1パケット未満に収まる（区間数が一致し、
+    /// 区間が連続して単調非減少である）ことを確認する。
     #[test]
     fn reference_matches_select_audio_segments_44100_case() {
         let video_timescale = 30_000u32;
@@ -285,19 +314,22 @@ mod pure_logic_tests {
         let frames_per_segment = 20u64;
         let segment_duration = frames_per_segment * frame_duration;
         let video_segment_durations = vec![segment_duration; 6];
+        let video_segment_source_starts = contiguous_source_starts(&video_segment_durations);
 
-        let ends = reference_cumulative_audio_packet_ends(
+        let ranges = reference_position_based_audio_packet_ranges(
             &video_segment_durations,
+            &video_segment_source_starts,
             video_timescale,
             &audio_packet_durations,
             audio_timescale,
         );
 
-        assert_eq!(ends.len(), 6);
+        assert_eq!(ranges.len(), 6);
         let mut prev = 0u64;
-        for end in &ends {
-            assert!(*end >= prev, "非減少であること: ends={ends:?}");
-            prev = *end;
+        for &(start, end) in &ranges {
+            assert!(start >= prev, "非減少であること: ranges={ranges:?}");
+            assert!(end >= start);
+            prev = end;
         }
     }
 
@@ -305,9 +337,10 @@ mod pure_logic_tests {
     /// 実測値: 先頭 `3852`、以降 `960`）で、固定の 1 パケット長で割る素朴な計算と
     /// 結果が食い違うことを固定する回帰テスト。
     ///
-    /// `tests/fixtures/sample.mp4` に対して `Trim` を 120 フレーム × 2 区間にした
-    /// 場合、固定長では 400 になるが正しい期待値は 397 である。この差を見落とすと
-    /// e2e テストが「実装が正しいのに落ちる」状態になる（実際にそうなっていた）。
+    /// `tests/fixtures/sample.mp4` に対して `Trim` を 120 フレーム × 2 区間（ソース
+    /// 先頭から連続）にした場合、固定長では 400 になるが正しい期待値は 397 である。
+    /// この差を見落とすと e2e テストが「実装が正しいのに落ちる」状態になる
+    /// （実際にそうなっていた）。
     #[test]
     fn reference_accounts_for_longer_priming_packet() {
         let video_timescale = 30_000u32;
@@ -319,17 +352,19 @@ mod pure_logic_tests {
         audio_packet_durations.extend(std::iter::repeat_n(960u64, 999));
 
         let video_segment_durations = vec![120 * frame_duration, 120 * frame_duration];
+        let video_segment_source_starts = contiguous_source_starts(&video_segment_durations);
 
-        let ends = reference_cumulative_audio_packet_ends(
+        let ranges = reference_position_based_audio_packet_ranges(
             &video_segment_durations,
+            &video_segment_source_starts,
             video_timescale,
             &audio_packet_durations,
             audio_timescale,
         );
 
         assert_eq!(
-            ends,
-            vec![197, 397],
+            ranges,
+            vec![(0, 197), (197, 397)],
             "プライミング分の長い先頭パケットを考慮した期待値になること"
         );
 
@@ -342,9 +377,51 @@ mod pure_logic_tests {
             "素朴な計算は 400 になる（＝使ってはいけない）"
         );
         assert_ne!(
-            *ends.last().unwrap(),
+            ranges.last().unwrap().1,
             naive_last,
             "実 duration の累積と固定長除算が食い違うことをこのテストで固定する"
+        );
+    }
+
+    /// 【最重要】区間ごとの音声は「出力の累積時間」ではなく「その区間のソース上の
+    /// 絶対開始時刻」から選ばれること（docs/lossless-cut.md「実際に起きた誤り」の
+    /// 回帰テスト）。`src/audio.rs` の同名テストと同じ考え方を、本ファイルの独立した
+    /// 再実装で確認する。
+    ///
+    /// 区間1はソース [0, 120フレーム)、区間2はソース [360, 480フレーム) を保持し、
+    /// その間 [120, 360) はCMとして除去された想定（実際の `cut_audio_is_bitwise_copy_
+    /// and_matches_expected_count` / `cut_audio_segments_start_from_correct_source_
+    /// position` と同じ形）。
+    #[test]
+    fn reference_uses_source_position_not_output_cumulative_time() {
+        let video_timescale = 30_000u32;
+        let frame_duration = 1001u64;
+        let audio_timescale = 48_000u32;
+        let audio_packet_durations = vec![960u64; 2000];
+
+        let segment_duration = 120 * frame_duration;
+        let video_segment_durations = vec![segment_duration, segment_duration];
+        // 区間2はソースの360フレーム目から始まる(区間1の直後ではない)。
+        let video_segment_source_starts = vec![0u64, 360 * frame_duration];
+
+        let ranges = reference_position_based_audio_packet_ranges(
+            &video_segment_durations,
+            &video_segment_source_starts,
+            video_timescale,
+            &audio_packet_durations,
+            audio_timescale,
+        );
+
+        assert_eq!(ranges.len(), 2);
+        let (seg1_start, seg1_end) = ranges[0];
+        let (seg2_start, _seg2_end) = ranges[1];
+        assert_eq!(seg1_start, 0);
+
+        // 「出力の累積時間」を起点にする修正前のロジックなら区間2はseg1_endの直後
+        // (=区間1と連結)になってしまうはず。
+        assert_ne!(
+            seg2_start, seg1_end,
+            "区間2の音声開始が区間1の終端(=出力の累積時間)に連結されている(修正前のバグの再現)"
         );
     }
 }
@@ -422,13 +499,106 @@ fn ffprobe_audio_dts(path: &Path) -> Vec<i64> {
 /// 音声ストリームの全パケットの duration を格納順に取得する。
 ///
 /// 固定の 1 パケット長を仮定せず実測値を使うため
-/// （[`reference_cumulative_audio_packet_ends`] のドキュメント参照）。
+/// （[`reference_position_based_audio_packet_ranges`] のドキュメント参照）。
 fn ffprobe_audio_packet_durations(path: &Path) -> Vec<u64> {
     ffprobe_csv_column(path, "a:0", "packet=duration")
         .into_iter()
         .map(|line| {
             line.parse::<u64>()
                 .unwrap_or_else(|_| panic!("duration が整数としてパースできない: {line:?}"))
+        })
+        .collect()
+}
+
+/// 音声ストリームの全パケットの CRC32 を**格納順（重複・順序を保ったまま）**取得する。
+///
+/// [`ffprobe_audio_crc_set`] は `HashSet` に畳み込むため順序と重複が失われる。
+/// 「区間の先頭パケットが元ファイルの正しい位置のパケットと一致するか」という
+/// **位置**の検査には、集合ではなく列としての値が要る。
+fn ffprobe_audio_crc_ordered(path: &Path) -> Vec<String> {
+    let output = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "a:0",
+            "-show_entries",
+            "packet=data_hash",
+            "-show_data_hash",
+            "CRC32",
+            "-of",
+            "csv=p=0",
+        ])
+        .arg(path)
+        .output()
+        .expect("ffprobe の起動に失敗した（PATH を確認）");
+    assert!(
+        output.status.success(),
+        "ffprobe が失敗した: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// 映像ストリームの全パケットの pts（timescale 単位、格納順 = デコード順）を取得する。
+///
+/// 対象フィクスチャは閉じた GOP なので、同期サンプル（GOP境界）のデコード順
+/// インデックスは表示順インデックスと一致する
+/// （`src/mp4io/order_map.rs` の `closed_gop_sync_samples_have_matching_display_and_
+/// decode_index` が実フィクスチャで確認済み）。そのため `pts[display_frame]`
+/// （`display_frame` がGOP境界の場合）がその表示フレームの**ソース上の絶対
+/// プレゼンテーション時刻**（映像timescale単位）になる。CFR前提の
+/// `display_frame * frame_duration` のような決め打ちをせず、実測の pts を直接使う。
+fn ffprobe_video_pts(path: &Path) -> Vec<i64> {
+    ffprobe_csv_column(path, "v:0", "packet=pts")
+        .into_iter()
+        .map(|line| {
+            line.parse::<i64>()
+                .unwrap_or_else(|_| panic!("pts が整数としてパースできない: {line:?}"))
+        })
+        .collect()
+}
+
+/// 映像ストリームの全パケットの dts（timescale 単位、格納順 = デコード順）を取得する。
+///
+/// # なぜ pts ではなく dts が要るか
+///
+/// 区間のソース上の絶対開始時刻として使うべきなのは合成時刻（pts 相当）ではなく
+/// **DTS** である（`src/commands.rs::segment_video_source_starts` の doc comment、
+/// CLAUDE.md「静かに壊れる3つの罠」参照）。過去に `expected_video_segments`
+/// （このテストファイルのオラクル）が `ffprobe_video_pts`（合成時刻）をそのまま
+/// 区間開始時刻として使っており、実装本体（`src/commands.rs`）が合成時刻を使う
+/// バグと**同じ間違いを踏んでいた**ため、テストとバグが「合意」してしまい検出でき
+/// なかった。オラクル側は `ffprobe` が返す dts（実装の内部計算を経由しない、真に
+/// 独立な値）を使うことで、この種の取り違えを検出できるようにする。
+fn ffprobe_video_dts(path: &Path) -> Vec<i64> {
+    ffprobe_csv_column(path, "v:0", "packet=dts")
+        .into_iter()
+        .map(|line| {
+            line.parse::<i64>()
+                .unwrap_or_else(|_| panic!("dts が整数としてパースできない: {line:?}"))
+        })
+        .collect()
+}
+
+/// 音声ストリームの全パケットの pts を格納順に取得する。
+///
+/// 音声には B フレーム相当の並べ替えが無いため、通常 `pts == dts` になる
+/// （[`ffprobe_audio_dts`] と同じ値のはず）。出力の映像 pts と音声 pts の見た目上の
+/// 対応（実際に再生した場合の A/V ずれ）を確認する
+/// [`output_video_and_audio_first_packet_stay_in_av_sync_with_source`] で、
+/// 「音声側もptsで揃える」ことを明示するために dts とは別名で用意する。
+fn ffprobe_audio_pts(path: &Path) -> Vec<i64> {
+    ffprobe_csv_column(path, "a:0", "packet=pts")
+        .into_iter()
+        .map(|line| {
+            line.parse::<i64>()
+                .unwrap_or_else(|_| panic!("pts が整数としてパースできない: {line:?}"))
         })
         .collect()
 }
@@ -577,6 +747,11 @@ const TRIM_AVS_CONTENT: &str = "Trim(10,109) ++ Trim(370,469)";
 /// スナップ後の各区間の映像フレーム数（`[0,120)` と `[360,480)`）。
 const SNAPPED_FRAMES_PER_SEGMENT: [u64; 2] = [120, 120];
 
+/// スナップ後の各区間の開始表示フレーム番号（`[0,120)` と `[360,480)` の開始側）。
+/// どちらも GOP 境界（同期サンプル）なので、デコード順インデックス = 表示順
+/// インデックスであり、`ffprobe_video_pts` の同じ添字でそのままソース時刻が引ける。
+const SNAPPED_START_DISPLAY_FRAMES: [usize; 2] = [0, 360];
+
 /// `cut` に渡す `.dtvi`。実 `dtvindex` 出力の抜粋（`src/mp4io/order_map.rs` の
 /// テストが同じものをフィクスチャとの全行一致検証に使っている）。
 fn dtvi_path() -> std::path::PathBuf {
@@ -618,10 +793,77 @@ fn run_cut(label: &str) -> (std::path::PathBuf, std::path::PathBuf) {
     (tmp_dir, out_path)
 }
 
+/// フィクスチャ・区間定義から `reference_position_based_audio_packet_ranges` に渡す
+/// `video_segment_durations` / `video_segment_source_starts` を実測値から組み立てる。
+///
+/// # なぜ pts ではなく dts を使うか(【最重要】過去にここが原因で67msのA/Vずれを見逃した)
+///
+/// `video_segment_source_starts` は `SNAPPED_START_DISPLAY_FRAMES` の各表示フレームの
+/// 実測 **dts**（`ffprobe_video_dts`）を使う。合成時刻（pts）ではない
+/// （`src/commands.rs::segment_video_source_starts` の doc comment、CLAUDE.md
+/// 「静かに壊れる3つの罠」参照）。
+///
+/// 過去はここで `ffprobe_video_pts`（合成時刻）を使っており、実装本体
+/// （`src/commands.rs`）が合成時刻を区間開始時刻として使うバグと**まったく同じ
+/// 間違い**を踏んでいた。その結果、このテストのオラクル（期待値の再計算）と
+/// 実装が「同じ間違った基準」で一致してしまい、67ms（=Bフレーム並べ替え深度2フレーム
+/// 分の`cts_offset`）のA/Vずれを検出できなかった（`cut_audio_is_bitwise_copy_and_
+/// matches_expected_count` / `cut_audio_segments_start_from_correct_source_position`
+/// はどちらも通っていたが、実際には出力の音声が映像より67ms先行していた）。
+/// dts はソースの実データを ffprobe が直接報告する値であり、`src/commands.rs` の
+/// 内部計算を一切経由しない独立な値なので、この種の取り違えを検出できる。
+///
+/// CFR 前提の `frame * frame_duration` という決め打ちもしない（先頭 GOP でも
+/// `dts != frame * frame_duration` になりうるため）。
+fn expected_video_segments(fixture: &Path) -> (Vec<u64>, Vec<u64>, u32) {
+    let video_timescale: u32 = ffprobe_scalar_stream_entry(fixture, "v:0", "stream=time_base")
+        .rsplit('/')
+        .next()
+        .expect("time_base の書式が想定と違う")
+        .parse()
+        .expect("video timescale が整数としてパースできない");
+    let video_frame_duration: u64 = ffprobe_scalar_stream_entry(fixture, "v:0", "packet=duration")
+        .lines()
+        .next()
+        .expect("映像パケットが1つも無い")
+        .parse()
+        .expect("映像パケットの duration が整数としてパースできない");
+
+    // 対象フィクスチャは閉じた GOP なので、同期サンプル（GOP境界）のデコード順
+    // インデックスは表示順インデックスと一致する（`src/mp4io/order_map.rs` の
+    // `closed_gop_sync_samples_have_matching_display_and_decode_index` で確認済み）。
+    // `SNAPPED_START_DISPLAY_FRAMES` はどちらも GOP 境界なので、`dts`（格納順=
+    // デコード順の配列）を表示フレーム番号でそのまま添字アクセスしてよい。
+    let video_dts = ffprobe_video_dts(fixture);
+    let video_segment_source_starts: Vec<u64> = SNAPPED_START_DISPLAY_FRAMES
+        .iter()
+        .map(|&frame| {
+            let dts = video_dts[frame];
+            assert!(
+                dts >= 0,
+                "映像フレーム{frame}のdtsが負になった: {dts}(想定外)"
+            );
+            dts as u64
+        })
+        .collect();
+
+    let video_segment_durations: Vec<u64> = SNAPPED_FRAMES_PER_SEGMENT
+        .iter()
+        .map(|frames| frames * video_frame_duration)
+        .collect();
+
+    (
+        video_segment_durations,
+        video_segment_source_starts,
+        video_timescale,
+    )
+}
+
 /// 完了条件:
 /// - フィクスチャで差分0件（出力の全音声パケットが入力に存在する）
 /// - 出力の音声パケット数が `select_audio_segments` の計算結果（
-///   `reference_cumulative_audio_packet_ends` で独立に再計算した期待値）と一致する
+///   `reference_position_based_audio_packet_ranges` で独立に再計算した期待値）と
+///   一致する
 /// - 出力の音声パケットの dts が単調増加である
 ///
 #[test]
@@ -642,37 +884,23 @@ fn cut_audio_is_bitwise_copy_and_matches_expected_count() {
     assert!(diff.is_empty(), "{}", describe_diff(&diff));
 
     // --- 完了条件2: 出力の音声パケット数が期待値と一致する ---
-    let video_timescale: u32 = ffprobe_scalar_stream_entry(&fixture, "v:0", "stream=time_base")
-        .rsplit('/')
-        .next()
-        .expect("time_base の書式が想定と違う")
-        .parse()
-        .expect("video timescale が整数としてパースできない");
-    let video_frame_duration: u64 = ffprobe_scalar_stream_entry(&fixture, "v:0", "packet=duration")
-        .lines()
-        .next()
-        .expect("映像パケットが1つも無い")
-        .parse()
-        .expect("映像パケットの duration が整数としてパースできない");
+    let (video_segment_durations, video_segment_source_starts, video_timescale) =
+        expected_video_segments(&fixture);
     let audio_timescale: u32 = ffprobe_scalar_stream_entry(&fixture, "a:0", "stream=sample_rate")
         .parse()
         .expect("sample_rate が整数としてパースできない");
     // 固定の 1 パケット長ではなく実測の duration 列を使う
-    // （reference_cumulative_audio_packet_ends のドキュメント参照）。
+    // （reference_position_based_audio_packet_ranges のドキュメント参照）。
     let audio_packet_durations = ffprobe_audio_packet_durations(&fixture);
 
-    let video_segment_durations: Vec<u64> = SNAPPED_FRAMES_PER_SEGMENT
-        .iter()
-        .map(|frames| frames * video_frame_duration)
-        .collect();
-
-    let expected_ends = reference_cumulative_audio_packet_ends(
+    let expected_ranges = reference_position_based_audio_packet_ranges(
         &video_segment_durations,
+        &video_segment_source_starts,
         video_timescale,
         &audio_packet_durations,
         audio_timescale,
     );
-    let expected_packet_count = *expected_ends.last().expect("区間が1つも無い");
+    let expected_packet_count: u64 = expected_ranges.iter().map(|&(s, e)| e - s).sum();
 
     let got_packet_count = out_set.len() as u64;
     // 集合の要素数はハッシュの衝突が無い限りパケット数と一致するはずだが、より
@@ -693,6 +921,186 @@ fn cut_audio_is_bitwise_copy_and_matches_expected_count() {
         is_strictly_increasing(&got_dts),
         "出力の音声パケットのdtsが単調増加でない: {got_dts:?}"
     );
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+/// 【最重要】自己検証の検査5（`docs/architecture.md`「自己検証（手順10）」の
+/// 検査5）に対応する e2e テスト: 出力の**各区間の先頭音声パケット**の CRC32 が、
+/// 元ファイルの**その区間のソース上の絶対開始時刻**付近のパケットの CRC32 と
+/// 一致すること。
+///
+/// フィクスチャの音声は周波数スイープ（`tests/fixtures/gen.sh` 参照）にしてある。
+/// 一定周波数のサイン波だと全 Opus パケットの中身がほぼ同一バイト列になり、
+/// 「音声パケットをソースのどの位置から取ったか」という位置ずれを CRC32 比較で
+/// 検出できない（同じ値ばかりで一致してしまう）ため、パケットごとに中身が変わる
+/// 信号が必須。
+///
+/// このテストが無いと、`cut_audio_is_bitwise_copy_and_matches_expected_count`
+/// （集合比較 + パケット数一致 + dts単調増加）が通っても、実際には
+/// 「出力の音声が常にソースの先頭から詰められている」バグ
+/// （docs/lossless-cut.md「実際に起きた誤り」参照）を見逃す。実際にそれが起きていた。
+#[test]
+#[ignore = "tests/fixtures/sample.mp4 と ffmpeg/ffprobe が必要。tests/fixtures/gen.sh を先に実行すること"]
+fn cut_audio_segments_start_from_correct_source_position() {
+    if common::skip_if_fixture_missing() || skip_if_missing("ffmpeg") || skip_if_missing("ffprobe")
+    {
+        return;
+    }
+
+    let fixture = common::fixture_path();
+    let (tmp_dir, out_path) = run_cut("position");
+
+    let (video_segment_durations, video_segment_source_starts, video_timescale) =
+        expected_video_segments(&fixture);
+    let audio_timescale: u32 = ffprobe_scalar_stream_entry(&fixture, "a:0", "stream=sample_rate")
+        .parse()
+        .expect("sample_rate が整数としてパースできない");
+    let audio_packet_durations = ffprobe_audio_packet_durations(&fixture);
+
+    // 元ファイルの各区間について、「ソース上の絶対開始時刻」に対応する音声パケット
+    // 範囲を独立に求める（select_audio_segments と同じアルゴリズムのテスト側再実装。
+    // 出力の累積時間は一切使わない）。
+    let expected_ranges = reference_position_based_audio_packet_ranges(
+        &video_segment_durations,
+        &video_segment_source_starts,
+        video_timescale,
+        &audio_packet_durations,
+        audio_timescale,
+    );
+    assert_eq!(expected_ranges.len(), 2, "区間は2つのはず");
+
+    let src_crc = ffprobe_audio_crc_ordered(&fixture);
+    let out_crc = ffprobe_audio_crc_ordered(&out_path);
+
+    // 出力は区間を順番に連結したものなので、出力側のオフセットは各区間の長さ
+    // (end - start) を先頭から積算するだけで求まる。
+    let mut out_offset = 0usize;
+    for (seg_idx, &(src_start, src_end)) in expected_ranges.iter().enumerate() {
+        let seg_len = (src_end - src_start) as usize;
+        assert!(seg_len > 0, "区間{}の音声パケット数が0", seg_idx + 1);
+
+        // 先頭から数パケット（区間が短い場合はその分だけ）を比較する。
+        // 手動の再現手順（issue本文）で最初の3パケットを確認しているのに合わせる。
+        let compare_len = seg_len.min(3).min(out_crc.len() - out_offset);
+        for k in 0..compare_len {
+            let got = &out_crc[out_offset + k];
+            let want = &src_crc[src_start as usize + k];
+            assert_eq!(
+                got,
+                want,
+                "区間{}のパケット{k}: 出力={got:?}, 期待(元ファイルのソース位置{})={want:?}\n\
+                 (出力の音声が出力タイムライン上の累積時間から詰められていないか確認すること)",
+                seg_idx + 1,
+                src_start as usize + k,
+            );
+        }
+
+        out_offset += seg_len;
+    }
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+/// 【最重要】出力の**映像先頭フレームの pts** と**音声先頭パケットの pts** の対応
+/// （実際に再生した場合の見た目上の A/V ずれ）が、元ファイルにおける同じフレーム・
+/// 同じ音声パケットの対応から大きくずれていないことを確認する e2e。
+///
+/// 具体的には、区間ごとに
+/// `(元の映像pts − 元の音声pts) ≈ (出力の映像pts − 出力の音声pts)`
+/// が1音声パケット長以内で成り立つことを assert する。
+///
+/// # 既存の検査と何が違うか（なぜこれが要るか）
+///
+/// [`cut_audio_segments_start_from_correct_source_position`] は「出力の先頭音声
+/// パケットの CRC32 が、テスト側オラクル（[`expected_video_segments`] /
+/// [`reference_position_based_audio_packet_ranges`]）が計算した位置のパケットと
+/// 一致するか」を見る。しかし**テスト側オラクルと実装本体が同じ間違った基準
+/// （合成時刻/PTS）を区間開始時刻に使っていれば、両者は一致してしまい67msのずれを
+/// 見逃す**（実際にこれが起きていた。[`expected_video_segments`] の doc comment
+/// 参照。修正前は `src/commands.rs` も `expected_video_segments` も合成時刻を使って
+/// いたため、比較先が「同じ間違い」を共有していて検出できなかった）。
+///
+/// このテストは `ffprobe` が報告する**再生時の pts 同士の見た目上の対応**だけを
+/// 比較する。実装側・テスト側どちらの「区間開始時刻」計算ロジックにも依存しない
+/// （`select_audio_segments` も `reference_position_based_audio_packet_ranges` も
+/// 呼ばない）ため、実装とテストオラクルが同じ勘違いを共有して見逃す、という
+/// 上記の失敗モードが原理的に起こらない。修正前のコードではここが約67msずれるため、
+/// この検査は実際に有効。
+#[test]
+#[ignore = "tests/fixtures/sample.mp4 と ffmpeg/ffprobe が必要。tests/fixtures/gen.sh を先に実行すること"]
+fn output_video_and_audio_first_packet_stay_in_av_sync_with_source() {
+    if common::skip_if_fixture_missing() || skip_if_missing("ffmpeg") || skip_if_missing("ffprobe")
+    {
+        return;
+    }
+
+    let fixture = common::fixture_path();
+    let (tmp_dir, out_path) = run_cut("avsync");
+
+    // 区間ごとの「元ファイルでの音声パケット範囲」はテスト側オラクルで求める
+    // （出力側で各区間が何パケットになるかを、区間の長さを先頭から積算して求める
+    // ためだけに使う。区間開始時刻の比較そのものには使わない点が
+    // `cut_audio_segments_start_from_correct_source_position` と違う）。
+    let (video_segment_durations, video_segment_source_starts, video_timescale) =
+        expected_video_segments(&fixture);
+    let audio_timescale: u32 = ffprobe_scalar_stream_entry(&fixture, "a:0", "stream=sample_rate")
+        .parse()
+        .expect("sample_rate が整数としてパースできない");
+    let audio_packet_durations = ffprobe_audio_packet_durations(&fixture);
+    let expected_ranges = reference_position_based_audio_packet_ranges(
+        &video_segment_durations,
+        &video_segment_source_starts,
+        video_timescale,
+        &audio_packet_durations,
+        audio_timescale,
+    );
+    assert_eq!(expected_ranges.len(), 2, "区間は2つのはず");
+
+    let src_video_pts = ffprobe_video_pts(&fixture);
+    let out_video_pts = ffprobe_video_pts(&out_path);
+    let src_audio_pts = ffprobe_audio_pts(&fixture);
+    let out_audio_pts = ffprobe_audio_pts(&out_path);
+
+    // 出力側で各区間が始まる映像フレーム番号・音声パケット番号。出力は区間を
+    // 順番に連結したものなので、区間の長さ(映像はSNAPPED_FRAMES_PER_SEGMENT、
+    // 音声はexpected_rangesの幅)を先頭から積算するだけで求まる
+    // （cut_audio_segments_start_from_correct_source_position と同じ考え方）。
+    let mut out_video_frame = 0usize;
+    let mut out_audio_packet = 0usize;
+
+    for (seg_idx, (&src_frame, &(src_audio_start, src_audio_end))) in SNAPPED_START_DISPLAY_FRAMES
+        .iter()
+        .zip(expected_ranges.iter())
+        .enumerate()
+    {
+        let src_video_pts_sec = src_video_pts[src_frame] as f64 / video_timescale as f64;
+        let src_audio_pts_sec =
+            src_audio_pts[src_audio_start as usize] as f64 / audio_timescale as f64;
+        let src_av_offset_sec = src_video_pts_sec - src_audio_pts_sec;
+
+        let out_video_pts_sec = out_video_pts[out_video_frame] as f64 / video_timescale as f64;
+        let out_audio_pts_sec = out_audio_pts[out_audio_packet] as f64 / audio_timescale as f64;
+        let out_av_offset_sec = out_video_pts_sec - out_audio_pts_sec;
+
+        // 1音声パケット長ぶんの許容誤差。パケット長は一定でない(先頭はプライミング
+        // で他より長い)ため、比較対象の区間の先頭パケットの実測durationを使う。
+        let tolerance_sec =
+            audio_packet_durations[src_audio_start as usize] as f64 / audio_timescale as f64;
+
+        let drift_sec = (src_av_offset_sec - out_av_offset_sec).abs();
+        assert!(
+            drift_sec <= tolerance_sec,
+            "区間{}: 元ファイルの(映像pts-音声pts)={src_av_offset_sec:.6}s に対し \
+             出力の(映像pts-音声pts)={out_av_offset_sec:.6}s で、{drift_sec:.6}s \
+             (許容{tolerance_sec:.6}s)ずれている。音声が映像より先行/遅延していないか \
+             確認すること(docs/lossless-cut.md「実際に起きた誤り」参照)",
+            seg_idx + 1
+        );
+
+        out_video_frame += SNAPPED_FRAMES_PER_SEGMENT[seg_idx] as usize;
+        out_audio_packet += (src_audio_end - src_audio_start) as usize;
+    }
 
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }

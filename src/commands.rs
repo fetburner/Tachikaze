@@ -3,15 +3,17 @@
 //! `src/main.rs` から切り出してライブラリ側に置いてある（理由は crate ルートの
 //! ドキュメント参照）。各モジュールの処理をつなぐだけで、アルゴリズムは持たない。
 
+use std::collections::HashSet;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, Context};
+use anyhow::{anyhow, bail, Context};
 use mp4_atom::{Codec, Moov};
 
 use crate::cli::{Cli, Commands};
+use crate::dtvi::Dtvi;
 use crate::mp4io::read::SampleInfo;
-use crate::order::DecodeIdx;
+use crate::order::{DecodeIdx, DisplayIdx, OrderMap};
 use crate::{analyze, audio, cli, dtvi, mp4io, plan, report, tools, trim, verify};
 
 /// パース済みの CLI 引数を受け取り、対応するサブコマンドを実行する。
@@ -35,8 +37,9 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
             video_only,
             verify,
             dtvi,
+            cm_output,
         } => run_cut(
-            tool_dir, input, trim, output, snap, video_only, verify, dtvi,
+            tool_dir, input, trim, output, snap, video_only, verify, dtvi, cm_output,
         ),
     }
 }
@@ -116,7 +119,22 @@ fn run_cut(
     video_only: bool,
     verify_with_ffprobe: bool,
     dtvi_path: Option<PathBuf>,
+    cm_output: Option<PathBuf>,
 ) -> anyhow::Result<()> {
+    // `--snap inward` は保持区間を退化させうる（終端が開始より前になる）。その場合
+    // 「保持区間の補集合をそのまま区間リストとして使える」という complement_ranges の
+    // 前提（区間が昇順・非重複）が崩れ、CM側の区間の順序も壊れる
+    // （docs/lossless-cut.md「CM 側（除去した区間）を別ファイルに出す」節）。
+    // 実害が出る前に、ここで明示エラーにして止める。
+    if cm_output.is_some() && snap == cli::Snap::Inward {
+        bail!(
+            "--snap inward と --cm-output は併用できません。inward スナップでは保持区間が \
+             退化する（終端が開始より前になる）ことがあり、その場合 CM 側（補集合）の \
+             区間の順序も壊れるため、意味のある CM 出力を作れません。--cm-output を \
+             使う場合は既定の --snap outward を使ってください。"
+        );
+    }
+
     let moov = mp4io::read::read_moov(&input)
         .with_context(|| format!("入力 mp4 の読み込みに失敗しました: {}", input.display()))?;
 
@@ -155,7 +173,6 @@ fn run_cut(
 
     let snapped = plan::snap(&trim, &sync_display, total_frames, snap)?;
     let video_keep = plan::keep_list(&snapped, &map.order)?;
-    let video_segment_durations = segment_video_durations(&snapped, &video_keep, &video_samples);
 
     let audio_track = if video_only {
         None
@@ -170,72 +187,251 @@ fn run_cut(
     let audio_samples: Option<Vec<SampleInfo>> = audio_track
         .as_ref()
         .map(|(trak, _)| mp4io::read::samples(&trak.mdia.minf.stbl));
+    let audio_timescale = audio_track.as_ref().map(|(_, info)| info.timescale);
 
-    let audio_segments = match (&audio_track, &audio_samples) {
-        (Some((_, info)), Some(samples)) => {
-            let (segments, _drift) = audio::select_audio_segments(
-                &video_segment_durations,
-                video_info.timescale,
-                samples,
-                info.timescale,
-            )?;
-            Some(segments)
+    let pipeline = CutPipeline {
+        tool_dir,
+        input: &input,
+        moov: &moov,
+        video_track_index,
+        audio_track_index,
+        video_samples: &video_samples,
+        video_timescale: video_info.timescale,
+        order: &map.order,
+        audio_samples: audio_samples.as_deref(),
+        audio_timescale,
+        dtvi_data: dtvi_data.as_ref(),
+        verify_with_ffprobe,
+    };
+
+    match cm_output {
+        None => {
+            let report = pipeline.run(&snapped, &video_keep, &output)?;
+            print_cut_report("cut 完了", "保持区間数", &output, &report);
         }
-        _ => None,
-    };
+        Some(cm_output) => {
+            let complement = plan::complement_ranges(&snapped, total_frames);
+            let cm_keep = plan::keep_list(&complement, &map.order)?;
 
-    let audio_diff_inputs = match (&audio_track, &audio_samples) {
-        (Some((_, info)), Some(samples)) => Some(verify::AudioDiffInputs {
-            video_segment_durations: &video_segment_durations,
-            video_timescale: video_info.timescale,
-            audio_samples: samples,
-            audio_timescale: info.timescale,
-        }),
-        _ => None,
-    };
+            // 自己検証8（docs/architecture.md「自己検証」節）: 保持側とCM側の映像フレーム
+            // 数の合計 == 総フレーム数、かつ DecodeIdx の集合が互いに素であることを、
+            // どちらの出力もまだ書き出していない時点（純粋な計算結果の比較のみ）で確認する。
+            // ここで先に確認しておくことで、失敗時にどちらの出力ファイルも一切作られない
+            // ことを保証する（「片方だけ書けて片方で落ちる」順序を避ける）。
+            verify_mutual_exclusivity(&video_keep, &cm_keep, total_frames)?;
 
-    let report = if verify_with_ffprobe {
-        let ffprobe_path = tools::resolve_tool(tool_dir.as_deref(), tools::FFPROBE)?;
-        verify::cut_verify_and_ffprobe_check(
-            &input,
-            &output,
-            &moov,
-            video_track_index,
-            audio_track_index,
-            &snapped,
-            &video_keep,
-            audio_segments.as_deref(),
-            &map.order,
-            dtvi_data.as_ref(),
-            audio_diff_inputs,
-            &ffprobe_path,
-        )?
-    } else {
-        verify::cut_and_verify(
-            &input,
-            &output,
-            &moov,
-            video_track_index,
-            audio_track_index,
-            &snapped,
-            &video_keep,
-            audio_segments.as_deref(),
-            &map.order,
-            dtvi_data.as_ref(),
-            audio_diff_inputs,
-        )?
-    };
+            // 保持側・CM側とも、まず最終出力先とは別の一時パスに書き出す。両方成功した
+            // 場合にのみ最終パスへ rename することで、どちらか一方の書き出し・検証が
+            // 失敗したときに成功した側だけが最終出力として残ってしまう事態を防ぐ
+            // （`verify::cut_and_verify` 自体は1ファイル単位でしか原子性を持たないため、
+            // 2ファイルにまたがる原子性はここで担保する）。
+            let tmp_output = sibling_pending_path(&output);
+            let tmp_cm_output = sibling_pending_path(&cm_output);
 
-    println!("cut 完了: {}", output.display());
+            let write_result =
+                (|| -> anyhow::Result<(verify::VerifyReport, verify::VerifyReport)> {
+                    let report = pipeline.run(&snapped, &video_keep, &tmp_output)?;
+                    let cm_report = pipeline.run(&complement, &cm_keep, &tmp_cm_output)?;
+                    Ok((report, cm_report))
+                })();
+
+            let (report, cm_report) = match write_result {
+                Ok(v) => v,
+                Err(err) => {
+                    let _ = fs::remove_file(&tmp_output);
+                    let _ = fs::remove_file(&tmp_cm_output);
+                    return Err(err);
+                }
+            };
+
+            fs::rename(&tmp_output, &output).with_context(|| {
+                format!(
+                    "一時ファイル({})から出力先({})への rename に失敗しました",
+                    tmp_output.display(),
+                    output.display()
+                )
+            })?;
+            fs::rename(&tmp_cm_output, &cm_output).with_context(|| {
+                format!(
+                    "一時ファイル({})から出力先({})への rename に失敗しました",
+                    tmp_cm_output.display(),
+                    cm_output.display()
+                )
+            })?;
+
+            print_cut_report("cut 完了", "保持区間数", &output, &report);
+            print_cut_report("CM 出力完了", "CM区間数", &cm_output, &cm_report);
+        }
+    }
+
+    Ok(())
+}
+
+/// cut パイプラインのうち「どの区間を切り出すか」以外は変わらない入力をまとめたもの。
+///
+/// `--cm-output` 指定時、保持側と CM 側（補集合）に対して同じ処理（音声区間選択→
+/// `verify::cut_and_verify`(または ffprobe 検証付き版)の呼び出し）を2回行う。呼び出しごと
+/// に変わるのは区間リスト（`snapped` / `video_keep`）と出力先だけなので、それ以外を
+/// この構造体にまとめることで `run_cut` 本体の `#[allow(clippy::too_many_arguments)]` を
+/// 増やさずに済ませる。
+struct CutPipeline<'a> {
+    tool_dir: Option<PathBuf>,
+    input: &'a Path,
+    moov: &'a Moov,
+    video_track_index: usize,
+    audio_track_index: Option<usize>,
+    video_samples: &'a [SampleInfo],
+    video_timescale: u32,
+    order: &'a OrderMap,
+    audio_samples: Option<&'a [SampleInfo]>,
+    audio_timescale: Option<u32>,
+    dtvi_data: Option<&'a Dtvi>,
+    verify_with_ffprobe: bool,
+}
+
+impl CutPipeline<'_> {
+    /// 区間リスト `snapped`（に対応する `video_keep`）を1回分書き出し、検証する。
+    /// 保持側・CM側のどちらの呼び出しにも使う共通処理（音声区間選択→書き出し→
+    /// 自己検証）。`--video-only` / `--verify` / `.dtvi` の扱いは呼び出し元に関わらず
+    /// 常に同じになる（`self` のフィールドで一元管理しているため分岐が生まれない）。
+    fn run(
+        &self,
+        snapped: &[plan::SnappedRange],
+        video_keep: &[DecodeIdx],
+        output: &Path,
+    ) -> anyhow::Result<verify::VerifyReport> {
+        let video_segment_durations =
+            segment_video_durations(snapped, video_keep, self.video_samples);
+        let video_segment_source_starts =
+            segment_video_source_starts(snapped, self.order, self.video_samples)?;
+
+        let audio_segments = match (self.audio_samples, self.audio_timescale) {
+            (Some(samples), Some(audio_timescale)) => {
+                let (segments, _drift) = audio::select_audio_segments(
+                    &video_segment_durations,
+                    &video_segment_source_starts,
+                    self.video_timescale,
+                    samples,
+                    audio_timescale,
+                )?;
+                Some(segments)
+            }
+            _ => None,
+        };
+
+        let audio_diff_inputs = match (self.audio_samples, self.audio_timescale) {
+            (Some(samples), Some(audio_timescale)) => Some(verify::AudioDiffInputs {
+                video_segment_durations: &video_segment_durations,
+                video_segment_source_starts: &video_segment_source_starts,
+                video_timescale: self.video_timescale,
+                audio_samples: samples,
+                audio_timescale,
+            }),
+            _ => None,
+        };
+
+        if self.verify_with_ffprobe {
+            let ffprobe_path = tools::resolve_tool(self.tool_dir.as_deref(), tools::FFPROBE)?;
+            verify::cut_verify_and_ffprobe_check(
+                self.input,
+                output,
+                self.moov,
+                self.video_track_index,
+                self.audio_track_index,
+                snapped,
+                video_keep,
+                audio_segments.as_deref(),
+                self.order,
+                self.dtvi_data,
+                audio_diff_inputs,
+                &ffprobe_path,
+            )
+        } else {
+            verify::cut_and_verify(
+                self.input,
+                output,
+                self.moov,
+                self.video_track_index,
+                self.audio_track_index,
+                snapped,
+                video_keep,
+                audio_segments.as_deref(),
+                self.order,
+                self.dtvi_data,
+                audio_diff_inputs,
+            )
+        }
+    }
+}
+
+/// 自己検証8（docs/architecture.md「自己検証」節）: `--cm-output` 指定時、保持側とCM側で
+/// 次の2点を assert する。
+///
+/// - 映像フレーム数の合計が入力の総フレーム数と一致する
+/// - `DecodeIdx` の集合が互いに素である
+///
+/// `video_keep` / `cm_keep` はどちらも `plan::keep_list` の戻り値そのもの（I/O を伴わない
+/// 純粋な計算結果）なので、この検査は書き出し前に行える。境界が1フレームでもずれれば
+/// 必ず失敗する。
+fn verify_mutual_exclusivity(
+    video_keep: &[DecodeIdx],
+    cm_keep: &[DecodeIdx],
+    total_frames: u32,
+) -> anyhow::Result<()> {
+    let total = video_keep.len() + cm_keep.len();
+    anyhow::ensure!(
+        total as u64 == u64::from(total_frames),
+        "自己検証8(相互検証)に失敗: 保持側の映像フレーム数({}) と CM側の映像フレーム数({}) \
+         の合計({total}) が入力の総フレーム数({total_frames})と一致しません",
+        video_keep.len(),
+        cm_keep.len()
+    );
+
+    let video_set: HashSet<DecodeIdx> = video_keep.iter().copied().collect();
+    let mut overlap: Vec<u32> = cm_keep
+        .iter()
+        .filter(|d| video_set.contains(d))
+        .map(|d| d.0)
+        .collect();
+    overlap.sort_unstable();
+    anyhow::ensure!(
+        overlap.is_empty(),
+        "自己検証8(相互検証)に失敗: 保持側とCM側の映像デコード順インデックスが{}個重複して \
+         います(先頭5件: {:?})。境界のスナップまたは補集合の計算に誤りがある可能性があります",
+        overlap.len(),
+        overlap.iter().take(5).collect::<Vec<_>>()
+    );
+
+    Ok(())
+}
+
+/// `path` と同じディレクトリに、一意なサフィックスを付けた一時パスを作る。
+///
+/// `--cm-output` 指定時、保持側とCM側の両方の書き出し・検証が成功するまで最終的な
+/// 出力先へ rename しない（`run_cut` のコメント参照）。`verify::cut_and_verify` 内部の
+/// 一時ファイル（書き出し直後の検証用、`temp_output_path`）とは別の、もう1段階の
+/// 一時パス。
+fn sibling_pending_path(path: &Path) -> PathBuf {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let mut os = path.as_os_str().to_os_string();
+    os.push(format!(".cm-pending-{}-{nonce}", std::process::id()));
+    PathBuf::from(os)
+}
+
+/// cut 完了時の結果表示。保持側/CM側で見出しと区間数のラベルだけを変える
+/// （`docs/architecture.md`「コマンド構成」節の表示例参照）。
+fn print_cut_report(label: &str, range_label: &str, output: &Path, report: &verify::VerifyReport) {
+    println!("{label}: {}", output.display());
     println!(
-        "映像パケット数: {} / 保持区間数: {}",
+        "映像パケット数: {} / {range_label}: {}",
         report.video_packet_count, report.video_range_count
     );
     if let Some(av_sync) = &report.av_sync {
         println!("{}", audio::format_av_sync_report(av_sync));
     }
-
-    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -251,6 +447,73 @@ fn track_index(moov: &Moov, kind: TrackKind) -> Option<usize> {
         matches!(
             (kind, trak.mdia.minf.stbl.stsd.codecs.first()),
             (TrackKind::Video, Some(Codec::Avc1(_))) | (TrackKind::Audio, Some(Codec::Opus(_)))
+        )
+    })
+}
+
+/// スナップ済み区間ごとに、その区間の**ソース上の絶対開始時刻（DTS 基準）**（映像
+/// トラックの timescale 単位）を求める。
+///
+/// 【最重要・静かに壊れる罠】ここは**合成時刻（PTS 相当、`dts + cts_offset`）ではなく
+/// DTS を返す**必要がある。理由は次の式（出力側で区間内のサンプルが連続し duration が
+/// 保たれることから導ける）による:
+///
+/// ```text
+/// output_pts(i) = T_{k-1} + source_pts(i) - source_dts(区間kの先頭サンプル)
+/// ```
+///
+/// （`T_{k-1}` はそれ以前の区間の映像長の累積 = 出力タイムライン上の区間 k の開始。
+/// `source_pts(i)` / `source_dts(i)` はソース上のサンプル `i` の合成時刻 / DTS。）
+///
+/// つまり出力タイムライン上の時刻 `T_{k-1} + u` に表示されるフレームのソース上の時刻は
+/// `source_dts(区間kの先頭サンプル) + u` であり、**区間の音声は「ソース時刻
+/// `dts(区間先頭サンプル)`」から選び始めるのが正しい**。
+///
+/// 以前はここに合成時刻（`dts + cts_offset` を返す `composition_time` という関数が
+/// あった。以後は使われなくなったため削除し、DTS のみを返す
+/// `mp4io::order_map::decode_timestamp` に置き換えた）を渡していた。`mp4io/write.rs` は
+/// `ctts` を引き継ぐため、出力の先頭フレームの pts は 0 ではなく `cts_offset`
+/// （B フレームの並べ替え深度ぶん。実測で約 66.7ms = 2 フレーム分）のままになる。
+/// 一方で音声は出力タイムライン 0 から並び始めるため、**音声が映像より
+/// `cts_offset` ぶん系統的に先行する**ずれが生まれていた（エラーは一切出ない）。
+/// 次にここを触る人へ: 「合成時刻の方が実際の再生時刻に近いから正しいはず」という
+/// 直感は罠なので、pts/合成時刻に戻さないこと。
+///
+/// 区間の開始点（`SnappedRange::start.snapped`、`DisplayIdx`）を `order.to_decode` で
+/// デコード順に変換し、`mp4io::order_map::decode_timestamp`（`dts(i) = samples[0..i]`
+/// の duration 累積、`dts(0) = 0`、`DisplayDecodeMap::build` と同じ定義）で DTS を
+/// 求める。CFR 前提の `S * frame_duration` のような決め打ちはしない（open GOP 由来の
+/// 端数がある場合や将来の可変長エンコードでも正しく動くようにするため）。
+fn segment_video_source_starts(
+    snapped: &[plan::SnappedRange],
+    order: &OrderMap,
+    video_samples: &[SampleInfo],
+) -> anyhow::Result<Vec<u64>> {
+    snapped
+        .iter()
+        .map(|range| video_source_decode_timestamp(video_samples, order, range.start.snapped))
+        .collect()
+}
+
+/// 表示順インデックス `display` に対応する、ソース上の絶対 DTS（映像トラックの
+/// timescale 単位）を求める。合成時刻（PTS）ではなく DTS を返す理由は
+/// [`segment_video_source_starts`] の doc comment を参照。
+fn video_source_decode_timestamp(
+    video_samples: &[SampleInfo],
+    order: &OrderMap,
+    display: DisplayIdx,
+) -> anyhow::Result<u64> {
+    let decode = order.to_decode(display).ok_or_else(|| {
+        anyhow!(
+            "表示順インデックス {} に対応するデコード順インデックスが見つかりません",
+            display.0
+        )
+    })?;
+
+    mp4io::order_map::decode_timestamp(video_samples, decode).ok_or_else(|| {
+        anyhow!(
+            "デコード順インデックス {} が映像サンプルの範囲外です",
+            decode.0
         )
     })
 }

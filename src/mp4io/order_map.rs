@@ -21,6 +21,34 @@ use crate::dtvi::Dtvi;
 use crate::mp4io::read::SampleInfo;
 use crate::order::{DecodeIdx, DisplayIdx, OrderMap};
 
+/// デコード順サンプル `decode` の DTS（`dts(decode)`、デコード順の duration 累積、
+/// `dts(0) = 0`）を求める。
+///
+/// 定義は [`DisplayDecodeMap::build`] の doc comment の `dts(i)` と同じ
+/// （`samples[0..i]` の `duration` 累積）。**合成時刻（`dts + cts_offset`、表示順を
+/// 決める値）とは別物**であることに注意（`cts_offset` は加えない）。
+///
+/// 区間の「ソース上の絶対開始時刻」を求めるときはこちらの DTS を使う。合成時刻
+/// （PTS 相当）を使うと、出力側で `ctts` を引き継ぐ都合上、音声が
+/// `cts_offset`（B フレームの並べ替え深度ぶん）先行してしまう系統的なずれの原因になる
+/// （なぜ合成時刻ではなく DTS が正しいのかの導出は
+/// `src/commands.rs::segment_video_source_starts` の doc comment を参照）。
+///
+/// `decode` が `samples` の範囲外なら `None`。
+///
+/// 呼び出しごとに `samples[0..decode.0]` の duration を合計し直す（O(n)）。
+/// カット処理では出力区間の数（せいぜい数十）だけ呼ばれるため、この程度の
+/// 計算量で十分（`DisplayDecodeMap::build` のようにファイル全体を1回で処理する
+/// 必要がある場面では、代わりに `build` 内の累積ループを使うこと）。
+pub fn decode_timestamp(samples: &[SampleInfo], decode: DecodeIdx) -> Option<u64> {
+    let idx = decode.0 as usize;
+    if idx >= samples.len() {
+        return None;
+    }
+    let dts: u64 = samples[..idx].iter().map(|s| s.duration as u64).sum();
+    Some(dts)
+}
+
 /// 表示順 ⇔ デコード順の対応（[`OrderMap`]）と、同期サンプルの一覧を保持する。
 pub struct DisplayDecodeMap {
     /// 表示順 ⇔ デコード順の対応。
@@ -371,6 +399,31 @@ mod tests {
         assert_eq!(map.order.to_decode(DisplayIdx(1)), Some(DecodeIdx(2)));
         assert_eq!(map.order.to_decode(DisplayIdx(2)), Some(DecodeIdx(3)));
         assert_eq!(map.order.to_decode(DisplayIdx(3)), Some(DecodeIdx(1)));
+    }
+
+    /// [`decode_timestamp`] が `DisplayDecodeMap::build` と同じ `dts(i)` の定義
+    /// （duration 累積、`cts_offset` は加えない）で DTS を求めることを、同じ合成データ
+    /// （`reordered_samples`）で確認する。合成時刻（cts）とは異なる値になることも
+    /// あわせて確認する（decode1 は cts=4000 だが dts=1000）。
+    #[test]
+    fn decode_timestamp_matches_build_derivation() {
+        let samples = reordered_samples();
+
+        // reordered_samples() のコメントに書かれている dts の累積そのもの:
+        // decode0: dts=0
+        // decode1: dts=1000
+        // decode2: dts=2000
+        // decode3: dts=3000
+        assert_eq!(decode_timestamp(&samples, DecodeIdx(0)), Some(0));
+        assert_eq!(decode_timestamp(&samples, DecodeIdx(1)), Some(1000));
+        assert_eq!(decode_timestamp(&samples, DecodeIdx(2)), Some(2000));
+        assert_eq!(decode_timestamp(&samples, DecodeIdx(3)), Some(3000));
+    }
+
+    #[test]
+    fn decode_timestamp_out_of_range_returns_none() {
+        let samples = reordered_samples();
+        assert_eq!(decode_timestamp(&samples, DecodeIdx(99)), None);
     }
 
     #[test]

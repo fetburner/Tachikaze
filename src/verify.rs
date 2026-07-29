@@ -9,7 +9,9 @@
 //! 1. `write_mp4` で **一時ファイル** に書き出す（本番の `output_path` には直接書かない）。
 //! 2. 一時ファイルを `read_moov` で読み直し、区間ごとの assert（検査1〜3）と
 //!    `.dtvi` との突き合わせ（検査4）を行う。
-//! 3. 音声を含む場合、A/V ずれの最大値をログ出力する（検査5）。
+//! 3. 音声を含む場合、区間ごとに出力の先頭音声パケットが元ファイルの正しい位置の
+//!    パケットと一致することを確認し（検査5）、A/V ずれの最大値をログ出力する
+//!    （検査6）。
 //! 4. 1つでも失敗すれば一時ファイルを削除してエラーを返す。すべて通れば
 //!    `std::fs::rename` で `output_path` へ移動する。
 //!
@@ -49,6 +51,8 @@
 //! 必要になった時点で明示的なフラグとして追加する。
 
 use std::collections::HashSet;
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
@@ -59,14 +63,13 @@ use mp4_atom::Moov;
 use crate::audio::{self, AudioSegment, AvSyncReport};
 use crate::dtvi::Dtvi;
 use crate::mp4io::order_map::{verify_against_dtvi, DisplayDecodeMap};
-#[cfg(test)]
-use crate::mp4io::read::find_audio_track;
-use crate::mp4io::read::{find_video_track, read_moov, samples, SampleInfo};
+use crate::mp4io::read::{find_audio_track, find_video_track, read_moov, samples, SampleInfo};
 use crate::mp4io::write::write_mp4;
 use crate::order::{DecodeIdx, OrderMap};
 use crate::plan::SnappedRange;
 
-/// 検査5（音声ドリフトのログ出力）に必要な入力をまとめたもの。
+/// 検査5（音声の位置）と検査6（音声ドリフトのログ出力）に共通で必要な入力をまとめた
+/// もの。
 ///
 /// 生のタプルのままだと `cut_and_verify` の引数が読みにくくなるため、意味のある名前を
 /// 持つ小さな構造体として切り出す（issue が許容している調整）。
@@ -74,6 +77,18 @@ use crate::plan::SnappedRange;
 pub struct AudioDiffInputs<'a> {
     /// 出力に並べる順の各映像区間の再生時間（映像トラックの timescale 単位）。
     pub video_segment_durations: &'a [u64],
+    /// 各映像区間の**ソース上の絶対 DTS**（映像トラックの timescale 単位。合成時刻/
+    /// PTS ではない。`src/commands.rs::segment_video_source_starts` 参照）。
+    /// `video_segment_durations` と同じ長さ・同じ順序。実際に `cut` が音声区間選択に
+    /// 使った値そのものであり、検査6（音声ドリフトのログ）で使う。
+    ///
+    /// 検査5（音声の位置）は、この値をそのまま信用すると「値自体が誤っていた場合に
+    /// 検出できない」（`select_audio_segments` に渡す値と検証に使う値が同じ計算経路
+    /// から来ることになるため）。そのため検査5は、元ファイルの映像 `SampleInfo` から
+    /// 独立に DTS を計算し直した値（[`verify_written_output`] 内の
+    /// `independent_video_segment_source_starts`）と突き合わせる。出力タイムライン上の
+    /// 累積時間ではないことにも注意（docs/lossless-cut.md「実際に起きた誤り」参照）。
+    pub video_segment_source_starts: &'a [u64],
     /// 映像トラックの timescale。
     pub video_timescale: u32,
     /// 音声トラックの全サンプル（デコード順 == 表示順）。
@@ -94,7 +109,7 @@ pub struct VerifyReport {
 }
 
 /// cut パイプラインの最終段。`write_mp4` で一時ファイルに書き出し、区間ごとの検査
-/// （1〜4）と音声ドリフトのログ出力（5）を行う。1つでも検査に失敗すれば一時ファイルを
+/// （1〜5）と音声ドリフトのログ出力（6）を行う。1つでも検査に失敗すれば一時ファイルを
 /// 削除してエラーを返す。すべて通れば `output_path` へ rename する。
 ///
 /// `dtvi` は既定で必須（`None` はエラー）。理由は本ファイル冒頭のdoc commentを参照。
@@ -166,6 +181,7 @@ pub fn cut_and_verify(
 
     match verify_written_output(
         &tmp_path,
+        input_path,
         moov,
         snapped_video_ranges,
         video_order,
@@ -223,10 +239,11 @@ fn temp_output_path(output_path: &Path) -> PathBuf {
     PathBuf::from(os)
 }
 
-/// 書き出した一時ファイルを読み直し、検査1〜5を行う。
+/// 書き出した一時ファイルを読み直し、検査1〜6を行う。
 #[allow(clippy::too_many_arguments)]
 fn verify_written_output(
     tmp_path: &Path,
+    input_path: &Path,
     original_moov: &Moov,
     snapped_video_ranges: &[SnappedRange],
     video_order: &OrderMap,
@@ -254,7 +271,50 @@ fn verify_written_output(
     // 検査4: 元ファイルの自前導出が .dtvi と一致すること（設計判断1参照）。
     verify_dtvi_consistency(original_moov, video_order, dtvi)?;
 
-    // 検査5: 音声の累積誤差の最大値をログ出力する（--video-only ならスキップ）。
+    // 検査5: 音声が正しい位置から取れていること（--video-only ならスキップ）。
+    // 出力ファイルの音声トラックの SampleInfo は、音声を含む場合だけここで読む
+    // （`output_moov` は既に読み込み済みなので `read_moov` をもう一度呼ぶ必要はない）。
+    let output_audio_samples = match audio_segments {
+        Some(_) => {
+            let (output_audio_trak, _) = find_audio_track(&output_moov).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "検査5(音声の位置)に失敗: 出力ファイルに音声トラックが見つかりません"
+                )
+            })?;
+            Some(samples(&output_audio_trak.mdia.minf.stbl))
+        }
+        None => None,
+    };
+    // 検査5の期待位置は `audio_samples_for_diff.video_segment_source_starts`
+    // （実際に `select_audio_segments` へ渡された値）をそのまま信用しない。その値自体が
+    // 合成時刻と DTS を取り違えるような系統的な誤りを持っていた場合、同じ値で
+    // 再計算しても必ず一致してしまい検出できない（過去に実際にこれが起きた。
+    // docs/lossless-cut.md「実際に起きた誤り」参照）。そのため元ファイルの映像
+    // `SampleInfo` から独立に DTS を計算し直す。
+    let independent_source_starts = match audio_segments {
+        Some(_) => {
+            let (original_video_trak, _) = find_video_track(original_moov).ok_or_else(|| {
+                anyhow::anyhow!("検査5(音声の位置)に失敗: 元ファイルに映像トラックが見つかりません")
+            })?;
+            let original_video_samples = samples(&original_video_trak.mdia.minf.stbl);
+            Some(independent_video_segment_source_starts(
+                snapped_video_ranges,
+                video_order,
+                &original_video_samples,
+            )?)
+        }
+        None => None,
+    };
+    verify_audio_segment_positions(
+        input_path,
+        tmp_path,
+        audio_segments,
+        output_audio_samples.as_deref(),
+        audio_samples_for_diff,
+        independent_source_starts.as_deref(),
+    )?;
+
+    // 検査6: 音声の累積誤差の最大値をログ出力する（--video-only ならスキップ）。
     let av_sync = log_audio_drift(audio_segments, audio_samples_for_diff)?;
 
     Ok(VerifyReport {
@@ -390,7 +450,301 @@ fn verify_dtvi_consistency(
         .context("検査4(.dtvi突き合わせ)に失敗: .dtvi と元ファイルの自前導出が一致しません")
 }
 
-/// 検査5（音声の累積誤差の最大値をログ出力する）。
+/// スナップ済み区間ごとに、その区間の**ソース上の絶対 DTS**を、元ファイルの映像
+/// `SampleInfo` から独立に計算する。
+///
+/// `src/commands.rs::segment_video_source_starts` と同じ式（`mp4io::order_map::
+/// decode_timestamp`、`dts(0) = 0` のデコード順 duration 累積）を使うが、呼び出しは
+/// 完全に別経路（`cut` パイプラインが実際に使った値である
+/// `AudioDiffInputs::video_segment_source_starts` は一切参照しない）。
+///
+/// 検査5（[`verify_audio_segment_positions`]）が `AudioDiffInputs::
+/// video_segment_source_starts` だけを信用してしまうと、その値自体に系統的な誤り
+/// （合成時刻と DTS の取り違えなど）があった場合、同じ値で「期待位置」を再計算しても
+/// 必ず一致してしまい検出できない（過去に実際にこれが起きていた。
+/// docs/lossless-cut.md「実際に起きた誤り」参照）。この関数が返す値を「本当の意味で
+/// 独立な」正解として検査5で使うことで、その取り違えを検出できるようにする。
+fn independent_video_segment_source_starts(
+    snapped_video_ranges: &[SnappedRange],
+    video_order: &OrderMap,
+    original_video_samples: &[SampleInfo],
+) -> anyhow::Result<Vec<u64>> {
+    snapped_video_ranges
+        .iter()
+        .map(|range| {
+            let decode = video_order.to_decode(range.start.snapped).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "検査5(音声の位置)に失敗: 表示順インデックス{}に対応するデコード順 \
+                     インデックスが見つかりません",
+                    range.start.snapped.0
+                )
+            })?;
+            crate::mp4io::order_map::decode_timestamp(original_video_samples, decode).ok_or_else(
+                || {
+                    anyhow::anyhow!(
+                        "検査5(音声の位置)に失敗: デコード順インデックス{}が映像サンプルの \
+                         範囲外です",
+                        decode.0
+                    )
+                },
+            )
+        })
+        .collect()
+}
+
+/// `audio_samples[..idx]` の duration 累積（音声トラックの timescale 単位、
+/// `audio::select_audio_segments` の `cumulative` と同じ定義）。
+fn cumulative_audio_duration(audio_samples: &[SampleInfo], idx: usize) -> u64 {
+    audio_samples[..idx.min(audio_samples.len())]
+        .iter()
+        .map(|s| s.duration as u64)
+        .sum()
+}
+
+/// 検査5（音声が正しい位置から取れていること）。
+///
+/// 区間ごとに次の2点を確認する:
+///
+/// 1. **出力の先頭音声パケットのソース上の時刻**と `dts(区間先頭サンプル)`
+///    （`independent_source_starts[k]`）の差が、半パケット + 1パケット長以内である
+///    こと（音声パケット長は一定でないため緩い上限。先頭のプライミングパケットが
+///    平均よりかなり長いことがあるのを考慮している）。
+/// 2. **出力の先頭音声パケットのバイト列**が、**元ファイルの期待位置（DTS 基準で
+///    独立に再計算した位置）に対応する音声パケット**のバイト列と一致すること。
+///
+/// # なぜこの検査が要るか
+///
+/// 検査6（音声ドリフトのログ、長さの一致）も `--verify` 指定時のffprobeパケット
+/// 集合比較も、どちらも**中身が別の位置の音声でも通ってしまう**
+/// （docs/lossless-cut.md「実際に起きた誤り」節）。過去に `select_audio_segments` が
+/// 出力タイムライン上の累積時間を起点にしてしまい、出力の音声が常にソースの先頭から
+/// 詰められるバグがあったが、上記2つの検査はどちらもこれを素通りさせた。
+///
+/// # 「期待位置」は `audio_segments` にも `diff_inputs.video_segment_source_starts`
+/// にも頼らない
+///
+/// `audio_segments` の値自体が誤っていた場合にそれを検出できるよう、期待位置は
+/// `audio_segments` を直接読むのではなく [`audio::select_audio_segments`] と同じ
+/// アルゴリズムで独立に再計算する。**このとき目標時刻には
+/// `diff_inputs.video_segment_source_starts` ではなく `independent_source_starts`
+/// （呼び出し元が元ファイルの映像から独立に計算し直した DTS）を使う。** もし前者を
+/// 使うと、`select_audio_segments` に実際に渡した値と検証に使う値が同じ計算経路
+/// （`src/commands.rs::segment_video_source_starts`）から来ることになり、その経路
+/// 自体に系統的な誤りがあっても検証が常に一致してしまう（過去に実際にこれが起きて
+/// いた）。`independent_source_starts` は元ファイルの映像 `SampleInfo` から
+/// [`independent_video_segment_source_starts`] で計算し直した、完全に別経路の値。
+///
+/// # バイト比較の方法
+///
+/// `output_audio_samples`（出力ファイルの音声 `SampleInfo` 列）と
+/// `diff_inputs.audio_samples`（元ファイルの音声 `SampleInfo` 列）はどちらも
+/// `file_offset` / `size` を持つため、ファイル全体を読み込まず `seek` した範囲
+/// だけを読んで比較する（[`read_byte_range`]）。
+///
+/// `--video-only` 相当（4引数がすべて `None`）ならスキップする。一部だけ `None` の
+/// 場合は呼び出し側の取り違えとみなしエラーにする。
+fn verify_audio_segment_positions(
+    input_path: &Path,
+    output_path: &Path,
+    audio_segments: Option<&[AudioSegment]>,
+    output_audio_samples: Option<&[SampleInfo]>,
+    diff_inputs: Option<AudioDiffInputs<'_>>,
+    independent_source_starts: Option<&[u64]>,
+) -> anyhow::Result<()> {
+    let (audio_segments, output_audio_samples, diff_inputs, independent_source_starts) = match (
+        audio_segments,
+        output_audio_samples,
+        diff_inputs,
+        independent_source_starts,
+    ) {
+        (None, None, None, None) => return Ok(()),
+        (Some(segments), Some(output_samples), Some(inputs), Some(starts)) => {
+            (segments, output_samples, inputs, starts)
+        }
+        _ => {
+            return Err(anyhow::anyhow!(
+                "audio_segments / output_audio_samples / audio_samples_for_diff / \
+                     independent_source_starts は すべて Some かすべて None である必要が \
+                     あります(音声ありの出力なら すべて指定し、--video-only 相当ならすべて \
+                     None にしてください)"
+            ))
+        }
+    };
+
+    anyhow::ensure!(
+        audio_segments.len() == diff_inputs.video_segment_durations.len(),
+        "検査5(音声の位置)に失敗: audio_segments の区間数({}) と \
+         video_segment_durations の区間数({})が一致しません",
+        audio_segments.len(),
+        diff_inputs.video_segment_durations.len()
+    );
+    anyhow::ensure!(
+        audio_segments.len() == independent_source_starts.len(),
+        "検査5(音声の位置)に失敗: audio_segments の区間数({}) と \
+         independent_source_starts の区間数({})が一致しません",
+        audio_segments.len(),
+        independent_source_starts.len()
+    );
+
+    // 「期待される音声区間」を audio_segments とは独立に、独立に再計算した DTS
+    // (independent_source_starts) から再計算する(select_audio_segments と同じ
+    // アルゴリズム)。audio_segments の値自体が誤っていた場合にそれを検出するため、
+    // ここでは audio_segments を一切参照しない。
+    let (expected_segments, _drift) = audio::select_audio_segments(
+        diff_inputs.video_segment_durations,
+        independent_source_starts,
+        diff_inputs.video_timescale,
+        diff_inputs.audio_samples,
+        diff_inputs.audio_timescale,
+    )
+    .context("検査5(音声の位置)に失敗: 期待される音声区間の再計算に失敗しました")?;
+    anyhow::ensure!(
+        expected_segments.len() == audio_segments.len(),
+        "検査5(音声の位置)に失敗: 再計算した期待区間数({}) が audio_segments の \
+         区間数({})と一致しません",
+        expected_segments.len(),
+        audio_segments.len()
+    );
+
+    // 誤差を「パケット単位」に正規化するための典型的な1パケットの長さ。実データは
+    // 先頭パケットがプライミング分だけ外れ値になりうるので全体の平均を使う
+    // （src/audio.rs::select_audio_segments の average_frame_size と同じ考え方）。
+    let average_frame_size = if diff_inputs.audio_samples.is_empty() {
+        1.0
+    } else {
+        let total: u64 = diff_inputs
+            .audio_samples
+            .iter()
+            .map(|s| s.duration as u64)
+            .sum();
+        total as f64 / diff_inputs.audio_samples.len() as f64
+    };
+    // 半パケット + 1パケット長。音声パケット長は一定でない(先頭のプライミング
+    // パケットが特に長い)ため、緩めの上限にしている。67msのような系統的なずれ
+    // （20msグリッドのOpusなら3パケット分程度）はこの上限を確実に超える。
+    const MAX_ALLOWED_ERROR_PACKETS: f64 = 1.5;
+
+    // audio_segments は出力に書き出された順そのものなので、区間ごとの長さ
+    // (end - start) を先頭から積算するだけで、出力ファイル内でのその区間の
+    // 先頭パケットのインデックスが求まる。
+    let mut output_cursor = 0usize;
+    for (i, ((seg, expected), &independent_start)) in audio_segments
+        .iter()
+        .zip(expected_segments.iter())
+        .zip(independent_source_starts.iter())
+        .enumerate()
+    {
+        let seg_len = (seg.end - seg.start) as usize;
+        if seg_len == 0 {
+            // 空区間(パケット無し)は先頭パケットが存在しないため比較しようがない。
+            continue;
+        }
+
+        // 検査5-1: 「出力の先頭音声パケットのソース上の時刻」(実際に cut が選んだ
+        // audio_segments[i].start を元ファイルの音声で見た累積時間) と
+        // 「dts(区間先頭サンプル)」(independent_start を音声 timescale に変換した
+        // 目標時刻)の差が緩い上限以内であること。
+        let actual_source_time =
+            cumulative_audio_duration(diff_inputs.audio_samples, seg.start.0 as usize) as f64;
+        let target_time = (independent_start as f64 * diff_inputs.audio_timescale as f64)
+            / diff_inputs.video_timescale as f64;
+        let error_packets = (actual_source_time - target_time).abs() / average_frame_size;
+        anyhow::ensure!(
+            error_packets <= MAX_ALLOWED_ERROR_PACKETS,
+            "検査5(音声の位置)に失敗: 区間{}の出力先頭音声パケットのソース時刻({actual_source_time:.0}) \
+             が dts(区間先頭サンプル)から音声timescaleに変換した目標時刻({target_time:.0})から \
+             {error_packets:.2}パケット分ずれています(許容{MAX_ALLOWED_ERROR_PACKETS}パケット)。 \
+             合成時刻(PTS)とDTSを取り違えていないか確認すること \
+             (docs/lossless-cut.md「実際に起きた誤り」参照)",
+            i + 1
+        );
+
+        let output_sample = *output_audio_samples.get(output_cursor).ok_or_else(|| {
+            anyhow::anyhow!(
+                "検査5(音声の位置)に失敗: 区間{}の出力側先頭音声パケット(インデックス{}) \
+                 が出力の音声サンプル総数({})の範囲外です",
+                i + 1,
+                output_cursor,
+                output_audio_samples.len()
+            )
+        })?;
+
+        let expected_start = expected.start.0 as usize;
+        let expected_sample = *diff_inputs
+            .audio_samples
+            .get(expected_start)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "検査5(音声の位置)に失敗: 区間{}の期待される先頭音声パケット \
+                 (元ファイルのインデックス{}) が元ファイルの音声サンプル総数({}) \
+                 の範囲外です",
+                    i + 1,
+                    expected_start,
+                    diff_inputs.audio_samples.len()
+                )
+            })?;
+
+        let output_bytes =
+            read_byte_range(output_path, output_sample.file_offset, output_sample.size)
+                .with_context(|| {
+                    format!(
+                        "検査5(音声の位置)に失敗: 区間{}の出力側パケットの読み込みに失敗しました",
+                        i + 1
+                    )
+                })?;
+        let expected_bytes = read_byte_range(
+            input_path,
+            expected_sample.file_offset,
+            expected_sample.size,
+        )
+        .with_context(|| {
+            format!(
+                "検査5(音声の位置)に失敗: 区間{}の元ファイル側パケットの読み込みに失敗しました",
+                i + 1
+            )
+        })?;
+
+        anyhow::ensure!(
+            output_bytes == expected_bytes,
+            "検査5(音声の位置)に失敗: 区間{}の出力の先頭音声パケット(出力インデックス{}, \
+             {}バイト)が元ファイルの期待位置(インデックス{}, {}バイト)と一致しません。 \
+             出力の音声が出力タイムライン上の累積時間から詰められていないか確認すること \
+             (docs/lossless-cut.md「実際に起きた誤り」参照)",
+            i + 1,
+            output_cursor,
+            output_sample.size,
+            expected_start,
+            expected_sample.size
+        );
+
+        output_cursor += seg_len;
+    }
+
+    Ok(())
+}
+
+/// `path` の `offset` から `size` バイトだけを読む。ファイル全体は読み込まない。
+fn read_byte_range(path: &Path, offset: u64, size: u32) -> anyhow::Result<Vec<u8>> {
+    let mut file = File::open(path)
+        .with_context(|| format!("ファイル({})を開けませんでした", path.display()))?;
+    file.seek(SeekFrom::Start(offset)).with_context(|| {
+        format!(
+            "ファイル({})の{offset}バイト目へのシークに失敗しました",
+            path.display()
+        )
+    })?;
+    let mut buf = vec![0u8; size as usize];
+    file.read_exact(&mut buf).with_context(|| {
+        format!(
+            "ファイル({})の{offset}..{}バイト目の読み込みに失敗しました",
+            path.display(),
+            offset + size as u64
+        )
+    })?;
+    Ok(buf)
+}
+
+/// 検査6（音声の累積誤差の最大値をログ出力する）。
 ///
 /// `--video-only` 相当（`audio_segments` / `audio_samples_for_diff` がどちらも `None`）
 /// の場合は音声処理そのものをスキップする。どちらか一方だけが `None` の場合は呼び出し側
@@ -409,7 +763,7 @@ fn log_audio_drift(
                 inputs.audio_samples,
                 inputs.audio_timescale,
             )
-            .context("検査5(音声ドリフトのログ)に失敗: av_sync_report の計算に失敗しました")?;
+            .context("検査6(音声ドリフトのログ)に失敗: av_sync_report の計算に失敗しました")?;
             eprintln!("{}", audio::format_av_sync_report(&report));
             Ok(Some(report))
         }
@@ -899,6 +1253,7 @@ mod tests {
         video_order: OrderMap,
         dtvi: Dtvi,
         video_segment_durations: Vec<u64>,
+        video_segment_source_starts: Vec<u64>,
         video_timescale: u32,
         audio_samples: Vec<SampleInfo>,
         audio_timescale: u32,
@@ -939,8 +1294,26 @@ mod tests {
             cursor += count;
         }
 
+        // 区間ごとのソース上の絶対DTS(音声パケット選択の起点。src/commands.rs の
+        // segment_video_source_starts と同じ計算)。合成時刻(PTS)ではなく DTS を
+        // 使う理由、出力タイムライン上の累積時間ではないことは
+        // segment_video_source_starts の doc comment 参照
+        // (docs/lossless-cut.md「実際に起きた誤り」も参照)。
+        let video_segment_source_starts: Vec<u64> = snapped
+            .iter()
+            .map(|r| {
+                let decode = map
+                    .order
+                    .to_decode(r.start.snapped)
+                    .expect("区間開始の表示順に対応するデコード順があるはず");
+                crate::mp4io::order_map::decode_timestamp(&video_samples, decode)
+                    .expect("デコード順が映像サンプルの範囲内のはず")
+            })
+            .collect();
+
         let (audio_segments, _drift) = crate::audio::select_audio_segments(
             &video_segment_durations,
+            &video_segment_source_starts,
             video_info.timescale,
             &audio_samples,
             audio_info.timescale,
@@ -981,6 +1354,7 @@ mod tests {
             video_order: map.order,
             dtvi,
             video_segment_durations,
+            video_segment_source_starts,
             video_timescale: video_info.timescale,
             audio_samples,
             audio_timescale: audio_info.timescale,
@@ -1009,6 +1383,7 @@ mod tests {
 
         let diff_inputs = AudioDiffInputs {
             video_segment_durations: &f.video_segment_durations,
+            video_segment_source_starts: &f.video_segment_source_starts,
             video_timescale: f.video_timescale,
             audio_samples: &f.audio_samples,
             audio_timescale: f.audio_timescale,
@@ -1091,6 +1466,7 @@ mod tests {
 
         let diff_inputs = AudioDiffInputs {
             video_segment_durations: &f.video_segment_durations,
+            video_segment_source_starts: &f.video_segment_source_starts,
             video_timescale: f.video_timescale,
             audio_samples: &f.audio_samples,
             audio_timescale: f.audio_timescale,
@@ -1137,6 +1513,7 @@ mod tests {
 
         let diff_inputs = AudioDiffInputs {
             video_segment_durations: &f.video_segment_durations,
+            video_segment_source_starts: &f.video_segment_source_starts,
             video_timescale: f.video_timescale,
             audio_samples: &f.audio_samples,
             audio_timescale: f.audio_timescale,
@@ -1226,12 +1603,176 @@ mod tests {
 
         let inputs = AudioDiffInputs {
             video_segment_durations: &durations,
+            video_segment_source_starts: &[0u64],
             video_timescale: 30000,
             audio_samples: &audio_samples,
             audio_timescale: 48000,
         };
         // 逆に audio_segments が None だが audio_samples_for_diff が Some。
         assert!(log_audio_drift(None, Some(inputs)).is_err());
+    }
+
+    // ---------------------------------------------------------------
+    // 検査5 (verify_audio_segment_positions) の単体テスト。
+    // ---------------------------------------------------------------
+
+    /// `verify_audio_segment_positions` のバイト比較テスト用に、一意な一時ファイルの
+    /// パスを作る(親ディレクトリは存在する状態にする。内容は呼び出し側が書く)。
+    fn temp_file_path(tag: &str) -> PathBuf {
+        let dir = make_tmp_dir(&format!("audio-position-{tag}"));
+        dir.join("data.bin")
+    }
+
+    /// `count` 個、`size` バイトずつのダミー `SampleInfo` 列を組み立てる。
+    /// サンプル `i` は `offset = i * size` に置かれている前提
+    /// (対応するファイルの内容もこのレイアウトで書く)。
+    fn synthetic_audio_samples(count: u32, size: u32) -> Vec<SampleInfo> {
+        (0..count)
+            .map(|i| SampleInfo {
+                file_offset: (i * size) as u64,
+                size,
+                duration: 1000,
+                cts_offset: 0,
+                is_sync: true,
+            })
+            .collect()
+    }
+
+    /// `sample_count` 個、`size` バイトずつのバイト列を組み立てる。サンプル `i` の
+    /// 中身は `size` バイトすべて値 `i` で埋める(位置によって内容が変わるようにして、
+    /// 「別の位置の音声を読んでいないか」を判別できるようにする)。
+    fn synthetic_audio_bytes(sample_count: u8, size: u32) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(sample_count as usize * size as usize);
+        for i in 0..sample_count {
+            bytes.extend(std::iter::repeat_n(i, size as usize));
+        }
+        bytes
+    }
+
+    #[test]
+    fn verify_audio_segment_positions_skips_for_video_only() {
+        let input = PathBuf::from("/nonexistent-input.mp4");
+        let output = PathBuf::from("/nonexistent-output.mp4");
+        verify_audio_segment_positions(&input, &output, None, None, None, None)
+            .expect("video-only(すべてNone)はエラーにならないはず");
+    }
+
+    #[test]
+    fn verify_audio_segment_positions_rejects_mismatched_optionals() {
+        let input = PathBuf::from("/nonexistent-input.mp4");
+        let output = PathBuf::from("/nonexistent-output.mp4");
+        let segments = [AudioSegment {
+            start: DecodeIdx(0),
+            end: DecodeIdx(1),
+        }];
+
+        // audio_segments だけ Some、他は None(取り違えの再現)。
+        let err =
+            verify_audio_segment_positions(&input, &output, Some(&segments), None, None, None)
+                .unwrap_err();
+        assert!(err.to_string().contains("すべて Some かすべて None"));
+    }
+
+    #[test]
+    fn verify_audio_segment_positions_succeeds_when_output_matches_source_position() {
+        // 元ファイル: 5サンプル、各4バイト、サンプルiの中身は値iで埋める。
+        let size = 4u32;
+        let input_path = temp_file_path("succeeds-input");
+        std::fs::write(&input_path, synthetic_audio_bytes(5, size))
+            .expect("元ファイルを書けること");
+        let audio_samples = synthetic_audio_samples(5, size);
+
+        // 区間: 映像1区間、ソース開始時刻2000(=サンプル2個分)、長さ2000(=サンプル2個分)。
+        // video/audio timescale を揃えているので、素の値のまま「期待される音声
+        // サンプル範囲 = [2,4)」になる(src/audio.rs::select_audio_segments と同じ計算)。
+        let video_segment_durations = [2000u64];
+        let video_segment_source_starts = [2000u64];
+
+        // 出力ファイル: 元ファイルのサンプル2,3をそのまま連結したもの
+        // (正しく書き出された場合の内容)。
+        let output_path = temp_file_path("succeeds-output");
+        std::fs::write(&output_path, [2u8, 2, 2, 2, 3, 3, 3, 3]).expect("出力ファイルを書けること");
+        let output_audio_samples = synthetic_audio_samples(2, size);
+
+        // audio_segments はサンプル2,3を書き出したことを表す(正しい値)。
+        let audio_segments = [AudioSegment {
+            start: DecodeIdx(2),
+            end: DecodeIdx(4),
+        }];
+
+        let diff_inputs = AudioDiffInputs {
+            video_segment_durations: &video_segment_durations,
+            video_segment_source_starts: &video_segment_source_starts,
+            video_timescale: 1000,
+            audio_samples: &audio_samples,
+            audio_timescale: 1000,
+        };
+
+        verify_audio_segment_positions(
+            &input_path,
+            &output_path,
+            Some(&audio_segments),
+            Some(&output_audio_samples),
+            Some(diff_inputs),
+            Some(&video_segment_source_starts),
+        )
+        .expect("出力が期待位置と一致する場合は検査を通るはず");
+    }
+
+    /// 完了条件: 意図的にずれた `AudioSegment` を渡すと検査5が落ちること
+    /// (docs/lossless-cut.md「実際に起きた誤り」の再現)。
+    #[test]
+    fn verify_audio_segment_positions_detects_shifted_audio_segment() {
+        // 元ファイルは成功テストと同じ(5サンプル、各4バイト、値iで埋める)。
+        let size = 4u32;
+        let input_path = temp_file_path("shifted-input");
+        std::fs::write(&input_path, synthetic_audio_bytes(5, size))
+            .expect("元ファイルを書けること");
+        let audio_samples = synthetic_audio_samples(5, size);
+
+        // 正しい期待位置は成功テストと同じ(ソース開始時刻2000 -> サンプル[2,4))。
+        let video_segment_durations = [2000u64];
+        let video_segment_source_starts = [2000u64];
+
+        // しかし実際に書き出されたのはサンプル[0,2)
+        // (select_audio_segments が出力タイムライン上の累積時間(=0)を起点にして
+        // しまった過去のバグを再現。audio_segments が意図的にずれている)。
+        let output_path = temp_file_path("shifted-output");
+        std::fs::write(&output_path, [0u8, 0, 0, 0, 1, 1, 1, 1]).expect("出力ファイルを書けること");
+        let output_audio_samples = synthetic_audio_samples(2, size);
+
+        // 意図的にずれた audio_segments (本来は{start:2,end:4}のはずが{start:0,end:2})。
+        let audio_segments = [AudioSegment {
+            start: DecodeIdx(0),
+            end: DecodeIdx(2),
+        }];
+
+        let diff_inputs = AudioDiffInputs {
+            video_segment_durations: &video_segment_durations,
+            video_segment_source_starts: &video_segment_source_starts,
+            video_timescale: 1000,
+            audio_samples: &audio_samples,
+            audio_timescale: 1000,
+        };
+
+        let err = verify_audio_segment_positions(
+            &input_path,
+            &output_path,
+            Some(&audio_segments),
+            Some(&output_audio_samples),
+            Some(diff_inputs),
+            Some(&video_segment_source_starts),
+        )
+        .unwrap_err();
+
+        // 意図的なずれ(サンプル2個分 = 2000)は許容(1.5パケット=1500)を超えるため、
+        // まず数値のずれチェック(検査5-1)で落ちる。
+        let message = err.to_string();
+        assert!(message.contains("検査5"), "message={message}");
+        assert!(
+            message.contains("ずれています"),
+            "位置がずれていることが分かるメッセージであること: {message}"
+        );
     }
 
     #[test]
@@ -1282,6 +1823,7 @@ mod tests {
 
         let diff_inputs = AudioDiffInputs {
             video_segment_durations: &f.video_segment_durations,
+            video_segment_source_starts: &f.video_segment_source_starts,
             video_timescale: f.video_timescale,
             audio_samples: &f.audio_samples,
             audio_timescale: f.audio_timescale,
@@ -1372,6 +1914,7 @@ mod tests {
 
         let diff_inputs = AudioDiffInputs {
             video_segment_durations: &f.video_segment_durations,
+            video_segment_source_starts: &f.video_segment_source_starts,
             video_timescale: f.video_timescale,
             audio_samples: &f.audio_samples,
             audio_timescale: f.audio_timescale,

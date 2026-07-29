@@ -50,6 +50,7 @@ mod trim;
 #[path = "../src/mp4io/mod.rs"]
 mod mp4io;
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -445,4 +446,175 @@ fn video_e2e_module_compiles_and_helpers_are_reachable() {
     let _ = extract_reference_crc32;
     let _ = assert_no_gaps_within_range;
     let _: fn() -> PathBuf = common::fixture_path;
+}
+
+// =====================================================================
+// `--cm-output`（CM として除去した区間を別ファイルに出す）の E2E。
+//
+// 上の `video_only_cut_matches_source_packets_by_crc32` は `main.rs` の `cut` が
+// まだ配線されていなかった頃の名残で `#[path]` インクルードで `src/` を直接呼んでいるが、
+// `cut` サブコマンドは現在配線済み（`tests/audio_e2e.rs` の e2e テストが実際に
+// `CARGO_BIN_EXE_tachikaze` を起動している）。`--cm-output` は CLI オプションそのものの
+// 検証（未指定時の挙動・`--snap inward` との併用エラー）も必要なので、こちらは
+// `tests/audio_e2e.rs` に倣い実際の `tachikaze` バイナリを起動する。
+// =====================================================================
+
+/// フィクスチャ（GOP=120・599フレーム）に対する Trim リスト。他のテスト
+/// （`video_only_cut_matches_source_packets_by_crc32` / `tests/audio_e2e.rs`）と同じ値を
+/// 使い、`Snap::Outward`（既定）で `[10,110)` は `[0,120)` へ、`[370,470)` は `[360,480)` へ
+/// 広がる。捨てられる中間区間 `[120,360)` と末尾の `[480,599)` が CM 側の補集合になる。
+const CM_OUTPUT_TRIM_AVS_CONTENT: &str = "Trim(10,109) ++ Trim(370,469)";
+
+/// `cut` に渡す `.dtvi`（`tests/audio_e2e.rs::dtvi_path` と同じファイル）。
+fn cm_output_dtvi_path() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/sample.dtvi")
+}
+
+/// `label` ごとに独立した一時ディレクトリを作る。
+fn make_cm_output_tmp_dir(label: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "tachikaze-video-e2e-cm-{label}-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("一時ディレクトリを作れること");
+    dir
+}
+
+/// フィクスチャに対して `tachikaze cut --cm-output` を実行する。
+///
+/// `snap` は `cli::Snap` の `--snap` 引数の文字列表現（`"outward"` / `"inward"`）を渡す。
+/// 戻り値はプロセスの `Output` そのもの（失敗ケースも呼び出し側で判定できるように
+/// `assert` はしない）。
+fn run_cut_with_cm_output(
+    label: &str,
+    snap: &str,
+) -> (PathBuf, PathBuf, PathBuf, std::process::Output) {
+    let fixture = common::fixture_path();
+    let tmp_dir = make_cm_output_tmp_dir(label);
+    let trim_path = tmp_dir.join("trim.avs");
+    let out_path = tmp_dir.join("out.mp4");
+    let cm_path = tmp_dir.join("cm.mp4");
+    std::fs::write(&trim_path, CM_OUTPUT_TRIM_AVS_CONTENT).expect("trim.avs を書けること");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_tachikaze"))
+        .arg("cut")
+        .arg(&fixture)
+        .arg("--trim")
+        .arg(&trim_path)
+        .arg("-o")
+        .arg(&out_path)
+        .arg("--dtvi")
+        .arg(cm_output_dtvi_path())
+        .arg("--snap")
+        .arg(snap)
+        .arg("--cm-output")
+        .arg(&cm_path)
+        .output()
+        .expect("tachikaze cut の起動に失敗した");
+
+    (tmp_dir, out_path, cm_path, output)
+}
+
+/// 完了条件:
+/// - 保持側 + CM側の映像パケット数の合計が入力の総パケット数と一致する
+/// - CM側の映像パケットの CRC32 がすべて入力に存在する（ビットコピー）
+/// - CM側と保持側の映像パケット CRC32 集合が互いに素
+#[test]
+#[ignore = "tests/fixtures/sample.mp4 と ffmpeg/ffprobe が必要。tests/fixtures/gen.sh を先に実行すること"]
+fn cm_output_packet_counts_sum_to_input_total_and_sets_are_disjoint() {
+    if common::skip_if_fixture_missing() {
+        return;
+    }
+    if !tools_available() {
+        return;
+    }
+
+    let fixture = common::fixture_path();
+    let (tmp_dir, out_path, cm_path, output) = run_cut_with_cm_output("counts", "outward");
+    assert!(
+        output.status.success(),
+        "tachikaze cut --cm-output が失敗した: status={:?}\nstdout={}\nstderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let input_crc32 = video_packet_crc32(&fixture);
+    let kept_crc32 = video_packet_crc32(&out_path);
+    let cm_crc32 = video_packet_crc32(&cm_path);
+
+    // --- 完了条件1: 保持側 + CM側のパケット数の合計 == 入力の総パケット数 ---
+    assert_eq!(
+        kept_crc32.len() + cm_crc32.len(),
+        input_crc32.len(),
+        "保持側({})+CM側({}) の映像パケット数の合計が入力の総数({})と一致しない",
+        kept_crc32.len(),
+        cm_crc32.len(),
+        input_crc32.len()
+    );
+
+    // フィクスチャの前提（599フレーム、保持側240パケット、CM側359パケット）が
+    // 変わっていないことのセルフチェック。
+    assert_eq!(input_crc32.len(), 599);
+    assert_eq!(kept_crc32.len(), 240, "保持側は120+120=240パケットのはず");
+    assert_eq!(cm_crc32.len(), 359, "CM側は240+119=359パケットのはず");
+
+    // --- 完了条件2: CM側の映像パケットの CRC32 がすべて入力に存在する（ビットコピー） ---
+    let input_set: HashSet<&str> = input_crc32.iter().map(String::as_str).collect();
+    let cm_only: Vec<&str> = cm_crc32
+        .iter()
+        .map(String::as_str)
+        .filter(|c| !input_set.contains(c))
+        .collect();
+    assert!(
+        cm_only.is_empty(),
+        "CM側にのみ存在する映像パケットが{}件ある(ビットコピーでない疑い): {:?}",
+        cm_only.len(),
+        cm_only
+    );
+
+    // --- 完了条件3: CM側と保持側の映像パケット CRC32 集合が互いに素 ---
+    let kept_set: HashSet<&str> = kept_crc32.iter().map(String::as_str).collect();
+    let cm_set: HashSet<&str> = cm_crc32.iter().map(String::as_str).collect();
+    let overlap: Vec<&&str> = kept_set.intersection(&cm_set).collect();
+    assert!(
+        overlap.is_empty(),
+        "保持側とCM側の映像パケット CRC32 集合が互いに素ではない(重複{}件): {:?}",
+        overlap.len(),
+        overlap
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+/// 完了条件: `--snap inward --cm-output` はエラーで落ちる
+/// （docs/lossless-cut.md「CM 側（除去した区間）を別ファイルに出す」節: inward スナップ
+/// では保持区間が退化しうり、補集合の順序も壊れるため併用を拒否する設計）。
+#[test]
+#[ignore = "tests/fixtures/sample.mp4 と ffmpeg/ffprobe が必要。tests/fixtures/gen.sh を先に実行すること"]
+fn snap_inward_with_cm_output_is_rejected() {
+    if common::skip_if_fixture_missing() {
+        return;
+    }
+    if !tools_available() {
+        return;
+    }
+
+    let (tmp_dir, out_path, cm_path, output) = run_cut_with_cm_output("inward-rejected", "inward");
+
+    assert!(
+        !output.status.success(),
+        "--snap inward --cm-output が成功してしまった（拒否されるべき）"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("inward") && stderr.contains("cm-output"),
+        "エラーメッセージに inward / cm-output の併用を拒否する理由が含まれていること: \
+         {stderr}"
+    );
+    assert!(!out_path.exists(), "エラー時は保持側の出力も作られないこと");
+    assert!(!cm_path.exists(), "エラー時はCM側の出力も作られないこと");
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
 }
