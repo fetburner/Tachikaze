@@ -23,7 +23,7 @@ FFmpeg へのリンク、C++ への FFI はいずれも**不要**。
 
 当初は「mp4 のサンプル単位 read/write」のために C++ ライブラリ（dtvindex / liblsmash）か libav への FFI が必要と考えていた。しかし `mp4-atom` が
 
-- `Codec::Opus`（`dOps`）を含む主要コーデックを網羅
+- `Codec::Opus`（`dOps`）/ `Codec::Mp4a`（AAC）を含む主要コーデックを網羅（現在は認識する音声 Codec 全般を同じカット経路で扱う。対応一覧は [mp4-atom.md](mp4-atom.md)）
 - `Any::Unknown(FourCC, Vec<u8>)` で未知アトムを不透明バイト列として保持
 - `stsz` / `stsc` / `stco` / `stts` / `ctts` / `stss` をすべて公開
 

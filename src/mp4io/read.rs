@@ -13,7 +13,7 @@ use mp4_atom::{Atom, Codec, Header, Moov, ReadAtom, ReadFrom, Stbl, StszSamples,
 /// トラックごとに異なりうる時間の基準単位。
 ///
 /// 映像と音声で timescale は別々なので、トラックごとに保持する
-/// （前提: 対象素材は H.264 + Opus で、両者の timescale は一致しない）。
+/// （前提: 対象素材は H.264 + 音声（Opus / AAC など）で、両者の timescale は一致しない）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TrackInfo {
     pub timescale: u32,
@@ -59,6 +59,40 @@ fn track_codec(trak: &Trak) -> Option<&Codec> {
     trak.mdia.minf.stbl.stsd.codecs.first()
 }
 
+/// `Codec` が音声コーデックかどうかを判定する（音声トラック識別の唯一の基準）。
+///
+/// カット処理は「ソース上の DTS から最近傍パケットを引き当ててビットコピーする」
+/// だけでコーデックに依存しない（docs/lossless-cut.md「音声の扱い」）。そのため
+/// 特定コーデックに限定せず、`mp4-atom` 0.14 が `Codec` として認識する音声系すべてを
+/// 音声トラックとして受け入れる。対応一覧は docs/mp4-atom.md の音声 Codec 表。
+///
+/// `Codec` は `#[non_exhaustive]` なので、未知の variant や映像・字幕・`Unknown` は
+/// `_ => false` で音声に数えない。read.rs / support.rs / commands.rs で音声判定が
+/// 二重定義にならないよう、判定はこの関数 1 か所に集約する。
+pub fn is_audio_codec(codec: &Codec) -> bool {
+    matches!(
+        codec,
+        // 圧縮音声
+        Codec::Opus(_)
+            | Codec::Mp4a(_)
+            | Codec::Flac(_)
+            | Codec::Ac3(_)
+            | Codec::Eac3(_)
+            | Codec::Samr(_)
+            // 非圧縮 / QuickTime 系 PCM
+            | Codec::Ipcm(_)
+            | Codec::Fpcm(_)
+            | Codec::Sowt(_)
+            | Codec::Twos(_)
+            | Codec::Lpcm(_)
+            | Codec::In24(_)
+            | Codec::In32(_)
+            | Codec::Fl32(_)
+            | Codec::Fl64(_)
+            | Codec::S16l(_)
+    )
+}
+
 /// トラックの `mdhd` から timescale を取り出す。
 fn track_info(trak: &Trak) -> TrackInfo {
     TrackInfo {
@@ -76,12 +110,13 @@ pub fn find_video_track(moov: &Moov) -> Option<(&Trak, TrackInfo)> {
     })
 }
 
-/// `moov` から音声トラック（`Codec::Opus`）を 1 本だけ見つける。
+/// `moov` から音声トラック（[`is_audio_codec`] が真になる Codec）を 1 本だけ見つける。
 ///
-/// 複数本存在する場合は最初に見つかったものを返す（対象素材は音声 1 本を想定）。
+/// 複数本存在する場合は最初に見つかったものを返す（対象素材は音声 1 本を想定。本数の
+/// 検証は `support::check_track_counts` が担い、2 本以上は明示エラーにする）。
 pub fn find_audio_track(moov: &Moov) -> Option<(&Trak, TrackInfo)> {
     moov.trak.iter().find_map(|trak| match track_codec(trak) {
-        Some(Codec::Opus(_)) => Some((trak, track_info(trak))),
+        Some(codec) if is_audio_codec(codec) => Some((trak, track_info(trak))),
         _ => None,
     })
 }
@@ -250,6 +285,188 @@ mod tests {
         let moov = Moov::default();
         assert!(find_video_track(&moov).is_none());
         assert!(find_audio_track(&moov).is_none());
+    }
+
+    // --- #43: 音声 Codec 判定の一般化 ---
+
+    /// サンプルエントリ共通の `Audio` ヘッダ（値は判定に影響しないダミー）。
+    fn dummy_audio() -> mp4_atom::Audio {
+        mp4_atom::Audio {
+            data_reference_index: 1,
+            channel_count: 2,
+            sample_size: 16,
+            sample_rate: 48_000u16.into(),
+        }
+    }
+
+    /// PCM 系サンプルエントリ（`Ipcm` 等）は全て同じ形なのでマクロで量産する。
+    macro_rules! pcm {
+        ($ty:ident) => {
+            mp4_atom::$ty {
+                audio: dummy_audio(),
+                pcmc: None,
+                chnl: None,
+                btrt: None,
+            }
+        };
+    }
+
+    /// `mp4-atom` 0.14 が認識する音声系 Codec を 1 つずつ構築して返す。
+    ///
+    /// #42 の対象一覧（圧縮 6 種 + 非圧縮/QT 系 10 種）と 1:1 で対応させ、
+    /// 一覧の増減にテストが追従するようにしている。
+    fn all_audio_codecs() -> Vec<Codec> {
+        use mp4_atom::esds::{DecoderConfig, DecoderSpecific, EsDescriptor, SLConfig};
+        use mp4_atom::*;
+
+        let opus = Codec::Opus(Opus {
+            audio: dummy_audio(),
+            dops: Dops {
+                output_channel_count: 2,
+                pre_skip: 0,
+                input_sample_rate: 48_000,
+                output_gain: 0,
+            },
+            btrt: None,
+        });
+
+        let mp4a = Codec::Mp4a(Mp4a {
+            audio: dummy_audio(),
+            esds: Esds {
+                es_desc: EsDescriptor {
+                    es_id: 0,
+                    dec_config: DecoderConfig {
+                        object_type_indication: 0x40, // AAC
+                        stream_type: 5,
+                        up_stream: 0,
+                        buffer_size_db: 0u32.try_into().unwrap(),
+                        max_bitrate: 0,
+                        avg_bitrate: 0,
+                        dec_specific: DecoderSpecific {
+                            profile: 2,
+                            freq_index: 3,
+                            chan_conf: 2,
+                        },
+                    },
+                    sl_config: SLConfig {},
+                },
+            },
+            btrt: None,
+            taic: None,
+        });
+
+        let flac = Codec::Flac(Flac {
+            audio: dummy_audio(),
+            dfla: Dfla { blocks: Vec::new() },
+        });
+
+        let ac3 = Codec::Ac3(Ac3 {
+            audio: dummy_audio(),
+            dac3: Ac3SpecificBox {
+                fscod: 0,
+                bsid: 8,
+                bsmod: 0,
+                acmod: 2,
+                lfeon: false,
+                bit_rate_code: 0,
+            },
+        });
+
+        let eac3 = Codec::Eac3(Eac3 {
+            audio: dummy_audio(),
+            dec3: Ec3SpecificBox {
+                data_rate: 0,
+                substreams: Vec::new(),
+            },
+        });
+
+        let samr = Codec::Samr(Samr {
+            amrsampleentry: AmrSampleEntry {
+                data_reference_index: 1,
+                timescale: 8000,
+            },
+            damr: Damr {
+                vendor: b"erat".into(),
+                decoder_version: 0,
+                mode_set: 0,
+                mode_change_period: 0,
+                frames_per_sample: 1,
+            },
+        });
+
+        vec![
+            opus,
+            mp4a,
+            flac,
+            ac3,
+            eac3,
+            samr,
+            Codec::Ipcm(pcm!(Ipcm)),
+            Codec::Fpcm(pcm!(Fpcm)),
+            Codec::Sowt(pcm!(Sowt)),
+            Codec::Twos(pcm!(Twos)),
+            Codec::Lpcm(pcm!(Lpcm)),
+            Codec::In24(pcm!(In24)),
+            Codec::In32(pcm!(In32)),
+            Codec::Fl32(pcm!(Fl32)),
+            Codec::Fl64(pcm!(Fl64)),
+            Codec::S16l(pcm!(S16l)),
+        ]
+    }
+
+    #[test]
+    fn all_audio_codecs_are_recognized_as_audio() {
+        let codecs = all_audio_codecs();
+        // 対象一覧（圧縮 6 + 非圧縮/QT 10）と本数が一致していること。
+        assert_eq!(codecs.len(), 16);
+        for codec in &codecs {
+            assert!(is_audio_codec(codec), "{codec:?} は音声と判定されるべき");
+        }
+    }
+
+    #[test]
+    fn video_subtitle_and_unknown_are_not_audio() {
+        use mp4_atom::{Avc1, FourCC, Tx3g};
+        assert!(!is_audio_codec(&Codec::Avc1(Avc1::default())));
+        assert!(!is_audio_codec(&Codec::Tx3g(Tx3g::default())));
+        assert!(!is_audio_codec(&Codec::Unknown(FourCC::new(b"xxxx"))));
+    }
+
+    #[test]
+    fn find_audio_track_matches_aac_track() {
+        use mp4_atom::{Avc1, Mdia, Minf, Stsd};
+
+        let trak_with_codec = |codec: Codec| Trak {
+            mdia: Mdia {
+                minf: Minf {
+                    stbl: Stbl {
+                        stsd: Stsd {
+                            codecs: vec![codec],
+                        },
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        // 音声を AAC(Mp4a) にした moov でも音声トラックが 1 本認識されること。
+        let aac = all_audio_codecs()
+            .into_iter()
+            .find(|c| matches!(c, Codec::Mp4a(_)))
+            .unwrap();
+        let moov = Moov {
+            trak: vec![
+                trak_with_codec(Codec::Avc1(Avc1::default())),
+                trak_with_codec(aac),
+            ],
+            ..Default::default()
+        };
+
+        assert!(find_video_track(&moov).is_some());
+        assert!(find_audio_track(&moov).is_some());
     }
 
     // --- #26: サンプル表の復元 ---

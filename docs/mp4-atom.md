@@ -2,7 +2,7 @@
 
 → 入口: [overview.md](overview.md) / 選定理由: [tech-stack.md](tech-stack.md)
 
-mp4 の読み書きコードを書くときはこの文書を読む。**すべて実ファイル（H.264 + Opus）で検証済み。**
+mp4 の読み書きコードを書くときはこの文書を読む。**検証は主に実ファイル（H.264 + Opus / AAC）で行った。**
 
 **この文書のコード片は、実装前に書いた検証用の最小コードである。** クレートの使い方・落とし穴の記録として有用だが、本番の実装は `src/mp4io/`（`read.rs` / `write.rs` / `order_map.rs` / `support.rs`）にあり、性能とファイル品質のために構造が違う。差分は下記「上のコードと本実装の違い」にまとめてある。
 
@@ -10,15 +10,32 @@ mp4 の読み書きコードを書くときはこの文書を読む。**すべ�
 
 本ツールはコーデックを理解する必要がない。**`stsd` を不透明なバイト列としてコピーしたいだけ**。`mp4-atom` はこの要件に合う:
 
-- `Codec` 列挙が `Avc1` / `Hev1` / `Hvc1` / `Vp08` / `Vp09` / `Av01` / `Mp4a` / `Tx3g` / **`Opus`** / `Uncv` / `Flac` / `Ac3` / `Eac3` / `Ipcm` / `Fpcm` / `Sowt` / `Twos` / `Lpcm` / `In24` … を網羅し、`#[non_exhaustive]`
+- `Codec` 列挙が `Avc1` / `Hev1` / `Hvc1` / `Vp08` / `Vp09` / `Av01` / `Uncv`（映像）、`Opus` / `Mp4a` / `Flac` / `Ac3` / `Eac3` / `Samr` / `Ipcm` / `Fpcm` / `Sowt` / `Twos` / `Lpcm` / `In24` / `In32` / `Fl32` / `Fl64` / `S16l`（音声）、`Tx3g` / `Wvtt`（字幕）を網羅し、`#[non_exhaustive]`（0.14 時点）
 - `Any::Unknown(FourCC, Vec<u8>)` で未知アトムを不透明バイト列として保持
 - `stsz` / `stsc` / `stco` / `co64` / `stts` / `ctts` / `stss` をすべて公開
+
+### 音声トラックとして扱う Codec（唯一の基準）
+
+音声トラックの識別は `src/mp4io/read.rs::is_audio_codec` に集約している。カット処理は
+「ソース上の DTS から最近傍パケットを引き当ててビットコピーする」だけでコーデックに
+依存しないため、`mp4-atom` が `Codec` として認識する音声系すべてを音声トラックとして
+受け入れる。映像・字幕・`Unknown(FourCC)` は音声に数えない。対応一覧（＝この関数の
+allowlist）:
+
+| 分類 | Codec |
+|---|---|
+| 圧縮 | `Opus`, `Mp4a`（AAC）, `Flac`, `Ac3`, `Eac3`, `Samr` |
+| 非圧縮 / QuickTime 系 | `Ipcm`, `Fpcm`, `Sowt`, `Twos`, `Lpcm`, `In24`, `In32`, `Fl32`, `Fl64`, `S16l` |
+
+E2E で実検証済みか、認識のみ（未検証）かの区別は [measurements.md](measurements.md)
+「音声コーデック別の検証状況」を参照。`Codec` は `#[non_exhaustive]` なので、将来
+追加される variant は明示的に allowlist へ足すまで音声に数えない（`_ => false`）。
 
 ## 検証済みの事実
 
 | 項目 | 結果 |
 |---|---|
-| Opus の認識 | ✓ `Codec::Opus`（`dOps`） |
+| 音声 Codec の認識 | ✓ `is_audio_codec` で一括判定（Opus は `dOps`、AAC は `esds` を保持したまま clone） |
 | サンプル表の復元 | ✓ 98,972 / 165,098 サンプル、同期サンプル 825 個（ffprobe と一致） |
 | サンプル部分集合の書き出し | ✓ 有効な mp4 が生成され ffmpeg がエラーなくデコード |
 | パケットのビット一致 | ✓ 映像 240/240、音声 402/402 で相違なし |
