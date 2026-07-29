@@ -93,7 +93,7 @@ fn video_packet_crc32(path: &Path) -> Vec<String> {
             "-select_streams",
             "v:0",
             "-show_entries",
-            "packet=size",
+            "packet=size,data_hash",
             "-show_data_hash",
             "CRC32",
             "-of",

@@ -558,7 +558,7 @@ mod tests {
                 "-select_streams",
                 stream_selector,
                 "-show_entries",
-                "packet=size",
+                "packet=size,data_hash",
                 "-show_data_hash",
                 "CRC32",
                 "-of",

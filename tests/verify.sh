@@ -62,7 +62,7 @@ require_tools() {
 video_packet_crc32() {
     local path="$1"
     ffprobe -v error -select_streams v:0 \
-        -show_entries packet=size -show_data_hash CRC32 \
+        -show_entries packet=size,data_hash -show_data_hash CRC32 \
         -of csv=p=0 "$path"
 }
 
