@@ -131,6 +131,170 @@ pub fn select_audio_segments(
     ))
 }
 
+/// 継ぎ目（出力区間）ごとの A/V ずれ 1 件分。
+#[derive(Copy, Clone, PartialEq, Debug)]
+pub struct SegmentAvDiff {
+    /// その区間の映像の再生時間（秒）。
+    pub video_seconds: f64,
+    /// その区間に割り当てられた音声サンプルの duration を合計した再生時間（秒）。
+    pub audio_seconds: f64,
+    /// `audio_seconds - video_seconds` を ms 換算したもの（符号あり）。
+    /// 正なら音声が映像より長い（音声が遅れて終わる）。
+    pub diff_ms: f64,
+}
+
+/// cut 全体の A/V 同期レポート。
+#[derive(Clone, PartialEq, Debug)]
+pub struct AvSyncReport {
+    pub per_segment: Vec<SegmentAvDiff>,
+    /// `per_segment` の `diff_ms` の絶対値の最大。
+    pub max_abs_diff_ms: f64,
+    /// `max_abs_diff_ms` を記録した区間のインデックス（0 始まり）。
+    pub max_abs_diff_segment_index: usize,
+    /// `per_segment` の `diff_ms` の合計（符号あり）。
+    pub total_diff_ms: f64,
+    /// `max_abs_diff_ms` が [`AV_DIFF_WARNING_THRESHOLD_MS`] を超えるかどうか。
+    pub exceeds_threshold: bool,
+}
+
+/// A/V ずれの警告閾値（ms）。映像 1 フレーム（30000/1001 fps で約 33.4ms）より
+/// 少し大きい値を採用し、フレーム単位の丸め誤差では鳴らないようにする。
+pub const AV_DIFF_WARNING_THRESHOLD_MS: f64 = 40.0;
+
+/// 出力区間ごとの A/V ずれを集計する。
+///
+/// `video_segment_durations` と `audio_segments` は同じ長さ・同じ順序であることを
+/// 前提とする（[`select_audio_segments`] の戻り値の `audio_segments` をそのまま渡す
+/// 想定）。各区間の音声側の実際の長さは、`frame_size` を仮定して掛け算するのでは
+/// なく、その区間に割り当てられた実際の音声サンプルの `duration` を合計して求める
+/// （`SampleInfo::duration` は必ずしも全サンプルで一定とは限らないため、こちらの
+/// 方が正確）。
+///
+/// `video_segment_durations` が空の場合は `per_segment` が空のレポートを返す。
+pub fn av_sync_report(
+    video_segment_durations: &[u64],
+    video_timescale: u32,
+    audio_segments: &[AudioSegment],
+    audio_samples: &[SampleInfo],
+    audio_timescale: u32,
+) -> anyhow::Result<AvSyncReport> {
+    anyhow::ensure!(
+        video_segment_durations.len() == audio_segments.len(),
+        "video_segment_durations と audio_segments の長さが一致しません（{} vs {}）",
+        video_segment_durations.len(),
+        audio_segments.len()
+    );
+    anyhow::ensure!(
+        video_timescale > 0,
+        "video_timescale はゼロより大きい必要があります"
+    );
+    anyhow::ensure!(
+        audio_timescale > 0,
+        "audio_timescale はゼロより大きい必要があります"
+    );
+
+    let mut per_segment = Vec::with_capacity(video_segment_durations.len());
+    let mut max_abs_diff_ms = 0.0f64;
+    let mut max_abs_diff_segment_index = 0usize;
+    let mut total_diff_ms = 0.0f64;
+
+    for (i, (&video_duration, audio_segment)) in video_segment_durations
+        .iter()
+        .zip(audio_segments.iter())
+        .enumerate()
+    {
+        let video_seconds = video_duration as f64 / video_timescale as f64;
+
+        let start = audio_segment.start.0 as usize;
+        let end = audio_segment.end.0 as usize;
+        anyhow::ensure!(
+            start <= end,
+            "audio_segments[{i}] の start が end を超えています（start={start}, end={end}）"
+        );
+        anyhow::ensure!(
+            end <= audio_samples.len(),
+            "audio_segments[{i}] の end が audio_samples の範囲外です（end={end}, len={}）",
+            audio_samples.len()
+        );
+
+        let audio_duration_units: u64 = audio_samples[start..end]
+            .iter()
+            .map(|s| s.duration as u64)
+            .sum();
+        let audio_seconds = audio_duration_units as f64 / audio_timescale as f64;
+
+        let diff_ms = (audio_seconds - video_seconds) * 1000.0;
+
+        total_diff_ms += diff_ms;
+        if diff_ms.abs() > max_abs_diff_ms {
+            max_abs_diff_ms = diff_ms.abs();
+            max_abs_diff_segment_index = i;
+        }
+
+        per_segment.push(SegmentAvDiff {
+            video_seconds,
+            audio_seconds,
+            diff_ms,
+        });
+    }
+
+    let exceeds_threshold = max_abs_diff_ms > AV_DIFF_WARNING_THRESHOLD_MS;
+
+    Ok(AvSyncReport {
+        per_segment,
+        max_abs_diff_ms,
+        max_abs_diff_segment_index,
+        total_diff_ms,
+        exceeds_threshold,
+    })
+}
+
+/// [`av_sync_report`] の結果を、issue 記載の形式のテキストに整形する。
+///
+/// `println!` はしない。表示するかどうか・タイミングは呼び出し側（cut パイプライン
+/// の配線）が決める。
+pub fn format_av_sync_report(report: &AvSyncReport) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::new();
+
+    if report.per_segment.is_empty() {
+        out.push_str("音声同期: 区間 0（対象区間なし）\n");
+        return out;
+    }
+
+    let warning = if report.exceeds_threshold {
+        " [警告: 閾値超過]"
+    } else {
+        ""
+    };
+
+    // 最大ずれは符号付きで表示する（区間番号は 1 始まり、ユーザ向けの表示のため）。
+    let max_diff_signed_ms = report.per_segment[report.max_abs_diff_segment_index].diff_ms;
+    let _ = writeln!(
+        out,
+        "音声同期: 区間 {} / 最大ずれ {:+.0} ms (区間 {}) / 合計 {:+.0} ms{}",
+        report.per_segment.len(),
+        max_diff_signed_ms,
+        report.max_abs_diff_segment_index + 1,
+        report.total_diff_ms,
+        warning
+    );
+
+    for (i, seg) in report.per_segment.iter().enumerate() {
+        let _ = writeln!(
+            out,
+            "  区間 {}: 映像 {:.3}s 音声 {:.3}s ({:+.0} ms)",
+            i + 1,
+            seg.video_seconds,
+            seg.audio_seconds,
+            seg.diff_ms
+        );
+    }
+
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -334,5 +498,131 @@ mod tests {
         let audio_samples = make_audio_samples(10, 960);
         assert!(select_audio_segments(&[1001], 0, &audio_samples, 48000).is_err());
         assert!(select_audio_segments(&[1001], 30000, &audio_samples, 0).is_err());
+    }
+
+    /// 完了条件: #33 の `select_audio_segments` と組み合わせた合成データで、
+    /// 継ぎ目ごとの A/V ずれが数 ms 台に収まる（docs/measurements.md の実測値
+    /// 「5 区間、継ぎ目あたり約 6ms」と桁が合っていることを確認する）。
+    #[test]
+    fn av_sync_report_stays_in_single_digit_ms_for_realistic_fixture() {
+        let video_timescale = 30000u32;
+        let frame_duration = 1001u64;
+        let audio_timescale = 48000u32;
+        let frame_size = 960u32;
+
+        // ファイルCの実測（5区間）を模した合成データ: 区間ごとに長さを変える。
+        let frames_per_segment = [500u64, 650, 300, 800, 450];
+        let video_segment_durations: Vec<u64> = frames_per_segment
+            .iter()
+            .map(|&f| f * frame_duration)
+            .collect();
+
+        let total_frames: u64 = frames_per_segment.iter().sum();
+        // 十分な数の音声サンプルを用意する（映像の総尺を確実に上回る）。
+        let total_audio_needed = (total_frames * frame_duration * audio_timescale as u64)
+            / (video_timescale as u64 * frame_size as u64);
+        let audio_samples = make_audio_samples((total_audio_needed as usize) + 10, frame_size);
+
+        let (audio_segments, _drift_stats) = select_audio_segments(
+            &video_segment_durations,
+            video_timescale,
+            &audio_samples,
+            audio_timescale,
+        )
+        .unwrap();
+
+        let report = av_sync_report(
+            &video_segment_durations,
+            video_timescale,
+            &audio_segments,
+            &audio_samples,
+            audio_timescale,
+        )
+        .unwrap();
+
+        assert_eq!(report.per_segment.len(), 5);
+
+        // 1 音声パケット（20ms）を大きく超えるようなら #33 側の丸めロジックが
+        // 壊れている（このテストでは #33 は変更せず、異常な値でないことだけ確認する）。
+        assert!(
+            report.max_abs_diff_ms < 20.0,
+            "max_abs_diff_ms = {} (1 パケット分の20msを超えている)",
+            report.max_abs_diff_ms
+        );
+        assert!(
+            report.total_diff_ms.abs() < 20.0,
+            "total_diff_ms = {}",
+            report.total_diff_ms
+        );
+        assert!(!report.exceeds_threshold);
+
+        let text = format_av_sync_report(&report);
+        assert!(text.contains("音声同期: 区間 5"));
+        assert!(text.contains("区間 1:"));
+        assert!(text.contains("区間 5:"));
+        assert!(!text.contains("警告"));
+    }
+
+    /// 完了条件: 閾値（[`AV_DIFF_WARNING_THRESHOLD_MS`]）を超えるずれがあれば
+    /// `exceeds_threshold` が true になり、フォーマット済みテキストにも警告が出る。
+    /// ただしエラーにはしない（`av_sync_report` は `Ok` を返す）。
+    #[test]
+    fn av_sync_report_flags_warning_when_threshold_exceeded() {
+        // 意図的に不自然なデータを手で作る: 映像区間は短いのに、その区間に
+        // 割り当てられた音声パケット数が過大（≈480ms 分）になるようにする。
+        let video_timescale = 30000u32;
+        let video_segment_durations = vec![1001u64 * 10]; // 約 333.7 ms 分の映像
+        let audio_timescale = 48000u32;
+
+        // 音声パケットは 960 サンプル(20ms)刻みだが、24 パケット全てを
+        // この 1 区間に割り当てる（select_audio_segments を経由せず、
+        // AudioSegment を手作りして不自然な対応を作る）。
+        let audio_samples = make_audio_samples(24, 960); // 24 * 20ms = 480ms 分
+        let audio_segments = vec![AudioSegment {
+            start: DecodeIdx(0),
+            end: DecodeIdx(24),
+        }];
+
+        let report = av_sync_report(
+            &video_segment_durations,
+            video_timescale,
+            &audio_segments,
+            &audio_samples,
+            audio_timescale,
+        )
+        .unwrap();
+
+        assert_eq!(report.per_segment.len(), 1);
+        // 映像 ≈333.7ms に対して音声 480ms なので、差は 100ms を超える。
+        assert!(report.max_abs_diff_ms > AV_DIFF_WARNING_THRESHOLD_MS);
+        assert!(report.exceeds_threshold);
+
+        let text = format_av_sync_report(&report);
+        assert!(text.contains("警告"));
+    }
+
+    #[test]
+    fn av_sync_report_rejects_length_mismatch() {
+        let audio_samples = make_audio_samples(10, 960);
+        let audio_segments = vec![AudioSegment {
+            start: DecodeIdx(0),
+            end: DecodeIdx(5),
+        }];
+        // video_segment_durations が 2 要素、audio_segments が 1 要素で不一致。
+        let result = av_sync_report(&[1001, 1001], 30000, &audio_segments, &audio_samples, 48000);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn format_av_sync_report_handles_empty_report() {
+        let report = AvSyncReport {
+            per_segment: Vec::new(),
+            max_abs_diff_ms: 0.0,
+            max_abs_diff_segment_index: 0,
+            total_diff_ms: 0.0,
+            exceeds_threshold: false,
+        };
+        let text = format_av_sync_report(&report);
+        assert!(text.contains("区間 0"));
     }
 }
