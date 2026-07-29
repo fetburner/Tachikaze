@@ -18,25 +18,28 @@
 //! 「出力の音声パケットの dts が単調増加」を別途 assert して補う
 //! （[`is_strictly_increasing`]）。
 //!
-//! # なぜ実際の cut 実行を伴う e2e テストが `#[ignore]` のままなのか
+//! # テストの構成
 //!
-//! この issue の時点で:
-//! - `main.rs` の `Commands::Cut { .. }` はまだ `unimplemented!()` であり、CLI の
-//!   `cut` サブコマンドは配線されていない。
-//! - `Cargo.toml` に `[lib]` ターゲットが無いため、`tests/`（別クレート扱い）から
-//!   `src/` の `pub` 関数（`mp4io::read` / `plan` / `audio::select_audio_segments` /
-//!   `mp4io::write::write_mp4` など）を直接呼ぶことができない。
+//! `Cargo.toml` に `[lib]` ターゲットが無いため、`tests/`（別クレート扱い）から
+//! `src/` の関数を直接呼ぶことはできない。そのため実際のカット処理は
+//! `tachikaze` バイナリ（`CARGO_BIN_EXE_tachikaze`）を起動する統合テストとして
+//! 検証する（[`cut_audio_is_bitwise_copy_and_matches_expected_count`] と
+//! [`corrupted_audio_packet_is_detected_by_set_comparison`]）。これらは
+//! フィクスチャと `ffmpeg`/`ffprobe` を要するため `#[ignore]` を付けている。
 //!
-//! そのため、実際にカット処理を実行して検証する部分
-//! （[`cut_audio_is_bitwise_copy_and_matches_expected_count`]）は、配線後に
-//! `tachikaze` バイナリ（`CARGO_BIN_EXE_tachikaze`）を起動する形の統合テストとして
-//! 書きつつ `#[ignore]` のプレースホルダに留める。集合比較・パース・順序検証の
-//! ロジック自体は本ファイル内で完結する独立関数として実装し、実ファイルが無くても
-//! （`ffprobe` の出力を模した文字列だけで）unit test で検証できるようにしている。
+//! 集合比較・パース・順序検証・期待パケット数の算出ロジックは本ファイル内で完結する
+//! 独立関数として実装し、実ファイルが無くても（`ffprobe` の出力を模した文字列だけで）
+//! unit test で検証できるようにしている。加えて `ffprobe` 呼び出しと CRC32 の
+//! パース処理そのものは [`ffprobe_wrapper_round_trips_on_real_fixture`] で
+//! 実フィクスチャ・実 `ffprobe` を使って検証する。
 //!
-//! 加えて、`ffprobe` 呼び出しと CRC32 のパース処理そのものは
-//! [`ffprobe_wrapper_round_trips_on_real_fixture`] で実フィクスチャ・実 `ffprobe`
-//! を使って検証する（`cut` の配線を待たずに今すぐ実行できる）。
+//! # `cut` に `--dtvi` が必要な理由
+//!
+//! `cut` はオープン GOP かどうかを `.dtvi` のフレーム表からしか判定できないため、
+//! `mp4io::support::check_supported` が `.dtvi` を必須にしている（#36 の決定）。
+//! したがってバイナリを起動する際は `--dtvi` を渡す必要がある。ここでは
+//! `tests/data/sample.dtvi`（このフィクスチャと同じ手順で作った mp4 に対する
+//! 実 `dtvindex` 出力の抜粋）を使う。
 
 mod common;
 
@@ -93,8 +96,21 @@ fn describe_diff(diff: &[&str]) -> String {
 }
 
 /// `src/audio.rs::select_audio_segments` と同じ丸めアルゴリズムの、テスト側での
-/// 独立再実装（累積誤差が蓄積しないことは src 側の unit test で既に検証済み。
-/// ここでは e2e テストの期待値を、実装本体を呼ばずに算出するためだけに使う）。
+/// 再実装（e2e テストの期待値を、実装本体を呼ばずに算出するために使う）。
+///
+/// 入力は `src` 側の `SampleInfo` ではなく **`ffprobe` から取った実パケット長の列**
+/// なので、データの取得経路は実装本体と独立している。
+///
+/// # 固定の 1 パケット長で割ってはいけない
+///
+/// 素朴には `累積映像時間 × audio_timescale / (video_timescale × frame_size)` を
+/// 丸めれば済みそうに見えるが、**これは実データで誤った期待値を出す。** エンコーダの
+/// プライミング分だけ先頭パケットが他より大幅に長いことがあるためで、
+/// `tests/fixtures/sample.mp4` でも先頭だけ `duration=3852`（他は `960`）になっている。
+/// 固定長で割ると 400、実 duration を累積すると 397 で、後者が正しい。
+///
+/// そのため `src/audio.rs` と同様に、各パケットの実 duration を先頭から累積し、
+/// 目標時刻に最も近い累積位置を探す方式にする。
 ///
 /// 戻り値は各出力区間の終端パケット数（累積、`AudioSegment.end` 相当）の列。
 /// 区間ごとの長さ（`AudioSegment.end - start` の合計）は最後の要素に等しい
@@ -102,20 +118,46 @@ fn describe_diff(diff: &[&str]) -> String {
 fn reference_cumulative_audio_packet_ends(
     video_segment_durations: &[u64],
     video_timescale: u32,
-    frame_size: u64,
-    total_audio_samples: u64,
+    audio_packet_durations: &[u64],
     audio_timescale: u32,
 ) -> Vec<u64> {
+    // cumulative[i] は audio_packet_durations[0..i] の合計（cumulative[0] == 0）。
+    let mut cumulative: Vec<u64> = Vec::with_capacity(audio_packet_durations.len() + 1);
+    cumulative.push(0);
+    for &d in audio_packet_durations {
+        cumulative.push(cumulative.last().copied().unwrap_or(0) + d);
+    }
+    let total_audio_samples = audio_packet_durations.len() as u64;
+
     let mut cumulative_video_time: u64 = 0;
     let mut ends = Vec::with_capacity(video_segment_durations.len());
     for &duration in video_segment_durations {
         cumulative_video_time += duration;
-        let ideal_packets = (cumulative_video_time as f64 * audio_timescale as f64)
-            / (video_timescale as f64 * frame_size as f64);
-        let packet_count = (ideal_packets.round() as u64).min(total_audio_samples);
+        let target =
+            (cumulative_video_time as f64 * audio_timescale as f64) / video_timescale as f64;
+        let packet_count =
+            reference_nearest_cumulative_index(&cumulative, target).min(total_audio_samples);
         ends.push(packet_count);
     }
     ends
+}
+
+/// 昇順の `cumulative` の中から `target` に最も近い要素のインデックスを返す。
+fn reference_nearest_cumulative_index(cumulative: &[u64], target: f64) -> u64 {
+    let idx = cumulative.partition_point(|&c| (c as f64) < target);
+    if idx == 0 {
+        return 0;
+    }
+    if idx >= cumulative.len() {
+        return (cumulative.len() - 1) as u64;
+    }
+    let before = cumulative[idx - 1] as f64;
+    let after = cumulative[idx] as f64;
+    if (target - before).abs() <= (after - target).abs() {
+        (idx - 1) as u64
+    } else {
+        idx as u64
+    }
 }
 
 #[cfg(test)]
@@ -214,16 +256,14 @@ mod pure_logic_tests {
         let video_timescale = 30_000u32;
         let frame_duration = 1001u64;
         let audio_timescale = 48_000u32;
-        let frame_size = 960u64;
-        let total_audio_samples = 10u64;
+        let audio_packet_durations = vec![960u64; 10];
 
         let video_segment_durations = vec![frame_duration * 10_000];
 
         let ends = reference_cumulative_audio_packet_ends(
             &video_segment_durations,
             video_timescale,
-            frame_size,
-            total_audio_samples,
+            &audio_packet_durations,
             audio_timescale,
         );
 
@@ -240,8 +280,7 @@ mod pure_logic_tests {
         let video_timescale = 30_000u32;
         let frame_duration = 1001u64;
         let audio_timescale = 44_100u32;
-        let frame_size = 882u64;
-        let total_audio_samples = 500u64;
+        let audio_packet_durations = vec![882u64; 500];
 
         let frames_per_segment = 20u64;
         let segment_duration = frames_per_segment * frame_duration;
@@ -250,8 +289,7 @@ mod pure_logic_tests {
         let ends = reference_cumulative_audio_packet_ends(
             &video_segment_durations,
             video_timescale,
-            frame_size,
-            total_audio_samples,
+            &audio_packet_durations,
             audio_timescale,
         );
 
@@ -261,6 +299,53 @@ mod pure_logic_tests {
             assert!(*end >= prev, "非減少であること: ends={ends:?}");
             prev = *end;
         }
+    }
+
+    /// 先頭パケットがエンコーダのプライミング分だけ長い実データ（フィクスチャの
+    /// 実測値: 先頭 `3852`、以降 `960`）で、固定の 1 パケット長で割る素朴な計算と
+    /// 結果が食い違うことを固定する回帰テスト。
+    ///
+    /// `tests/fixtures/sample.mp4` に対して `Trim` を 120 フレーム × 2 区間にした
+    /// 場合、固定長では 400 になるが正しい期待値は 397 である。この差を見落とすと
+    /// e2e テストが「実装が正しいのに落ちる」状態になる（実際にそうなっていた）。
+    #[test]
+    fn reference_accounts_for_longer_priming_packet() {
+        let video_timescale = 30_000u32;
+        let frame_duration = 1001u64;
+        let audio_timescale = 48_000u32;
+
+        // フィクスチャの実測パターン: 先頭だけ 3852、以降は 960。
+        let mut audio_packet_durations = vec![3852u64];
+        audio_packet_durations.extend(std::iter::repeat_n(960u64, 999));
+
+        let video_segment_durations = vec![120 * frame_duration, 120 * frame_duration];
+
+        let ends = reference_cumulative_audio_packet_ends(
+            &video_segment_durations,
+            video_timescale,
+            &audio_packet_durations,
+            audio_timescale,
+        );
+
+        assert_eq!(
+            ends,
+            vec![197, 397],
+            "プライミング分の長い先頭パケットを考慮した期待値になること"
+        );
+
+        // 固定長 960 で割る素朴な計算は 200 / 400 になり、上と食い違う。
+        let naive_last = ((240 * frame_duration) as f64 * audio_timescale as f64
+            / (video_timescale as f64 * 960.0))
+            .round() as u64;
+        assert_eq!(
+            naive_last, 400,
+            "素朴な計算は 400 になる（＝使ってはいけない）"
+        );
+        assert_ne!(
+            *ends.last().unwrap(),
+            naive_last,
+            "実 duration の累積と固定長除算が食い違うことをこのテストで固定する"
+        );
     }
 }
 
@@ -334,6 +419,80 @@ fn ffprobe_audio_dts(path: &Path) -> Vec<i64> {
         .collect()
 }
 
+/// 音声ストリームの全パケットの duration を格納順に取得する。
+///
+/// 固定の 1 パケット長を仮定せず実測値を使うため
+/// （[`reference_cumulative_audio_packet_ends`] のドキュメント参照）。
+fn ffprobe_audio_packet_durations(path: &Path) -> Vec<u64> {
+    ffprobe_csv_column(path, "a:0", "packet=duration")
+        .into_iter()
+        .map(|line| {
+            line.parse::<u64>()
+                .unwrap_or_else(|_| panic!("duration が整数としてパースできない: {line:?}"))
+        })
+        .collect()
+}
+
+/// 音声ストリームの各パケットの `(ファイル内オフセット, サイズ)` を格納順に取得する。
+///
+/// 出力ファイルの音声パケットを1つだけ意図的に壊すために使う。
+///
+/// # `packet=pos,size` を1回で取らない理由
+///
+/// `ffprobe` は `-show_entries` に並べた順ではなく**内部の定義順**でフィールドを出す。
+/// 実際に `packet=pos,size` と指定しても CSV は `size,pos` の順で出てくるため、
+/// 1回のクエリを位置で解釈すると値が入れ替わる（このテストで実際に踏んだ）。
+/// フィールド順に依存しないよう、`pos` と `size` を別々に取得して zip する。
+fn ffprobe_audio_packet_positions(path: &Path) -> Vec<(u64, u64)> {
+    let parse_all = |entry: &str| -> Vec<u64> {
+        ffprobe_csv_column(path, "a:0", entry)
+            .into_iter()
+            .map(|line| {
+                line.parse::<u64>()
+                    .unwrap_or_else(|_| panic!("{entry} が整数としてパースできない: {line:?}"))
+            })
+            .collect()
+    };
+
+    let positions = parse_all("packet=pos");
+    let sizes = parse_all("packet=size");
+    assert_eq!(
+        positions.len(),
+        sizes.len(),
+        "pos と size のパケット数が一致しない"
+    );
+    positions.into_iter().zip(sizes).collect()
+}
+
+/// `ffprobe ... -of csv=p=0` の出力を空行を除いた行の列として返す。
+fn ffprobe_csv_column(path: &Path, stream_selector: &str, entry: &str) -> Vec<String> {
+    let output = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            stream_selector,
+            "-show_entries",
+            entry,
+            "-of",
+            "csv=p=0",
+        ])
+        .arg(path)
+        .output()
+        .expect("ffprobe の起動に失敗した");
+    assert!(
+        output.status.success(),
+        "ffprobe が失敗した: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 fn ffprobe_scalar_stream_entry(path: &Path, stream_selector: &str, entry: &str) -> String {
     let output = Command::new("ffprobe")
         .args([
@@ -404,12 +563,60 @@ fn ffprobe_wrapper_round_trips_on_real_fixture() {
     );
 }
 
-// --- 実際に cut を実行する e2e テスト（配線待ちのプレースホルダ） ---
+// --- 実際に cut を実行する e2e テスト ---
 
 /// フィクスチャ (`tests/fixtures/sample.mp4`, GOP=120 固定, 30000/1001fps, docs/lossless-cut.md
-/// 前提と同じ) の先頭2GOP分を2区間に分けて keep する Trim リスト:
-/// `Trim(0,119) ++ Trim(240,359)`（キーフレーム境界ちょうどなので snap による移動は無い）。
-const TRIM_AVS_CONTENT: &str = "Trim(0,119) ++ Trim(240,359)";
+/// 前提と同じ) に対する Trim リスト。
+///
+/// **キーフレーム境界からわざとずらした値**を使う（#15 の補足）。フィクスチャの
+/// キーフレームは表示順 0 / 120 / 240 / 360 / 480 なので、`Snap::Outward`（既定）で
+/// `[10,110)` は `[0,120)` へ、`[370,470)` は `[360,480)` へ広がる。これにより
+/// スナップ処理も経路に入り、`video_e2e.rs` / `src/verify.rs` のテストと同じ区間に揃う。
+const TRIM_AVS_CONTENT: &str = "Trim(10,109) ++ Trim(370,469)";
+
+/// スナップ後の各区間の映像フレーム数（`[0,120)` と `[360,480)`）。
+const SNAPPED_FRAMES_PER_SEGMENT: [u64; 2] = [120, 120];
+
+/// `cut` に渡す `.dtvi`。実 `dtvindex` 出力の抜粋（`src/mp4io/order_map.rs` の
+/// テストが同じものをフィクスチャとの全行一致検証に使っている）。
+fn dtvi_path() -> std::path::PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/sample.dtvi")
+}
+
+/// フィクスチャに対して `tachikaze cut` を実行し、`(一時ディレクトリ, 出力パス)` を返す。
+fn run_cut(label: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+    let fixture = common::fixture_path();
+
+    let tmp_dir = std::env::temp_dir().join(format!(
+        "tachikaze-audio-e2e-{label}-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&tmp_dir).expect("一時ディレクトリを作れること");
+    let trim_path = tmp_dir.join("trim.avs");
+    let out_path = tmp_dir.join("out.mp4");
+    std::fs::write(&trim_path, TRIM_AVS_CONTENT).expect("trim.avs を書けること");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_tachikaze"))
+        .arg("cut")
+        .arg(&fixture)
+        .arg("--trim")
+        .arg(&trim_path)
+        .arg("-o")
+        .arg(&out_path)
+        .arg("--dtvi")
+        .arg(dtvi_path())
+        .output()
+        .expect("tachikaze cut の起動に失敗した");
+    assert!(
+        output.status.success(),
+        "tachikaze cut が失敗した: status={:?}\nstdout={}\nstderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    (tmp_dir, out_path)
+}
 
 /// 完了条件:
 /// - フィクスチャで差分0件（出力の全音声パケットが入力に存在する）
@@ -417,12 +624,8 @@ const TRIM_AVS_CONTENT: &str = "Trim(0,119) ++ Trim(240,359)";
 ///   `reference_cumulative_audio_packet_ends` で独立に再計算した期待値）と一致する
 /// - 出力の音声パケットの dts が単調増加である
 ///
-/// `main.rs` の `Commands::Cut { .. }` が `unimplemented!()` のままであり、かつこの
-/// クレートに `[lib]` ターゲットが無く `tests/` から `src/` の関数を直接呼べないため、
-/// 現時点ではこのテストを実行すると `tachikaze cut` の起動そのものが失敗する
-/// （パニックで終了する）。CLI 配線が完了したら `#[ignore]` を外して有効化する。
 #[test]
-#[ignore = "cut サブコマンドがまだ CLI に配線されていない（main.rs の unimplemented!()）。配線後に有効化する"]
+#[ignore = "tests/fixtures/sample.mp4 と ffmpeg/ffprobe が必要。tests/fixtures/gen.sh を先に実行すること"]
 fn cut_audio_is_bitwise_copy_and_matches_expected_count() {
     if common::skip_if_fixture_missing() || skip_if_missing("ffmpeg") || skip_if_missing("ffprobe")
     {
@@ -430,26 +633,7 @@ fn cut_audio_is_bitwise_copy_and_matches_expected_count() {
     }
 
     let fixture = common::fixture_path();
-
-    let tmp_dir = std::env::temp_dir().join(format!("tachikaze-audio-e2e-{}", std::process::id()));
-    std::fs::create_dir_all(&tmp_dir).expect("一時ディレクトリを作れること");
-    let trim_path = tmp_dir.join("trim.avs");
-    let out_path = tmp_dir.join("out.mp4");
-    std::fs::write(&trim_path, TRIM_AVS_CONTENT).expect("trim.avs を書けること");
-
-    let status = Command::new(env!("CARGO_BIN_EXE_tachikaze"))
-        .arg("cut")
-        .arg(&fixture)
-        .arg("--trim")
-        .arg(&trim_path)
-        .arg("-o")
-        .arg(&out_path)
-        .status()
-        .expect("tachikaze cut の起動に失敗した");
-    assert!(
-        status.success(),
-        "tachikaze cut が失敗した: status={status:?}"
-    );
+    let (tmp_dir, out_path) = run_cut("bitcopy");
 
     // --- 完了条件1: 差分0件（集合比較） ---
     let src_set = ffprobe_audio_crc_set(&fixture);
@@ -473,22 +657,19 @@ fn cut_audio_is_bitwise_copy_and_matches_expected_count() {
     let audio_timescale: u32 = ffprobe_scalar_stream_entry(&fixture, "a:0", "stream=sample_rate")
         .parse()
         .expect("sample_rate が整数としてパースできない");
-    let frame_size: u64 = ffprobe_scalar_stream_entry(&fixture, "a:0", "packet=duration")
-        .lines()
-        .next()
-        .expect("音声パケットが1つも無い")
-        .parse()
-        .expect("音声パケットの duration が整数としてパースできない");
-    let total_audio_samples = ffprobe_audio_dts(&fixture).len() as u64;
+    // 固定の 1 パケット長ではなく実測の duration 列を使う
+    // （reference_cumulative_audio_packet_ends のドキュメント参照）。
+    let audio_packet_durations = ffprobe_audio_packet_durations(&fixture);
 
-    // Trim(0,119) ++ Trim(240,359): 120フレームずつ2区間。
-    let video_segment_durations = vec![120 * video_frame_duration, 120 * video_frame_duration];
+    let video_segment_durations: Vec<u64> = SNAPPED_FRAMES_PER_SEGMENT
+        .iter()
+        .map(|frames| frames * video_frame_duration)
+        .collect();
 
     let expected_ends = reference_cumulative_audio_packet_ends(
         &video_segment_durations,
         video_timescale,
-        frame_size,
-        total_audio_samples,
+        &audio_packet_durations,
         audio_timescale,
     );
     let expected_packet_count = *expected_ends.last().expect("区間が1つも無い");
@@ -507,10 +688,77 @@ fn cut_audio_is_bitwise_copy_and_matches_expected_count() {
         "CRC32集合の要素数がパケット数を超えている（あり得ないはず）"
     );
 
-    // --- 完了条件3: 出力の音声パケットの dts が単調増加である ---
+    // --- 注意書きの補完: 出力の音声パケットの dts が単調増加である ---
     assert!(
         is_strictly_increasing(&got_dts),
         "出力の音声パケットのdtsが単調増加でない: {got_dts:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+/// 完了条件3: 意図的に壊した出力で差分が検出されることを確認する。
+///
+/// `cut` の正常な出力をコピーし、**音声パケット1個のバイトを1つだけ反転**させて
+/// （`ffprobe` から得たそのパケットのファイル内オフセットを使う）、集合比較が
+/// その1件を検出することを確認する。純ロジックの
+/// [`pure_logic_tests::packets_only_in_output_detects_intentionally_corrupted_packet`]
+/// と違い、実ファイル・実 `ffprobe` を通した経路で検出できることを示す。
+#[test]
+#[ignore = "tests/fixtures/sample.mp4 と ffmpeg/ffprobe が必要。tests/fixtures/gen.sh を先に実行すること"]
+fn corrupted_audio_packet_is_detected_by_set_comparison() {
+    if common::skip_if_fixture_missing() || skip_if_missing("ffmpeg") || skip_if_missing("ffprobe")
+    {
+        return;
+    }
+
+    let fixture = common::fixture_path();
+    let (tmp_dir, out_path) = run_cut("corrupt");
+
+    // 壊す前提のセルフチェック: 壊す前は差分0件のはず。
+    let src_set = ffprobe_audio_crc_set(&fixture);
+    let clean_set = ffprobe_audio_crc_set(&out_path);
+    let diff = packets_only_in_output(&clean_set, &src_set);
+    assert!(
+        diff.is_empty(),
+        "壊す前に差分が出た: {}",
+        describe_diff(&diff)
+    );
+
+    // 音声パケットを1つ選んでバイトを1つ反転させる。先頭はプライミングで特殊なので
+    // 中ほどのパケットを選ぶ。
+    let positions = ffprobe_audio_packet_positions(&out_path);
+    assert!(
+        positions.len() >= 3,
+        "音声パケットが少なすぎて壊す対象を選べない: {}",
+        positions.len()
+    );
+    let (pos, size) = positions[positions.len() / 2];
+    assert!(size > 0, "パケットサイズが0");
+
+    let corrupted_path = tmp_dir.join("corrupted.mp4");
+    let mut bytes = std::fs::read(&out_path).expect("出力を読めること");
+    let target = pos as usize;
+    assert!(
+        target < bytes.len(),
+        "パケットのオフセットがファイル範囲外: pos={pos}, len={}",
+        bytes.len()
+    );
+    bytes[target] ^= 0xFF;
+    std::fs::write(&corrupted_path, &bytes).expect("壊した出力を書けること");
+
+    let corrupted_set = ffprobe_audio_crc_set(&corrupted_path);
+    let diff = packets_only_in_output(&corrupted_set, &src_set);
+    assert!(
+        !diff.is_empty(),
+        "音声パケットを1つ壊したのに集合比較で検出されなかった"
+    );
+
+    // 報告メッセージに件数と先頭のCRCが出ること。
+    let message = describe_diff(&diff);
+    assert!(
+        message.contains(diff[0]),
+        "報告メッセージに先頭のCRCが含まれること: {message}"
     );
 
     let _ = std::fs::remove_dir_all(&tmp_dir);
