@@ -31,16 +31,16 @@
 
 mod common;
 
-#[path = "../src/order.rs"]
-mod order;
-#[path = "../src/dtvi.rs"]
-mod dtvi;
-#[path = "../src/trim.rs"]
-mod trim;
 #[path = "../src/cli.rs"]
 mod cli;
+#[path = "../src/dtvi.rs"]
+mod dtvi;
+#[path = "../src/order.rs"]
+mod order;
 #[path = "../src/plan.rs"]
 mod plan;
+#[path = "../src/trim.rs"]
+mod trim;
 // `mp4io/mod.rs` はディレクトリオーナー(`mod.rs`)なので、これ経由で読み込めば
 // `pub mod read;` 等の子モジュール宣言はそのファイル自身の場所(`src/mp4io/`)を
 // 基準に解決される。個々のファイルに `#[path]` を付け直す必要が無いぶんこちらが単純
@@ -248,7 +248,8 @@ fn assert_no_gaps_within_range(pts_in_range: &[i64], range_index: usize) {
     for (i, w) in pts_in_range.windows(2).enumerate() {
         let delta = w[1] - w[0];
         assert_eq!(
-            delta, step,
+            delta,
+            step,
             "range {range_index} 内、区間先頭から{i}枚目→{}枚目の表示順フレーム間隔が\
              一定ではありません（欠落の疑い）: 通常間隔={step}, 実際={delta}",
             i + 1
@@ -301,8 +302,14 @@ fn video_only_cut_matches_source_packets_by_crc32() {
 
     // テストの前提が壊れていないことのセルフチェック（outward で本編側に伸びること）。
     assert_eq!(snapped.len(), 2, "保持区間は2つのはず");
-    assert_eq!((snapped[0].start.snapped.0, snapped[0].end.snapped.0), (0, 120));
-    assert_eq!((snapped[1].start.snapped.0, snapped[1].end.snapped.0), (360, 480));
+    assert_eq!(
+        (snapped[0].start.snapped.0, snapped[0].end.snapped.0),
+        (0, 120)
+    );
+    assert_eq!(
+        (snapped[1].start.snapped.0, snapped[1].end.snapped.0),
+        (360, 480)
+    );
 
     let keep = plan::keep_list(&snapped, &map.order).expect("keep_list が成功すること");
     assert_eq!(keep.len(), 240, "保持パケット数は 120 + 120 のはず");
@@ -325,15 +332,17 @@ fn video_only_cut_matches_source_packets_by_crc32() {
         })
         .collect();
 
-    let tmp_dir = std::env::temp_dir().join(format!(
-        "tachikaze-video-e2e-{}",
-        std::process::id()
-    ));
+    let tmp_dir = std::env::temp_dir().join(format!("tachikaze-video-e2e-{}", std::process::id()));
     std::fs::create_dir_all(&tmp_dir).expect("一時ディレクトリを作れること");
     let out_path = tmp_dir.join("cut_video_only.mp4");
 
-    write_mp4(fixture.as_path(), out_path.as_path(), &moov, &keep_per_track)
-        .expect("write_mp4 が成功すること");
+    write_mp4(
+        fixture.as_path(),
+        out_path.as_path(),
+        &moov,
+        &keep_per_track,
+    )
+    .expect("write_mp4 が成功すること");
 
     // --- 完了条件1: 全映像パケットの CRC32 が一致する ---
     // --- 完了条件3: 不一致時は最初に食い違ったパケット番号を表示する ---
@@ -385,7 +394,8 @@ fn video_only_cut_matches_source_packets_by_crc32() {
     // 「最初に食い違ったパケット番号」がそのままテスト失敗メッセージに出る。
     for (i, (got, want)) in got_crc32.iter().zip(want_crc32.iter()).enumerate() {
         assert_eq!(
-            got, want,
+            got,
+            want,
             "最初に食い違ったパケット番号 = {i} (出力パケット数={}, 期待パケット数={})",
             got_crc32.len(),
             want_crc32.len()
