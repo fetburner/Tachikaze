@@ -17,7 +17,7 @@
 use std::env;
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 
 /// `chapter_exe` の実行ファイル名。
 pub const CHAPTER_EXE: &str = "chapter_exe";
@@ -123,6 +123,10 @@ fn resolve_from_dirs(dirs: &[Option<PathBuf>], name: &str) -> Result<PathBuf> {
 /// - `tool_dir`: `--tool-dir` CLI オプションの値（最優先）。
 /// - `name`: 実行ファイル名（[`CHAPTER_EXE`] などの定数を渡す）。
 ///
+/// 見つかったパスは絶対パスに正規化して返す。`external::run` が作業
+/// ディレクトリへ `current_dir` するため、`--tool-dir tools` のような相対
+/// 指定のままだと `work/tools/...` を探しにいって起動に失敗する。
+///
 /// 見つからない場合は、調べた場所を全て列挙したエラーを返す。`ffprobe` の
 /// ように必須ではないツールは、呼び出し側で `Result` を見て `.ok()` などに
 /// 変換し、警告に留めるかどうかを判断する。
@@ -132,7 +136,13 @@ pub fn resolve_tool(tool_dir: Option<&Path>, name: &str) -> Result<PathBuf> {
         .ok()
         .and_then(|p| p.parent().map(Path::to_path_buf));
 
-    resolve_from_dirs(&[tool_dir.map(Path::to_path_buf), env_dir, exe_dir], name)
+    let found = resolve_from_dirs(&[tool_dir.map(Path::to_path_buf), env_dir, exe_dir], name)?;
+    std::fs::canonicalize(&found).with_context(|| {
+        format!(
+            "外部ツール `{name}` の絶対パス解決に失敗しました: {}",
+            found.display()
+        )
+    })
 }
 
 /// `join_logo_scp` バイナリと同じディレクトリの `JL/` から既定の JL コマンド
@@ -366,6 +376,8 @@ mod tests {
             None => env::remove_var("TACHIKAZE_TOOL_DIR"),
         }
 
+        // canonicalize 後のパスと比較する（macOS では /var → /private/var）。
+        let expected = fs::canonicalize(&expected).expect("canonicalize expected");
         assert_eq!(result.expect("should resolve"), expected);
     }
 
@@ -386,6 +398,7 @@ mod tests {
             None => env::remove_var("TACHIKAZE_TOOL_DIR"),
         }
 
+        let expected = fs::canonicalize(&expected).expect("canonicalize expected");
         assert_eq!(result.expect("should resolve"), expected);
     }
 
@@ -429,6 +442,7 @@ mod tests {
         env::remove_var("TACHIKAZE_TOOL_DIR");
 
         let result = resolve_tool(None, &unique_name);
+        let expected = fs::canonicalize(&dummy_path).expect("canonicalize dummy");
 
         match original_env {
             Some(v) => env::set_var("TACHIKAZE_TOOL_DIR", v),
@@ -436,7 +450,7 @@ mod tests {
         }
         let _ = fs::remove_file(&dummy_path);
 
-        assert_eq!(result.expect("should resolve via exe dir"), dummy_path);
+        assert_eq!(result.expect("should resolve via exe dir"), expected);
     }
 
     #[test]

@@ -48,6 +48,15 @@ impl WorkDir {
                 fs::create_dir_all(&path).with_context(|| {
                     format!("作業ディレクトリの作成に失敗しました: {}", path.display())
                 })?;
+                // 相対パスのまま保持すると、`external::run` が `current_dir` を
+                // このディレクトリに切り替えたあと、引数の `work/work.mp4` などが
+                // 二重にネストして解決される。作成直後に絶対化しておく。
+                let path = fs::canonicalize(&path).with_context(|| {
+                    format!(
+                        "作業ディレクトリの絶対パス解決に失敗しました: {}",
+                        path.display()
+                    )
+                })?;
                 Ok(Self { path, keep: true })
             }
             None => {

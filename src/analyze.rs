@@ -134,7 +134,12 @@ fn run_pipeline(config: &AnalyzeConfig, work_dir: &WorkDir) -> Result<AnalyzeOut
     }
 
     let jl_file = match &config.jl_file {
-        Some(path) => path.clone(),
+        Some(path) => fs::canonicalize(path).with_context(|| {
+            format!(
+                "JL コマンドファイルの絶対パス解決に失敗しました: {}",
+                path.display()
+            )
+        })?,
         None => tools::default_jl_command_file(&join_logo_scp_path)?,
     };
 
