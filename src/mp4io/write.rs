@@ -22,32 +22,101 @@ use mp4_atom::{
 use crate::mp4io::read::{samples, SampleInfo};
 use crate::order::DecodeIdx;
 
-/// `mdat` アトムのヘッダ(サイズ4バイト + kind4バイト)の長さ。
+/// `mdat` アトムの通常ヘッダ(サイズ4バイト + kind4バイト)の長さ。
 const MDAT_HEADER_LEN: u64 = 8;
 
-/// `mdat` を書き終えたあとに `moov` を書けるように、`ftyp` の長さと
-/// `mdat` 本体の合計バイト数から `mdat` 本体の開始オフセットを求める。
+/// `mdat` アトムの largesize ヘッダの長さ。
 ///
-/// `stco` は 32bit オフセットしか持てない(`co64` は今回のスコープ外)ため、
-/// `mdat` 本体の最後の1バイトのオフセットが `u32::MAX` を超えるならここで
-/// エラーにする(黙って壊れた `stco` を書かない)。
-fn mdat_body_start(ftyp_len: u64, mdat_body_len: u64) -> anyhow::Result<u64> {
-    let start = ftyp_len
+/// ISO BMFF のボックスヘッダは通常「サイズ4バイト + 種別4バイト」だが、
+/// サイズが32bitに収まらない場合は「サイズ=1(4バイト) + 種別4バイト +
+/// 64bit の実サイズ(8バイト)」という形式が使える(先頭の `size` フィールドに
+/// `1` を書くと続く8バイトが実際のサイズだという意味になる)。
+/// `mp4_atom` の `Header::encode` も同じ規則で largesize を選択しており
+/// (`src/header.rs`)、ここでの判定はそれと整合させてある。
+const MDAT_LARGESIZE_HEADER_LEN: u64 = 16;
+
+/// `mdat` アトムのレイアウト計画。
+///
+/// `write_mp4` 本体から純粋関数として切り出してあるのは、実際に4GB超の
+/// ファイルを作らずに `co64`/largesize の分岐を unit test できるようにする
+/// ため(docs/mp4-atom.md「本実装で直すべき点」3番)。
+#[derive(Debug)]
+struct MdatLayout {
+    /// `mdat` ヘッダの長さ(8 または 16)。
+    header_len: u64,
+    /// largesize 形式のヘッダを使うかどうか。
+    use_largesize: bool,
+    /// `mdat` 本体の開始オフセット(= `ftyp_len + header_len`)。
+    body_start: u64,
+    /// `stco`(32bit オフセット)ではなく `co64`(64bit オフセット)を
+    /// 使うべきかどうか。
+    use_co64: bool,
+}
+
+/// `ftyp` の長さと `mdat` 本体の合計バイト数から `mdat` のレイアウトを
+/// 決める純粋関数。
+///
+/// `use_largesize` は「`mdat` の通常ヘッダ込みの合計サイズ(`mdat_body_len + 8`)
+/// が `u32::MAX` に収まるか」で決める。`use_co64` は「`mdat` の終端オフセット
+/// (`body_start + mdat_body_len`)が `u32::MAX` を超えるか」で決める。
+/// 個々のチャンクオフセットではなく `mdat` 全体の終端で判定することで、
+/// 「一部のトラックだけ `co64` になる」というちぐはぐな状態を避ける。
+fn plan_mdat_layout(ftyp_len: u64, mdat_body_len: u64) -> anyhow::Result<MdatLayout> {
+    let normal_total = mdat_body_len
         .checked_add(MDAT_HEADER_LEN)
+        .ok_or_else(|| anyhow::anyhow!("mdat のサイズ計算がオーバーフローした"))?;
+    let use_largesize = normal_total > u32::MAX as u64;
+    let header_len = if use_largesize {
+        MDAT_LARGESIZE_HEADER_LEN
+    } else {
+        MDAT_HEADER_LEN
+    };
+
+    let body_start = ftyp_len
+        .checked_add(header_len)
         .ok_or_else(|| anyhow::anyhow!("ftyp のサイズ計算がオーバーフローした"))?;
 
-    let last_offset = start
+    let mdat_end = body_start
         .checked_add(mdat_body_len)
         .ok_or_else(|| anyhow::anyhow!("mdat のサイズ計算がオーバーフローした"))?;
+    let use_co64 = mdat_end > u32::MAX as u64;
 
-    anyhow::ensure!(
-        last_offset <= u32::MAX as u64,
-        "mdat が大きすぎて stco (32bit オフセット) で表現できません\
-         (mdat 本体 {mdat_body_len} バイト、末尾オフセット {last_offset} > u32::MAX)。\
-         co64 対応は #10 送りのため、この入力は処理できません。"
-    );
+    Ok(MdatLayout {
+        header_len,
+        use_largesize,
+        body_start,
+        use_co64,
+    })
+}
 
-    Ok(start)
+/// `plan_mdat_layout` の結果に従って `mdat` のヘッダバイトを書く。
+///
+/// `impl Write` にしてあるのは unit test で `Vec<u8>` に対しても呼べるように
+/// するため。本番では `BufWriter<File>` に対して呼ぶ。
+fn write_mdat_header(
+    out: &mut impl Write,
+    layout: &MdatLayout,
+    mdat_body_len: u64,
+) -> anyhow::Result<()> {
+    if layout.use_largesize {
+        // size フィールドに 1 を書くと「続く8バイトが実際のサイズ」の意味になる。
+        out.write_all(&1u32.to_be_bytes())?;
+        out.write_all(b"mdat")?;
+        let largesize = mdat_body_len
+            .checked_add(layout.header_len)
+            .ok_or_else(|| anyhow::anyhow!("mdat の largesize 計算がオーバーフローした"))?;
+        out.write_all(&largesize.to_be_bytes())?;
+    } else {
+        let total = mdat_body_len
+            .checked_add(layout.header_len)
+            .ok_or_else(|| anyhow::anyhow!("mdat のサイズ計算がオーバーフローした"))?;
+        let total: u32 = total
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("mdat の総サイズが u32::MAX を超えています"))?;
+        out.write_all(&total.to_be_bytes())?;
+        out.write_all(b"mdat")?;
+    }
+    Ok(())
 }
 
 /// `kept` の `duration` 列をランレングス圧縮して `stts` のエントリ列にする。
@@ -252,7 +321,8 @@ pub fn write_mp4<P: AsRef<Path>>(
         .iter()
         .map(|&ti| kept_samples[ti].iter().map(|s| s.size as u64).sum::<u64>())
         .sum();
-    let mdat_body_start = mdat_body_start(ftyp_buf.len() as u64, mdat_body_len)?;
+    let mdat_layout = plan_mdat_layout(ftyp_buf.len() as u64, mdat_body_len)?;
+    let mdat_body_start = mdat_layout.body_start;
 
     let output_path = output_path.as_ref();
     let mut out = BufWriter::new(File::create(output_path)?);
@@ -260,13 +330,9 @@ pub fn write_mp4<P: AsRef<Path>>(
 
     // 2. mdat: ヘッダを先に書き、続けて keep リストの順に元ファイルから
     // サンプルを読んで追記する。元ファイル全体はメモリに載せず、サンプル単位で
-    // seek + read する。
-    let mdat_total_len = mdat_body_len + MDAT_HEADER_LEN;
-    let mdat_total_len_u32: u32 = mdat_total_len
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("mdat の総サイズが u32::MAX を超えています"))?;
-    out.write_all(&mdat_total_len_u32.to_be_bytes())?;
-    out.write_all(b"mdat")?;
+    // seek + read する。4GB を超える場合は largesize 形式のヘッダになる
+    // (plan_mdat_layout 参照)。
+    write_mdat_header(&mut out, &mdat_layout, mdat_body_len)?;
 
     // トラックごとに1秒程度でチャンクに分割し、開始時刻でグローバルに
     // マージする。これがそのまま「映像→音声→映像→…」という mdat 上の
@@ -347,13 +413,21 @@ pub fn write_mp4<P: AsRef<Path>>(
         stbl.stsc = Stsc {
             entries: build_stsc_entries(&chunk_sample_counts[ti]),
         };
-        // 各チャンクの先頭オフセット列そのものが stco になる。個々のオフセットが
-        // u32::MAX を超えないことは mdat_body_start が mdat 全体のサイズで
-        // 既にチェックしているので、ここで個別に確認する必要はない。
-        stbl.stco = Some(Stco {
-            entries: offs.iter().map(|&o| o as u32).collect(),
-        });
-        stbl.co64 = None::<Co64>;
+        // 各チャンクの先頭オフセット列そのものが stco/co64 になる。
+        // stco(32bit) で表現できるかどうかは個々のオフセットではなく
+        // mdat 全体の終端オフセットで判定済み(plan_mdat_layout.use_co64)。
+        // 一部のトラックだけ co64 になる、というちぐはぐな状態を避けるため。
+        if mdat_layout.use_co64 {
+            stbl.stco = None;
+            stbl.co64 = Some(Co64 {
+                entries: offs.clone(),
+            });
+        } else {
+            stbl.stco = Some(Stco {
+                entries: offs.iter().map(|&o| o as u32).collect(),
+            });
+            stbl.co64 = None;
+        }
 
         // duration を更新する。
         let track_duration: u64 = kept.iter().map(|s| s.duration as u64).sum();
@@ -385,36 +459,121 @@ pub fn write_mp4<P: AsRef<Path>>(
 mod tests {
     use super::*;
 
-    // --- mdat_body_start: オフセット計算のロジック単体テスト ---
-    // (完了条件: 「mdat が4GBを超える場合に明示的なエラーになる」を、
-    // 実際に4GBのファイルを作らずに検証する)
+    // --- plan_mdat_layout / write_mdat_header: オフセット計算のロジック単体テスト ---
+    // (完了条件: 「4GB を超える出力に対応する」を、実際に4GBのファイルを
+    // 作らずに co64/largesize の分岐込みで検証する)
 
     #[test]
-    fn mdat_body_start_computes_normal_case() {
+    fn plan_mdat_layout_computes_normal_case() {
         // ftyp 32バイト + mdat ヘッダ8バイト = 40。
-        let start = mdat_body_start(32, 1000).expect("通常サイズは成功すること");
-        assert_eq!(start, 40);
+        let layout = plan_mdat_layout(32, 1000).expect("通常サイズは成功すること");
+        assert_eq!(layout.header_len, MDAT_HEADER_LEN);
+        assert!(!layout.use_largesize);
+        assert_eq!(layout.body_start, 40);
+        assert!(!layout.use_co64);
     }
 
     #[test]
-    fn mdat_body_start_errors_when_exceeding_u32_max() {
-        // mdat 本体の末尾オフセットが u32::MAX を超えるケース。
-        let err = mdat_body_start(32, u32::MAX as u64).unwrap_err();
-        assert!(err.to_string().contains("stco"));
-    }
-
-    #[test]
-    fn mdat_body_start_errors_on_overflow() {
-        let err = mdat_body_start(u64::MAX, 1).unwrap_err();
+    fn plan_mdat_layout_errors_on_overflow() {
+        let err = plan_mdat_layout(u64::MAX, 1).unwrap_err();
         assert!(err.to_string().contains("オーバーフロー"));
     }
 
     #[test]
-    fn mdat_body_start_accepts_boundary_just_under_u32_max() {
-        // start(40) + body <= u32::MAX ぎりぎりのケースは成功する。
+    fn plan_mdat_layout_accepts_boundary_just_under_u32_max() {
+        // body_start(40) + body <= u32::MAX ぎりぎりのケースは stco のまま成功する。
         let body_len = u32::MAX as u64 - 40;
-        let start = mdat_body_start(32, body_len).expect("境界ちょうどは成功すること");
-        assert_eq!(start + body_len, u32::MAX as u64);
+        let layout = plan_mdat_layout(32, body_len).expect("境界ちょうどは成功すること");
+        assert!(!layout.use_largesize);
+        assert!(!layout.use_co64);
+        assert_eq!(layout.body_start + body_len, u32::MAX as u64);
+    }
+
+    #[test]
+    fn plan_mdat_layout_uses_largesize_and_co64_when_mdat_body_exceeds_4gb() {
+        // mdat 本体だけで(通常ヘッダ込みで)u32::MAX を超える、実際に4GB超の
+        // 出力になるケース。largesize ヘッダ(16バイト)になり、当然 mdat の
+        // 終端オフセットも u32::MAX を超えるので co64 になる。
+        let body_len = u32::MAX as u64 + 1_000_000;
+        let layout = plan_mdat_layout(32, body_len).expect("largesize で成功すること");
+        assert_eq!(layout.header_len, MDAT_LARGESIZE_HEADER_LEN);
+        assert!(layout.use_largesize);
+        assert_eq!(layout.body_start, 32 + MDAT_LARGESIZE_HEADER_LEN);
+        assert!(layout.use_co64);
+    }
+
+    #[test]
+    fn plan_mdat_layout_uses_co64_without_largesize_when_only_end_offset_exceeds_u32_max() {
+        // use_largesize と use_co64 は別々の閾値で決まることを確認する。
+        // mdat 本体自体は小さくても(largesize は不要)、ftyp が異常に
+        // 大きければ mdat の終端オフセットは u32::MAX を超えうる。
+        let body_len = 1000u64;
+        let huge_ftyp_len = u32::MAX as u64;
+        let layout =
+            plan_mdat_layout(huge_ftyp_len, body_len).expect("成功すること(co64 で救える)");
+        assert!(
+            !layout.use_largesize,
+            "mdat 本体自体は小さいので largesize は不要"
+        );
+        assert!(
+            layout.use_co64,
+            "mdat の終端オフセットが u32::MAX を超えるので co64 が必要"
+        );
+    }
+
+    #[test]
+    fn write_mdat_header_writes_normal_8_byte_header() {
+        let layout = plan_mdat_layout(32, 1000).unwrap();
+        let mut buf: Vec<u8> = Vec::new();
+        write_mdat_header(&mut buf, &layout, 1000).expect("書き込みが成功すること");
+
+        // 手動でパースする: size==1 でなければ通常ヘッダ(size4 + kind4)。
+        assert_eq!(buf.len(), 8);
+        let size = u32::from_be_bytes(buf[0..4].try_into().unwrap());
+        assert_ne!(size, 1, "largesize のプレースホルダではないこと");
+        assert_eq!(size, 1008, "size フィールドは本体+ヘッダの合計であること");
+        assert_eq!(&buf[4..8], b"mdat");
+    }
+
+    #[test]
+    fn write_mdat_header_writes_largesize_16_byte_header_when_body_exceeds_4gb() {
+        let body_len = u32::MAX as u64 + 1_000_000;
+        let layout = plan_mdat_layout(32, body_len).unwrap();
+        let mut buf: Vec<u8> = Vec::new();
+        write_mdat_header(&mut buf, &layout, body_len).expect("書き込みが成功すること");
+
+        // 手動でパースする: size==1 なら続く8バイトが実際のサイズ。
+        assert_eq!(buf.len(), 16);
+        let placeholder = u32::from_be_bytes(buf[0..4].try_into().unwrap());
+        assert_eq!(placeholder, 1, "largesize のプレースホルダであること");
+        assert_eq!(&buf[4..8], b"mdat");
+        let largesize = u64::from_be_bytes(buf[8..16].try_into().unwrap());
+        assert_eq!(
+            largesize,
+            body_len + MDAT_LARGESIZE_HEADER_LEN,
+            "largesize フィールドは本体+16バイトヘッダの合計であること"
+        );
+    }
+
+    // --- Co64: mp4_atom のエンコード/デコードでエントリが保持されることの確認 ---
+    // (完了条件: 実ファイルで4GB超のケースを作れないため、mp4_atom の
+    // 型を直接 encode/decode してエントリが保持されることを確認する)
+
+    #[test]
+    fn co64_roundtrips_via_encode_decode() {
+        use mp4_atom::Decode;
+
+        let co64 = Co64 {
+            // u32::MAX を超えるオフセットを含めて、64bit 値が欠けずに
+            // 保持されることを確認する。
+            entries: vec![0, 1_000, u32::MAX as u64 + 12_345, 5_000_000_000],
+        };
+        let mut buf = Vec::new();
+        co64.encode(&mut buf).expect("encode が成功すること");
+
+        let mut slice = buf.as_slice();
+        let decoded = Co64::decode(&mut slice).expect("decode が成功すること");
+        assert_eq!(decoded, co64, "co64 のエントリが完全に保持されること");
     }
 
     // --- write_mp4: フィクスチャを使った統合テスト ---
