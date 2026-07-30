@@ -2,14 +2,14 @@
 
 → 入口: [overview.md](overview.md)
 
-**実装は完了している。** 当初エピック 8 件・サブ issue 31 件に分解したタスクはすべてクローズ済み（経緯は `git log` の `[E1-1]`〜`[E8-4]`、および GitHub issue #3〜#41）。この文書は**現在の構成**と、**まだ対応していないこと**を書く。
+**実装は完了している。** エピック E1〜E10 とそれぞれのサブ issue に分解したタスクはすべてクローズ済み（経緯は `git log` の `[E1-1]`〜`[E10-6]`）。この文書は**現在の構成**と、**まだ対応していないこと**を書く。
 
 ## コマンド構成
 
 **解析とカットは別のコマンドに分かれている。** 検出の見逃しが実際に起きるため（[jls-settings.md](jls-settings.md)）、目視確認と手動修正を挟めるようにしてある。
 
 ```
-tachikaze analyze IN.mp4 -o trim.avs [--report] [--work-dir DIR]
+tachikaze analyze IN.mp4 -o trim.avs [--report] [--work-dir DIR] [--no-keep-work]
                                      [--jls-set KEY=VALUE]... [--jl-file FILE]
     1. dtvindex build              （外部プロセス）
     2. chapter_exe                 （外部プロセス）
@@ -22,7 +22,7 @@ tachikaze analyze IN.mp4 -o trim.avs [--report] [--work-dir DIR]
 
 （必要なら trim.avs を人手で編集）
 
-tachikaze cut IN.mp4 --trim trim.avs -o OUT.mp4 --dtvi work.mp4.dtvi
+tachikaze cut IN.mp4 --trim trim.avs -o OUT.mp4 [--dtvi work.mp4.dtvi]
                                      [--snap outward|inward] [--cm-output CM.mp4]
                                      [--video-only] [--verify]
     5. mp4-atom でサンプル表を読み、表示順↔デコード順を導出
@@ -37,7 +37,7 @@ tachikaze cut IN.mp4 --trim trim.avs -o OUT.mp4 --dtvi work.mp4.dtvi
        + 保持側と CM 側でフレーム数の合計 == 総フレーム数 / 集合が互いに素 を assert
 ```
 
-`--dtvi` は必須。オープン GOP の判定（[lossless-cut.md](lossless-cut.md)）と自己検証 4（表示順/デコード順の突き合わせ）に使う。`analyze --work-dir DIR` を使うと `DIR/work.mp4.dtvi` に残る。
+`.dtvi` はオープン GOP の判定（[lossless-cut.md](lossless-cut.md)）と自己検証 4（表示順/デコード順の突き合わせ）に必須で、これ自体は変わっていない。省略できるようにしたのは**パスの指定**だけで、`.dtvi` 無しで動くようにしたわけではない（`cut --dtvi` を省略すると、`analyze` と同じ入力ごとのキャッシュディレクトリ規則から `work.mp4.dtvi` を自動的に探す。見つからなければ `analyze` を実行するコマンド例を添えて停止する。探索順・キャッシュの場所は次節「パス解決」参照）。
 
 **CLI に `tachikaze auto` は用意していない**（検出の見逃しがあるため、analyze と cut のあいだに人手を挟める設計を崩さない）。代わりにパス結線・edit list 除去・出力名決めなど**判断不要な手順だけ**を自動化するラッパーを `scripts/tachikaze-cmcut` に置いてある。既定では analyze 後に確認プロンプトを出し、`--yes` で省略できる。
 
@@ -45,10 +45,30 @@ tachikaze cut IN.mp4 --trim trim.avs -o OUT.mp4 --dtvi work.mp4.dtvi
 $ scripts/tachikaze-cmcut IN.mp4                  # analyze → 確認 → cut
 $ scripts/tachikaze-cmcut --yes IN.mp4 [IN2 ...]  # 確認省略（バッチ向き）
 $ scripts/tachikaze-cmcut --analyze-only IN.mp4   # 検出だけ
-$ scripts/tachikaze-cmcut --cut-only --work-dir work/cmcut_xxx IN.mp4
+$ scripts/tachikaze-cmcut --cut-only --work-dir <work-root>/cmcut_xxx IN.mp4
 ```
 
 注意: `analyze -o DIR/trim.avs --work-dir DIR` のように **`-o` と work_dir 内の `trim.avs` を同じパスにすると**、かつては `fs::copy(src, src)` で空ファイルになっていた（macOS で実測）。`analyze` 側で同一パスならコピーを省略するよう直してあるが、ラッパーは `final_trim.avs` / `user_trim.avs` に分けて書く。
+
+## パス解決
+
+インストールして（`/usr/local/bin` などに置いて）使う場合を含め、パスの決め方は**実行ファイル / 読み取り専用データ / キャッシュ / 出力**の4分類ごとに変える。配置手順は [toolchain-macos.md](toolchain-macos.md)「ビルド後の配置とインストール」。
+
+| 種類 | 中身 | 探索順・既定 |
+|---|---|---|
+| 実行ファイル | `tachikaze` / `tachikaze-cmcut` / `chapter_exe` / `join_logo_scp` / `dtvindex` | `--tool-dir` → `TACHIKAZE_TOOL_DIR` → 自分の実行ファイルの隣 → `PATH`（`src/tools.rs::resolve_tool`） |
+| 読み取り専用データ | JL コマンドファイル（既定 `JL_標準.txt`） | `TACHIKAZE_JL_DIR` → `${XDG_DATA_HOME:-~/.local/share}/tachikaze/JL/` → `$XDG_DATA_DIRS`（既定 `/usr/local/share:/usr/share`）各要素 + `join_logo_scp/JL/` → `<join_logo_scp の実体パス>/../share/join_logo_scp/JL/` → `<join_logo_scp と同じディレクトリ>/JL/`（`src/tools.rs::default_jl_command_file`） |
+| キャッシュ（再生成可能な中間物） | `work.mp4.dtvi` / `trim.avs` / `detail.jls` / `work.mp4`（入力への symlink） | `TACHIKAZE_CACHE_DIR` → `${XDG_CACHE_HOME:-~/.cache}/tachikaze/<入力ごと>/`（既定。削除せず、同じ入力を再実行すると再利用する。`src/workdir.rs`）。`cut --dtvi` 省略時もこの規則から `work.mp4.dtvi` を自動的に探す |
+| 出力 | `*_CMcut.mp4` / `*_CM.mp4` | 入力の隣（変更しない） |
+
+`--tool-dir` / `--jl-file` / `--work-dir` / `--dtvi` を明示指定した場合は、いずれも上記の探索より最優先でそのまま使う。`analyze --no-keep-work` を指定すると、既定のキャッシュディレクトリではなく従来どおりの使い捨て一時ディレクトリ（成功時に削除）になる。
+
+**なぜこの形にしたか**:
+
+- **中間物を XDG キャッシュに置いた理由**: `.dtvi` / `trim.avs` / `detail.jls` はいずれも `analyze` を再実行すれば作り直せる。`dtvindex` / `chapter_exe` / `join_logo_scp` はいずれも既存の出力先を実害なく上書きすることを実バイナリで確認済みなので、消えても実害なく復旧できるデータとして XDG の定義どおりキャッシュ扱いにし、既定で残すことで `analyze` → `cut` を `--work-dir` / `--dtvi` の手打ちなしで繋げられるようにした
+- **bindir の `JL/` を最後の候補として残した理由**: `join_logo_scp` と `JL/` を同じディレクトリに置く1ディレクトリ配布の既存運用と後方互換を保つため。新規に配置するなら `$PREFIX/share/join_logo_scp/JL/` を使う
+- **出力だけ入力の隣のままにした理由**: 出力は録画ファイルと同じ場所で管理したいという運用上の要求があり、消えても再生成できるキャッシュとは性質が違う（ユーザーの成果物）ため対象外にした
+- **`$XDG_CONFIG_HOME` を用意しなかった理由**: 現時点で設定ファイルに載せる項目がない。必要になるまで空けておく方針
 
 ## モジュール構成
 
@@ -58,9 +78,9 @@ $ scripts/tachikaze-cmcut --cut-only --work-dir work/cmcut_xxx IN.mp4
 |---|---|---|
 | `cli.rs` | サブコマンドとオプションの定義 | — |
 | `commands.rs` | 各モジュールを繋ぐ組み立て（アルゴリズムは持たない） | — |
-| `tools.rs` | 外部ツールと JL ファイルの探索 | [toolchain-macos.md](toolchain-macos.md) |
+| `tools.rs` | 外部ツールと JL ファイルの探索 | 上記「パス解決」節、[toolchain-macos.md](toolchain-macos.md) |
 | `external.rs` | 外部プロセスの起動と出力の回収 | [pipeline.md](pipeline.md) |
-| `workdir.rs` | 作業ディレクトリと symlink | [toolchain-macos.md](toolchain-macos.md) |
+| `workdir.rs` | 作業ディレクトリ（既定は入力ごとの XDG キャッシュ）と symlink | 上記「パス解決」節 |
 | `order.rs` | `DisplayIdx` / `DecodeIdx` | 下記「型設計の要点」 |
 | `trim.rs` | `Trim(a,b)++…` のパース / 生成（半開区間 `[s, e+1)` に正規化） | — |
 | `dtvi.rs` | `.dtvi` のパース（タブ区切りテキスト） | [pipeline.md](pipeline.md) |

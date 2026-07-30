@@ -114,6 +114,8 @@ arm64 では該当ファイルをビルド対象から外し、`IsAVXAvailable()
 
 ## 実行例
 
+3 ツールをビルドしたディレクトリ直下で、`JL/`（`join_logo_scp` と同じディレクトリ）を相対指定して直接実行する場合:
+
 ```bash
 dtvindex build IN.mp4 -o IN.dtvi
 chapter_exe -v IN.mp4 -o scp.txt
@@ -128,3 +130,28 @@ join_logo_scp -inscp scp.txt -incmd JL/JL_標準.txt \
 ln -sf /path/to/IN.mp4 work.mp4
 chapter_exe -v work.mp4 -o scp.txt      # work.mp4.dtvi が作業ディレクトリに作られる
 ```
+
+これは3ツールを直接叩く場合の例。`tachikaze` 経由で使う場合は下記「ビルド後の配置とインストール」の構成にすれば、`JL/JL_標準.txt` のような相対指定は不要になる（`tachikaze` 側が探索する。[architecture.md](architecture.md)「パス解決」節）。
+
+## ビルド後の配置とインストール
+
+3 ツールと `JL/` は本リポジトリに含まれないため、`tachikaze` 側の `make install`（後述）の対象にはならない。配置先は `tachikaze` 本体の探索仕様（[architecture.md](architecture.md)「パス解決」節）に合わせる。
+
+| もの | 配置先 |
+|---|---|
+| `chapter_exe` / `dtvindex` / `join_logo_scp` | `$PREFIX/bin`（`PATH` に通せば `tachikaze` 側の探索で解決できる） |
+| `JL/`（ルールファイル群） | `$PREFIX/share/join_logo_scp/JL/` |
+| `tachikaze` / `tachikaze-cmcut`（本リポジトリ） | `make install PREFIX=...`（本リポジトリのルートで実行） |
+
+例（`$PREFIX = /usr/local`）:
+
+```bash
+install -m 755 chapter_exe dtvindex join_logo_scp /usr/local/bin/
+install -d /usr/local/share/join_logo_scp
+cp -R JL /usr/local/share/join_logo_scp/
+
+cd <tachikaze リポジトリ>
+make install PREFIX=/usr/local
+```
+
+この構成であれば、`tachikaze` / `tachikaze-cmcut` は `--tool-dir` も `--jl-file` も指定せずに動く。`$HOME/.local` など非 root なプレフィックスでも同様（`make install PREFIX=$HOME/.local` と `$PREFIX/bin` を `PATH` に追加すればよい）。

@@ -2,12 +2,14 @@
 
 mp4 に変換済みの録画ファイルを、**再エンコードせずに CM カット**するツール。CM 検出は既存ツール（chapter_exe → join_logo_scp）に任せ、本ツールは「Trim リスト → ロスレス出力」だけを担う。
 
-**状態**: **実装完了**（当初のエピック 8 件・サブ issue 31 件はすべてクローズ済み。経緯は `git log` の `[E1-1]`〜`[E8-4]`）。言語は Rust、mp4 の読み書きは `mp4-atom` クレート。
+**状態**: **実装完了**（エピック E1〜E10 とそれぞれのサブ issue はすべてクローズ済み。経緯は `git log` の `[E1-1]`〜`[E10-6]`）。言語は Rust、mp4 の読み書きは `mp4-atom` クレート。
 
 ```console
-$ tachikaze analyze IN.mp4 -o trim.avs --report --work-dir work
-$ tachikaze cut IN.mp4 --trim trim.avs -o OUT.mp4 --dtvi work/work.mp4.dtvi
+$ tachikaze analyze IN.mp4 -o trim.avs --report
+$ tachikaze cut IN.mp4 --trim trim.avs -o OUT.mp4
 ```
+
+`--work-dir` / `--dtvi` は省略可（入力ごとの XDG キャッシュディレクトリから自動的に繋がる。探索順は [docs/architecture.md](docs/architecture.md)「パス解決」節）。インストールして使う場合の配置先は [docs/toolchain-macos.md](docs/toolchain-macos.md)「ビルド後の配置とインストール」。
 
 手元のファイルを一通しで処理するときは `scripts/tachikaze-cmcut`（edit list 除去・パス結線・`--cm-output` 付き cut。既定は analyze 後に確認、`--yes` で省略）。
 

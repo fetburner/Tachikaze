@@ -123,12 +123,12 @@ target_is_leading         0
 
 ## dtvindex の位置づけ
 
-表示順↔デコード順と GOP 境界そのものは、`mp4-atom` の `stss`（同期サンプル）と `ctts`（合成オフセット）から**自力で導出できる**（`src/mp4io/order_map.rs`）。それでも **`cut` は `--dtvi` を必須にしている**。理由は 2 つ:
+表示順↔デコード順と GOP 境界そのものは、`mp4-atom` の `stss`（同期サンプル）と `ctts`（合成オフセット）から**自力で導出できる**（`src/mp4io/order_map.rs`）。それでも **`.dtvi` は必須にしている**（`cut --dtvi` を省略した場合も、`.dtvi` 無しで動くわけではなくキャッシュから自動的に見つける。[architecture.md](architecture.md)「パス解決」節）。理由は 2 つ:
 
 1. **整合性チェック**: `.dtvi` のフレーム番号と自分の導出結果が一致するかを assert する。フレーム番号の解釈がずれると**エラーを出さずに間違った位置で切る**ため、これが唯一の実効的な防御になる（`order_map.rs::verify_against_dtvi`）
 2. **オープン GOP の判定**: `leading_frame_count` を見る手段が `.dtvi` 以外にない。判定できないまま処理すると「パケット数 == フレーム数」規則が静かに破れるので、`.dtvi` が無い場合は**チェックをスキップして警告ではなく明示エラーで停止**する（`support.rs::check_closed_gop`）
 
-`analyze` が `dtvindex build` を走らせるので、`--work-dir DIR` を付けておけば `DIR/work.mp4.dtvi` が残る。
+`analyze` が `dtvindex build` を走らせるので、既定（入力ごとの XDG キャッシュディレクトリ）のままでも `work.mp4.dtvi` が残り、`cut` から自動的に見つかる。
 
 ## Amatsukaze 側の対応実装（アルゴリズム参照用）
 
