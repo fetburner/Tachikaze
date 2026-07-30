@@ -10,12 +10,22 @@
 #     （同一パスへの copy で空ファイルになることがある）。
 #
 # 使い方:
-#   scripts/cmcut.sh IN.mp4
-#   scripts/cmcut.sh --yes IN.mp4 [IN2.mp4 ...]
-#   scripts/cmcut.sh --analyze-only IN.mp4
-#   scripts/cmcut.sh --cut-only IN.mp4          # 既存 work-dir / trim を使う
-#   scripts/cmcut.sh -o OUT.mp4 IN.mp4
-#   scripts/cmcut.sh --work-dir DIR --yes IN.mp4
+#   tachikaze-cmcut IN.mp4
+#   tachikaze-cmcut --yes IN.mp4 [IN2.mp4 ...]
+#   tachikaze-cmcut --analyze-only IN.mp4
+#   tachikaze-cmcut --cut-only IN.mp4          # 既存 work-dir / trim を使う
+#   tachikaze-cmcut -o OUT.mp4 IN.mp4
+#   tachikaze-cmcut --work-dir DIR --yes IN.mp4
+#
+# パス解決は tachikaze 本体（`src/tools.rs` / `src/workdir.rs`）と揃える:
+#   - tachikaze 本体・外部3ツールは PATH から探す（`--tool-dir` /
+#     `TACHIKAZE_TOOL_DIR` で明示指定も可）。`<repo>/tools` や `<repo>/target`
+#     が無くても、リポジトリの外にコピーして動く。
+#   - 中間ファイルの置き場所（work-root）の既定は
+#     `${TACHIKAZE_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/tachikaze}`。
+#   - 環境変数は `TACHIKAZE_` 接頭辞に統一（`TACHIKAZE_BIN` /
+#     `TACHIKAZE_TOOL_DIR` / `TACHIKAZE_CACHE_DIR`）。旧名（`TACHIKAZE` /
+#     `TOOL_DIR` / `WORK_ROOT`）は読まない。
 
 set -euo pipefail
 
@@ -24,9 +34,9 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 # --- defaults ---------------------------------------------------------------
 
-TACHIKAZE="${TACHIKAZE:-}"
-TOOL_DIR="${TOOL_DIR:-${REPO_ROOT}/tools}"
-WORK_ROOT="${WORK_ROOT:-${REPO_ROOT}/work}"
+TACHIKAZE_BIN="${TACHIKAZE_BIN:-}"
+TOOL_DIR="${TACHIKAZE_TOOL_DIR:-}"
+WORK_ROOT="${TACHIKAZE_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/tachikaze}"
 MODE="all"          # all | analyze-only | cut-only
 AUTO_YES=0
 NO_CM=0
@@ -41,7 +51,7 @@ KEEP_STRIPPED=0
 
 usage() {
   cat <<'EOF'
-Usage: cmcut.sh [options] IN.mp4 [IN2.mp4 ...]
+Usage: tachikaze-cmcut [options] IN.mp4 [IN2.mp4 ...]
 
 Options:
   -y, --yes              analyze 後の確認を省略して cut まで進む
@@ -51,24 +61,31 @@ Options:
   --cm-output PATH       CM 側出力（単一入力時のみ）
   --no-cm                CM 側ファイルを出さない
   --work-dir DIR         中間ファイル置き場（単一入力時のみ）
-  --work-root DIR        複数入力時の work 親ディレクトリ (default: <repo>/work)
+  --work-root DIR        複数入力時の work 親ディレクトリ
+                         (既定: ${TACHIKAZE_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/tachikaze})
   --jl-file FILE         join_logo_scp の JL コマンドファイル
   --jls-set KEY=VALUE    join_logo_scp の -set（繰り返し可）
   --snap outward|inward  キーフレーム丸め方向 (default: outward)
   --verify               cut に --verify を付ける
   --keep-stripped        elst 除去後の中間 mp4 を消さない
-  --tachikaze PATH       tachikaze バイナリ
-  --tool-dir DIR         外部ツールディレクトリ (default: <repo>/tools)
+  --tachikaze PATH       tachikaze バイナリ (既定: PATH から解決)
+  --tool-dir DIR         外部ツールディレクトリ
+                         (既定: 指定なし。chapter_exe/dtvindex/join_logo_scp を PATH から解決)
   -h, --help             このヘルプ
 
 Environment:
-  TACHIKAZE, TOOL_DIR, WORK_ROOT  上記と同義
+  TACHIKAZE_BIN       tachikaze バイナリのパス（--tachikaze と同義）
+  TACHIKAZE_TOOL_DIR  外部ツールディレクトリ（--tool-dir と同義。tachikaze 本体と共通）
+  TACHIKAZE_CACHE_DIR work-root の既定（--work-root と同義。tachikaze 本体と共通）
+
+  旧名（TACHIKAZE / TOOL_DIR / WORK_ROOT）は読みません。上記の
+  TACHIKAZE_ 接頭辞の名前に統一しています。
 
 Typical:
-  scripts/cmcut.sh ~/Downloads/録画.mp4
-  scripts/cmcut.sh --yes ~/Downloads/*.mp4
+  tachikaze-cmcut ~/Downloads/録画.mp4
+  tachikaze-cmcut --yes ~/Downloads/*.mp4
   # analyze 結果を直したあと:
-  scripts/cmcut.sh --cut-only --work-dir work/cmcut_xxx ~/Downloads/録画.mp4
+  tachikaze-cmcut --cut-only --work-dir <work-root>/cmcut_xxx ~/Downloads/録画.mp4
 EOF
 }
 
@@ -96,7 +113,7 @@ while [[ $# -gt 0 ]]; do
     --snap) SNAP="${2:-}"; shift 2 ;;
     --verify) VERIFY=1; shift ;;
     --keep-stripped) KEEP_STRIPPED=1; shift ;;
-    --tachikaze) TACHIKAZE="${2:-}"; shift 2 ;;
+    --tachikaze) TACHIKAZE_BIN="${2:-}"; shift 2 ;;
     --tool-dir) TOOL_DIR="${2:-}"; shift 2 ;;
     --) shift; INPUTS+=("$@"); break ;;
     -*) die "不明なオプション: $1（--help を参照）" ;;
@@ -123,31 +140,48 @@ fi
 
 # --- resolve tools ----------------------------------------------------------
 
+# tachikaze 本体は PATH を優先する。`<repo>/target/{release,debug}` は
+# このスクリプトがリポジトリ内から実行されている場合（`Cargo.toml` の有無で
+# 判定）だけ、PATH に無かったときのフォールバックとして候補にする
+# （インストール版より古いビルドが誤って優先されないようにするため）。
 resolve_tachikaze() {
-  if [[ -n "$TACHIKAZE" ]]; then
-    [[ -x "$TACHIKAZE" ]] || die "tachikaze が実行できません: $TACHIKAZE"
+  if [[ -n "$TACHIKAZE_BIN" ]]; then
+    [[ -x "$TACHIKAZE_BIN" ]] || die "tachikaze が実行できません: $TACHIKAZE_BIN"
     return
   fi
-  local candidates=(
-    "${REPO_ROOT}/target/release/tachikaze"
-    "${REPO_ROOT}/target/debug/tachikaze"
-  )
-  local c
-  for c in "${candidates[@]}"; do
-    if [[ -x "$c" ]]; then
-      TACHIKAZE="$c"
-      return
-    fi
-  done
   if command -v tachikaze >/dev/null 2>&1; then
-    TACHIKAZE="$(command -v tachikaze)"
+    TACHIKAZE_BIN="$(command -v tachikaze)"
     return
   fi
-  die "tachikaze が見つかりません。cargo build --release するか --tachikaze で指定してください"
+  if [[ -f "${REPO_ROOT}/Cargo.toml" ]]; then
+    local c
+    for c in "${REPO_ROOT}/target/release/tachikaze" "${REPO_ROOT}/target/debug/tachikaze"; do
+      if [[ -x "$c" ]]; then
+        TACHIKAZE_BIN="$c"
+        return
+      fi
+    done
+  fi
+  die "tachikaze が見つかりません。PATH に通すか --tachikaze で指定してください"
 }
 
 need_cmd() {
   command -v "$1" >/dev/null 2>&1 || die "$1 が PATH にありません"
+}
+
+# 外部ツール（chapter_exe / dtvindex / join_logo_scp）の存在確認。
+# `--tool-dir` / `TACHIKAZE_TOOL_DIR` 指定時はそのディレクトリ限定で探し、
+# 未指定なら tachikaze 本体の探索仕様（`src/tools.rs::resolve_tool`）と
+# 揃えて PATH から探す。ディレクトリが無いだけで die しない
+# （`command -v` の失敗は `set -e` 配下でも `if` 条件式の中では安全）。
+check_external_tool() {
+  local name="$1"
+  if [[ -n "$TOOL_DIR" ]]; then
+    [[ -x "${TOOL_DIR}/${name}" ]] || die "${name} がありません: ${TOOL_DIR}/${name}"
+  else
+    command -v "$name" >/dev/null 2>&1 \
+      || die "${name} が PATH にありません（--tool-dir か TACHIKAZE_TOOL_DIR で指定するか、PATH に置いてください）"
+  fi
 }
 
 resolve_tachikaze
@@ -155,13 +189,16 @@ need_cmd ffmpeg
 need_cmd ffprobe
 need_cmd python3
 
-[[ -d "$TOOL_DIR" ]] || die "tool-dir がありません: $TOOL_DIR"
-[[ -x "${TOOL_DIR}/dtvindex" ]] || die "dtvindex がありません: ${TOOL_DIR}/dtvindex"
-[[ -x "${TOOL_DIR}/chapter_exe" ]] || die "chapter_exe がありません: ${TOOL_DIR}/chapter_exe"
-[[ -x "${TOOL_DIR}/join_logo_scp" ]] || die "join_logo_scp がありません: ${TOOL_DIR}/join_logo_scp"
+check_external_tool dtvindex
+check_external_tool chapter_exe
+check_external_tool join_logo_scp
 
-log "tachikaze: $TACHIKAZE"
-log "tool-dir:  $TOOL_DIR"
+log "tachikaze: $TACHIKAZE_BIN"
+if [[ -n "$TOOL_DIR" ]]; then
+  log "tool-dir:  $TOOL_DIR"
+else
+  log "tool-dir:  (PATH から解決)"
+fi
 
 # --- helpers ----------------------------------------------------------------
 
@@ -349,8 +386,11 @@ run_analyze() {
   local prepared
   prepared="$(prepare_input "$src" "$work")"
 
-  local analyze_args=(
-    --tool-dir "$TOOL_DIR"
+  local analyze_args=()
+  if [[ -n "$TOOL_DIR" ]]; then
+    analyze_args+=(--tool-dir "$TOOL_DIR")
+  fi
+  analyze_args+=(
     analyze "$prepared"
     -o "$trim_final"
     --work-dir "$work"
@@ -365,7 +405,7 @@ run_analyze() {
   done
 
   log "analyze: $prepared"
-  "$TACHIKAZE" "${analyze_args[@]}"
+  "$TACHIKAZE_BIN" "${analyze_args[@]}"
 
   # 以降の cut / 人手編集用に final_trim.avs を trim.avs としても参照しやすくする
   # （work_dir 内の中間 trim.avs と同じ内容。final を正とする）
@@ -404,8 +444,11 @@ run_cut() {
   local dtvi="${work}/work.mp4.dtvi"
   [[ -f "$dtvi" ]] || die ".dtvi がありません: $dtvi（analyze を --work-dir 付きで実行してください）"
 
-  local cut_args=(
-    --tool-dir "$TOOL_DIR"
+  local cut_args=()
+  if [[ -n "$TOOL_DIR" ]]; then
+    cut_args+=(--tool-dir "$TOOL_DIR")
+  fi
+  cut_args+=(
     cut "$prepared"
     --trim "$trim"
     --dtvi "$dtvi"
@@ -426,7 +469,7 @@ run_cut() {
     log "  cm   → $cm_out"
   fi
 
-  "$TACHIKAZE" "${cut_args[@]}"
+  "$TACHIKAZE_BIN" "${cut_args[@]}"
 
   if [[ "$KEEP_STRIPPED" -eq 0 && -f "${work}/input_noelst.mp4" ]]; then
     # 元が別パスなら中間を消してディスクを空ける

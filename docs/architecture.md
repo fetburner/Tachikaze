@@ -39,13 +39,13 @@ tachikaze cut IN.mp4 --trim trim.avs -o OUT.mp4 --dtvi work.mp4.dtvi
 
 `--dtvi` は必須。オープン GOP の判定（[lossless-cut.md](lossless-cut.md)）と自己検証 4（表示順/デコード順の突き合わせ）に使う。`analyze --work-dir DIR` を使うと `DIR/work.mp4.dtvi` に残る。
 
-**CLI に `tachikaze auto` は用意していない**（検出の見逃しがあるため、analyze と cut のあいだに人手を挟める設計を崩さない）。代わりにパス結線・edit list 除去・出力名決めなど**判断不要な手順だけ**を自動化するラッパーを `scripts/cmcut.sh` に置いてある。既定では analyze 後に確認プロンプトを出し、`--yes` で省略できる。
+**CLI に `tachikaze auto` は用意していない**（検出の見逃しがあるため、analyze と cut のあいだに人手を挟める設計を崩さない）。代わりにパス結線・edit list 除去・出力名決めなど**判断不要な手順だけ**を自動化するラッパーを `scripts/tachikaze-cmcut` に置いてある。既定では analyze 後に確認プロンプトを出し、`--yes` で省略できる。
 
 ```console
-$ scripts/cmcut.sh IN.mp4                  # analyze → 確認 → cut
-$ scripts/cmcut.sh --yes IN.mp4 [IN2 ...]  # 確認省略（バッチ向き）
-$ scripts/cmcut.sh --analyze-only IN.mp4   # 検出だけ
-$ scripts/cmcut.sh --cut-only --work-dir work/cmcut_xxx IN.mp4
+$ scripts/tachikaze-cmcut IN.mp4                  # analyze → 確認 → cut
+$ scripts/tachikaze-cmcut --yes IN.mp4 [IN2 ...]  # 確認省略（バッチ向き）
+$ scripts/tachikaze-cmcut --analyze-only IN.mp4   # 検出だけ
+$ scripts/tachikaze-cmcut --cut-only --work-dir work/cmcut_xxx IN.mp4
 ```
 
 注意: `analyze -o DIR/trim.avs --work-dir DIR` のように **`-o` と work_dir 内の `trim.avs` を同じパスにすると**、かつては `fs::copy(src, src)` で空ファイルになっていた（macOS で実測）。`analyze` 側で同一パスならコピーを省略するよう直してあるが、ラッパーは `final_trim.avs` / `user_trim.avs` に分けて書く。

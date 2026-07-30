@@ -21,7 +21,7 @@ Amatsukaze は MPEG2-TS を入力して CM カットとエンコードを行い 
 | 外部ツールを macOS でビルドする | [toolchain-macos.md](toolchain-macos.md) |
 | 実測値（GOP 長・カット精度・検出品質）を見る | [measurements.md](measurements.md) |
 | 現在の構成・自己検証・未対応の入力・未解決事項を知る | [architecture.md](architecture.md) |
-| 手元の mp4 を一連で CM カットする（ラッパー） | `scripts/cmcut.sh`（説明は [architecture.md](architecture.md)） |
+| 手元の mp4 を一連で CM カットする（ラッパー） | `scripts/tachikaze-cmcut`（説明は [architecture.md](architecture.md)） |
 
 ## スコープ
 
