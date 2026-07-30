@@ -44,8 +44,12 @@ pub struct AnalyzeConfig {
     pub output: PathBuf,
     /// `--tool-dir`（外部ツールの探索ディレクトリ）。
     pub tool_dir: Option<PathBuf>,
-    /// `--work-dir`（中間ファイルの置き場所）。未指定なら一時ディレクトリ。
+    /// `--work-dir`（中間ファイルの置き場所）。未指定なら入力ごとのキャッシュ
+    /// ディレクトリ（`--no-keep-work` 指定時は一時ディレクトリ）。
     pub work_dir: Option<PathBuf>,
+    /// `--no-keep-work`。未指定時の既定（キャッシュディレクトリを残す）をやめ、
+    /// 従来どおり一時ディレクトリを使い成功時に削除する。
+    pub no_keep_work: bool,
     /// `--jls-set` で上書き・追加された `(KEY, VALUE)`。
     pub jls_set: Vec<(String, String)>,
     /// `--jl-file`。未指定なら `tools::default_jl_command_file` の既定値を使う。
@@ -74,21 +78,36 @@ pub struct AnalyzeOutput {
 /// （`external::run` のエラーにはコマンドライン全体と stderr の末尾が
 /// 既に含まれている）。成功・失敗いずれの経路でも `WorkDir::finish` を
 /// 呼ぶため、実際の処理は [`run_pipeline`] に分離している。
+///
+/// ツールの解決は `WorkDir::new` より先に行う。見つからない場合は入力ファイル
+/// の存在確認や作業ディレクトリの作成（既定のキャッシュディレクトリ使用時は
+/// 入力の `canonicalize` を伴う）より前に、探索場所を列挙したエラーで早期に
+/// 失敗させるため（`run_propagates_tool_resolution_failure_with_searched_locations`
+/// が実在しない入力パスでこの順序を検証している）。
 pub fn run(config: &AnalyzeConfig) -> Result<AnalyzeOutput> {
-    let work_dir = WorkDir::new(config.work_dir.clone())?;
-    let result = run_pipeline(config, &work_dir);
-    work_dir.finish(result.is_ok());
-    result
-}
-
-fn run_pipeline(config: &AnalyzeConfig, work_dir: &WorkDir) -> Result<AnalyzeOutput> {
-    // ツールの解決を先に行う。見つからない場合は入力ファイルの存在確認や
-    // 作業ディレクトリへの symlink 作成より前に、探索場所を列挙したエラーで
-    // 早期に失敗させる。
     let dtvindex_path = tools::resolve_tool(config.tool_dir.as_deref(), DTVINDEX)?;
     let chapter_exe_path = tools::resolve_tool(config.tool_dir.as_deref(), CHAPTER_EXE)?;
     let join_logo_scp_path = tools::resolve_tool(config.tool_dir.as_deref(), JOIN_LOGO_SCP)?;
 
+    let work_dir = WorkDir::new(config.work_dir.clone(), &config.input, config.no_keep_work)?;
+    let result = run_pipeline(
+        config,
+        &work_dir,
+        &dtvindex_path,
+        &chapter_exe_path,
+        &join_logo_scp_path,
+    );
+    work_dir.finish(result.is_ok());
+    result
+}
+
+fn run_pipeline(
+    config: &AnalyzeConfig,
+    work_dir: &WorkDir,
+    dtvindex_path: &Path,
+    chapter_exe_path: &Path,
+    join_logo_scp_path: &Path,
+) -> Result<AnalyzeOutput> {
     let work_mp4 = work_dir.link_input(&config.input)?;
     let dtvi_path = work_dir.dtvi_path();
     let scp_path = work_dir.scp_path();
@@ -100,7 +119,7 @@ fn run_pipeline(config: &AnalyzeConfig, work_dir: &WorkDir) -> Result<AnalyzeOut
     // （包むと `anyhow::Error` の `Display`（`to_string()`）が外側のメッセージ
     // だけを返し、肝心の stderr が隠れてしまう）。
     external::run(
-        require_utf8(&dtvindex_path)?,
+        require_utf8(dtvindex_path)?,
         &[
             "build",
             require_utf8(&work_mp4)?,
@@ -111,7 +130,7 @@ fn run_pipeline(config: &AnalyzeConfig, work_dir: &WorkDir) -> Result<AnalyzeOut
     )?;
 
     let chapter_exe_output = external::run(
-        require_utf8(&chapter_exe_path)?,
+        require_utf8(chapter_exe_path)?,
         &[
             "-v",
             require_utf8(&work_mp4)?,
@@ -140,7 +159,7 @@ fn run_pipeline(config: &AnalyzeConfig, work_dir: &WorkDir) -> Result<AnalyzeOut
                 path.display()
             )
         })?,
-        None => tools::default_jl_command_file(&join_logo_scp_path)?,
+        None => tools::default_jl_command_file(join_logo_scp_path)?,
     };
 
     let set_args = build_jls_set_args(DEFAULT_JLS_SET, &config.jls_set);
@@ -157,7 +176,7 @@ fn run_pipeline(config: &AnalyzeConfig, work_dir: &WorkDir) -> Result<AnalyzeOut
     join_logo_scp_args.extend(set_args.iter().map(String::as_str));
 
     external::run(
-        require_utf8(&join_logo_scp_path)?,
+        require_utf8(join_logo_scp_path)?,
         &join_logo_scp_args,
         work_dir.path(),
     )?;
@@ -432,6 +451,7 @@ mod tests {
             output,
             tool_dir: Some(empty_tool_dir.clone()),
             work_dir: None,
+            no_keep_work: false,
             jls_set: vec![],
             jl_file: None,
         };
@@ -488,6 +508,7 @@ mod tests {
             output: output_dir.join("trim.avs"),
             tool_dir: Some(tool_dir.clone()),
             work_dir: None,
+            no_keep_work: false,
             jls_set: vec![],
             jl_file: None,
         };
@@ -532,6 +553,7 @@ mod tests {
             output: output_dir.join("trim.avs"),
             tool_dir: None,
             work_dir: None,
+            no_keep_work: false,
             jls_set: vec![],
             jl_file: None,
         };

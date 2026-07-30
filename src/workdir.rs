@@ -8,8 +8,17 @@
 //! 中間ファイルの名前（`work.mp4` / `work.mp4.dtvi` / `scp.txt` / `trim.avs` /
 //! `detail.jls`）はこのモジュールに集約し、他のモジュールは `WorkDir` の
 //! アクセサ経由でのみパスを得る。
+//!
+//! 中間ファイル（`.dtvi` / `trim.avs` / `detail.jls`）はいずれも `analyze` を
+//! 再実行すれば作り直せる**キャッシュ**であり、XDG のキャッシュディレクトリの
+//! 定義（消えても再生成できるデータ）と一致する。既定では入力ファイルごとに
+//! 決まるキャッシュディレクトリを使い、削除しないことで `cut --dtvi` へ
+//! そのまま繋げられるようにしている（`--no-keep-work` で従来の使い捨て
+//! 一時ディレクトリに戻せる）。
 
+use std::env;
 use std::fs;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::process;
@@ -23,15 +32,27 @@ const SCP_FILE_NAME: &str = "scp.txt";
 const TRIM_FILE_NAME: &str = "trim.avs";
 const DETAIL_JLS_FILE_NAME: &str = "detail.jls";
 
+/// キャッシュディレクトリ名に使う stem の長さ上限（文字数）。
+const SAFE_STEM_MAX_CHARS: usize = 80;
+
 /// analyze / cut の中間ファイルを置く作業ディレクトリ。
 ///
-/// `--work-dir` で明示された場合はそのディレクトリを使い、処理後も削除しない
-/// （中間ファイルを見たい場合があるため）。未指定の場合は一時ディレクトリを
-/// 作り、成功時のみ削除する。失敗時は原因調査のため中間ファイルを残す。
+/// - `--work-dir` で明示された場合: そのディレクトリを使い、処理後も削除しない
+///   （中間ファイルを見たい場合があるため）。
+/// - 未指定・既定の場合: 入力ファイルごとに決まる XDG キャッシュディレクトリを
+///   使い、処理後も削除しない。同じ入力を再度 `analyze` すると同じディレクトリ
+///   を再利用し、中間ファイルは上書きされる（`dtvindex` / `chapter_exe` /
+///   `join_logo_scp` はいずれも既存の出力先へ実害なく上書きすることを実機で
+///   確認済み）。
+/// - `--no-keep-work` 指定時: 従来どおり一時ディレクトリを作り、成功時のみ
+///   削除する。
+///
+/// いずれの場合も失敗時は原因調査のため中間ファイルを残す。
 #[derive(Debug)]
 pub struct WorkDir {
     path: PathBuf,
-    /// `true` なら `finish` で削除しない（`--work-dir` 指定時）。
+    /// `true` なら `finish` で削除しない（`--work-dir` 指定時、または既定の
+    /// キャッシュディレクトリ使用時）。
     keep: bool,
 }
 
@@ -39,10 +60,15 @@ impl WorkDir {
     /// 作業ディレクトリを用意する。
     ///
     /// - `explicit` が `Some` の場合: そのディレクトリを使う（無ければ作る）。
-    ///   `finish` では削除しない。
-    /// - `explicit` が `None` の場合: OS の一時ディレクトリ配下にユニークな
-    ///   ディレクトリを新規作成する。`finish(true)` で削除される。
-    pub fn new(explicit: Option<PathBuf>) -> Result<Self> {
+    ///   `finish` では削除しない。`input` / `no_keep_work` は無視する。
+    /// - `explicit` が `None` の場合:
+    ///   - `no_keep_work == true`: OS の一時ディレクトリ配下にユニークな
+    ///     ディレクトリを新規作成する。`finish(true)` で削除される
+    ///     （`--no-keep-work` 指定時の従来どおりの挙動）。
+    ///   - `no_keep_work == false`（既定）: `input` の絶対パスから決まる
+    ///     XDG キャッシュディレクトリを使う（無ければ作る）。`finish` では
+    ///     削除しない。
+    pub fn new(explicit: Option<PathBuf>, input: &Path, no_keep_work: bool) -> Result<Self> {
         match explicit {
             Some(path) => {
                 fs::create_dir_all(&path).with_context(|| {
@@ -59,9 +85,25 @@ impl WorkDir {
                 })?;
                 Ok(Self { path, keep: true })
             }
-            None => {
+            None if no_keep_work => {
                 let path = create_unique_temp_dir()?;
                 Ok(Self { path, keep: false })
+            }
+            None => {
+                let path = cache_dir_for_input(input)?;
+                fs::create_dir_all(&path).with_context(|| {
+                    format!(
+                        "キャッシュディレクトリの作成に失敗しました: {}",
+                        path.display()
+                    )
+                })?;
+                let path = fs::canonicalize(&path).with_context(|| {
+                    format!(
+                        "キャッシュディレクトリの絶対パス解決に失敗しました: {}",
+                        path.display()
+                    )
+                })?;
+                Ok(Self { path, keep: true })
             }
         }
     }
@@ -147,14 +189,22 @@ impl WorkDir {
 
     /// 処理完了時に呼ぶ。
     ///
-    /// - `--work-dir` 指定時（`keep == true`）: 何もしない。中間ファイルを見たい
-    ///   場合があるため、成功・失敗にかかわらず残す。
-    /// - 未指定時（`keep == false`）:
+    /// - `--work-dir` 指定時、または既定のキャッシュディレクトリ使用時
+    ///   （`keep == true`）: ディレクトリは削除しない。成功時は `cut --dtvi`
+    ///   にそのまま渡せる `.dtvi` の場所をログへ出す。
+    /// - `--no-keep-work` 指定時（`keep == false`）:
     ///   - `success == true`: 一時ディレクトリを削除する。
     ///   - `success == false`: 削除せず、調査用にパスをログへ出す
     ///     （再解析は数秒だが、失敗の調査には中間ファイルが要る）。
     pub fn finish(self, success: bool) {
         if self.keep {
+            if success {
+                eprintln!(
+                    "[workdir] 中間ファイルを残しました: {}（cut --dtvi {} で使えます）",
+                    self.path.display(),
+                    self.dtvi_path().display()
+                );
+            }
             return;
         }
 
@@ -210,9 +260,112 @@ fn create_unique_temp_dir() -> Result<PathBuf> {
     );
 }
 
+/// 環境変数を読み、**空文字なら未設定として扱う**（XDG Base Directory 仕様の作法）。
+fn non_empty_env(key: &str) -> Option<std::ffi::OsString> {
+    env::var_os(key).filter(|v| !v.is_empty())
+}
+
+/// キャッシュディレクトリの根（`$TACHIKAZE_CACHE_DIR` →
+/// `${XDG_CACHE_HOME:-$HOME/.cache}/tachikaze`）を返す。
+///
+/// `$HOME` が取れない環境（コンテナ等）でも `$TMPDIR` にフォールバックし、
+/// エラーにはしない。
+fn cache_root() -> PathBuf {
+    if let Some(dir) = non_empty_env("TACHIKAZE_CACHE_DIR") {
+        return PathBuf::from(dir);
+    }
+    if let Some(data_home) = non_empty_env("XDG_CACHE_HOME") {
+        return PathBuf::from(data_home).join("tachikaze");
+    }
+    if let Some(home) = non_empty_env("HOME") {
+        return PathBuf::from(home).join(".cache").join("tachikaze");
+    }
+    env::temp_dir().join("tachikaze-cache")
+}
+
+/// キャッシュディレクトリ名に使う stem を安全化する。
+///
+/// 空白・`/`・制御文字は `_` に置き換える。日本語などマルチバイト文字は
+/// そのまま残す。`scripts/tachikaze-cmcut` の `safe_stem` と同じ役割だが、
+/// こちらを正とする（シェル側はこの規則に合わせる）。
+fn sanitize_stem(stem: &str) -> String {
+    stem.chars()
+        .map(|c| {
+            if c.is_control() || c == '/' || c.is_whitespace() {
+                '_'
+            } else {
+                c
+            }
+        })
+        .take(SAFE_STEM_MAX_CHARS)
+        .collect()
+}
+
+/// バイト列から短い16進ハッシュを計算する（FNV-1a、64bit）。
+///
+/// 依存を増やさず自前実装で十分という判断（衝突耐性が必要な用途ではなく、
+/// 同じ入力パスを同じディレクトリ名に落とせればよい）。
+fn fnv1a_hex(bytes: &[u8]) -> String {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for &byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{hash:016x}")
+}
+
+/// 入力ファイルの絶対パスから、この入力専用のキャッシュディレクトリのパスを
+/// 求める。`<cache_root>/<入力絶対パスのハッシュ>-<安全化したstem>/`。
+///
+/// ハッシュだけでなく stem も併記するのは、万が一ハッシュが衝突しても別入力が
+/// 同じディレクトリを共有しないようにするため（人間が見て区別しやすくもなる）。
+fn cache_dir_for_input(input: &Path) -> Result<PathBuf> {
+    let absolute = fs::canonicalize(input).with_context(|| {
+        format!(
+            "入力ファイルの絶対パス解決に失敗しました: {}",
+            input.display()
+        )
+    })?;
+    let hash = fnv1a_hex(absolute.as_os_str().as_bytes());
+    let stem = absolute
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("input");
+    let dir_name = format!("{hash}-{}", sanitize_stem(stem));
+    Ok(cache_root().join(dir_name))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// `TACHIKAZE_CACHE_DIR` 等の環境変数の書き換えを伴うテストを直列化する
+    /// ためのロック（`cargo test` はテストを並行実行するため）。
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// 環境変数を書き換え、Drop で元の値に戻すガード（`ENV_LOCK` と併用する）。
+    struct EnvVarGuard {
+        key: &'static str,
+        original: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let original = env::var_os(key);
+            env::set_var(key, value);
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.original {
+                Some(v) => env::set_var(self.key, v),
+                None => env::remove_var(self.key),
+            }
+        }
+    }
 
     /// テスト用に、システムの一時ディレクトリ配下にユニークなディレクトリを作る。
     /// `WorkDir` 自体のテストなので `tempfile` クレートには頼らず、
@@ -244,15 +397,20 @@ mod tests {
 
     /// 入力ファイルのあるディレクトリに、analyze 相当の処理（作業ディレクトリ作成 →
     /// symlink 張り → finish）を通しても新規ファイルが作られないことを確認する。
+    /// `--work-dir` 未指定・既定（キャッシュディレクトリ使用）での検証。
     #[test]
     fn does_not_create_files_next_to_input() {
+        let _env_guard = ENV_LOCK.lock().unwrap();
+        let cache_root = make_scratch_dir("cache-root-no-pollution");
+        let _cache_env = EnvVarGuard::set("TACHIKAZE_CACHE_DIR", &cache_root);
+
         let input_dir = make_scratch_dir("input-dir");
         let input_path = input_dir.join("IN.mp4");
         fs::write(&input_path, b"dummy mp4 content").expect("write input");
 
         let before = dir_entries(&input_dir);
 
-        let work_dir = WorkDir::new(None).expect("create work dir");
+        let work_dir = WorkDir::new(None, &input_path, false).expect("create work dir");
         work_dir.link_input(&input_path).expect("link input");
         work_dir.finish(true);
 
@@ -263,6 +421,7 @@ mod tests {
         );
 
         fs::remove_dir_all(&input_dir).expect("cleanup input dir");
+        fs::remove_dir_all(&cache_root).expect("cleanup cache root");
     }
 
     /// `--work-dir` 指定時は成功しても中間ファイル（symlink 等）が残る。
@@ -274,7 +433,8 @@ mod tests {
 
         let explicit_dir = make_scratch_dir("explicit-workdir");
 
-        let work_dir = WorkDir::new(Some(explicit_dir.clone())).expect("create work dir");
+        let work_dir =
+            WorkDir::new(Some(explicit_dir.clone()), &input_path, false).expect("create work dir");
         let work_mp4 = work_dir.link_input(&input_path).expect("link input");
         assert!(work_mp4.exists(), "symlink 先が存在するはず");
         work_dir.finish(true);
@@ -292,14 +452,105 @@ mod tests {
         fs::remove_dir_all(&explicit_dir).expect("cleanup explicit dir");
     }
 
-    /// `--work-dir` 未指定時、成功すると一時ディレクトリが消える。
+    /// 既定（`--work-dir` も `--no-keep-work` も未指定）では、入力ごとのキャッシュ
+    /// ディレクトリが使われ、成功しても削除されない。
     #[test]
-    fn implicit_work_dir_is_removed_after_success() {
-        let input_dir = make_scratch_dir("implicit-input");
+    fn default_cache_dir_is_kept_after_success() {
+        let _env_guard = ENV_LOCK.lock().unwrap();
+        let cache_root = make_scratch_dir("cache-root-kept");
+        let _cache_env = EnvVarGuard::set("TACHIKAZE_CACHE_DIR", &cache_root);
+
+        let input_dir = make_scratch_dir("cache-kept-input");
         let input_path = input_dir.join("IN.mp4");
         fs::write(&input_path, b"dummy mp4 content").expect("write input");
 
-        let work_dir = WorkDir::new(None).expect("create work dir");
+        let work_dir = WorkDir::new(None, &input_path, false).expect("create work dir");
+        let path = work_dir.path().to_path_buf();
+        // `path` は WorkDir::new 内で canonicalize 済み（macOS では
+        // /var → /private/var）なので、比較対象の cache_root も canonicalize する。
+        let cache_root_canon = fs::canonicalize(&cache_root).expect("canonicalize cache root");
+        assert!(
+            path.starts_with(&cache_root_canon),
+            "既定のキャッシュディレクトリは TACHIKAZE_CACHE_DIR 配下のはず"
+        );
+        work_dir.link_input(&input_path).expect("link input");
+        work_dir.finish(true);
+
+        assert!(
+            path.exists(),
+            "既定のキャッシュディレクトリは成功しても削除されないはず"
+        );
+
+        fs::remove_dir_all(&input_dir).expect("cleanup input dir");
+        fs::remove_dir_all(&cache_root).expect("cleanup cache root");
+    }
+
+    /// 同じ入力に対して2回 `WorkDir::new` すると、同じキャッシュディレクトリを再利用する。
+    #[test]
+    fn default_cache_dir_is_reused_for_same_input() {
+        let _env_guard = ENV_LOCK.lock().unwrap();
+        let cache_root = make_scratch_dir("cache-root-reuse");
+        let _cache_env = EnvVarGuard::set("TACHIKAZE_CACHE_DIR", &cache_root);
+
+        let input_dir = make_scratch_dir("cache-reuse-input");
+        let input_path = input_dir.join("IN.mp4");
+        fs::write(&input_path, b"dummy mp4 content").expect("write input");
+
+        let first = WorkDir::new(None, &input_path, false).expect("create work dir (1st)");
+        let first_path = first.path().to_path_buf();
+        first.finish(true);
+
+        let second = WorkDir::new(None, &input_path, false).expect("create work dir (2nd)");
+        let second_path = second.path().to_path_buf();
+        second.finish(true);
+
+        assert_eq!(
+            first_path, second_path,
+            "同じ入力なら同じキャッシュディレクトリを再利用するはず"
+        );
+
+        fs::remove_dir_all(&input_dir).expect("cleanup input dir");
+        fs::remove_dir_all(&cache_root).expect("cleanup cache root");
+    }
+
+    /// 異なる入力に対しては異なるキャッシュディレクトリが割り当てられる。
+    #[test]
+    fn default_cache_dir_differs_for_different_inputs() {
+        let _env_guard = ENV_LOCK.lock().unwrap();
+        let cache_root = make_scratch_dir("cache-root-differ");
+        let _cache_env = EnvVarGuard::set("TACHIKAZE_CACHE_DIR", &cache_root);
+
+        let input_dir = make_scratch_dir("cache-differ-input");
+        let first_input = input_dir.join("FIRST.mp4");
+        let second_input = input_dir.join("SECOND.mp4");
+        fs::write(&first_input, b"first").expect("write first input");
+        fs::write(&second_input, b"second").expect("write second input");
+
+        let first = WorkDir::new(None, &first_input, false).expect("create work dir (1st)");
+        let first_path = first.path().to_path_buf();
+        first.finish(true);
+
+        let second = WorkDir::new(None, &second_input, false).expect("create work dir (2nd)");
+        let second_path = second.path().to_path_buf();
+        second.finish(true);
+
+        assert_ne!(
+            first_path, second_path,
+            "異なる入力なら異なるキャッシュディレクトリのはず"
+        );
+
+        fs::remove_dir_all(&input_dir).expect("cleanup input dir");
+        fs::remove_dir_all(&cache_root).expect("cleanup cache root");
+    }
+
+    /// `--no-keep-work` 指定時、成功すると従来どおり一時ディレクトリが消える。
+    #[test]
+    fn no_keep_work_removes_temp_dir_after_success() {
+        let input_dir = make_scratch_dir("no-keep-work-input");
+        let input_path = input_dir.join("IN.mp4");
+        fs::write(&input_path, b"dummy mp4 content").expect("write input");
+
+        let work_dir = WorkDir::new(None, &input_path, true).expect("create work dir");
         let path = work_dir.path().to_path_buf();
         work_dir.link_input(&input_path).expect("link input");
         work_dir.finish(true);
@@ -309,14 +560,14 @@ mod tests {
         fs::remove_dir_all(&input_dir).expect("cleanup input dir");
     }
 
-    /// `--work-dir` 未指定時、失敗すると一時ディレクトリは残る（調査用）。
+    /// `--no-keep-work` 指定時、失敗すると一時ディレクトリは残る（調査用）。
     #[test]
-    fn implicit_work_dir_is_kept_after_failure() {
-        let input_dir = make_scratch_dir("implicit-fail-input");
+    fn no_keep_work_keeps_temp_dir_after_failure() {
+        let input_dir = make_scratch_dir("no-keep-work-fail-input");
         let input_path = input_dir.join("IN.mp4");
         fs::write(&input_path, b"dummy mp4 content").expect("write input");
 
-        let work_dir = WorkDir::new(None).expect("create work dir");
+        let work_dir = WorkDir::new(None, &input_path, true).expect("create work dir");
         let path = work_dir.path().to_path_buf();
         work_dir.link_input(&input_path).expect("link input");
         work_dir.finish(false);
@@ -337,7 +588,7 @@ mod tests {
         let symlink_input = input_dir.join("IN.mp4");
         symlink(&real_path, &symlink_input).expect("create input symlink");
 
-        let work_dir = WorkDir::new(None).expect("create work dir");
+        let work_dir = WorkDir::new(None, &symlink_input, true).expect("create work dir");
         let work_mp4 = work_dir.link_input(&symlink_input).expect("link input");
 
         let resolved = fs::canonicalize(&work_mp4).expect("resolve work.mp4");
@@ -360,7 +611,7 @@ mod tests {
         fs::write(&first_input, b"first").expect("write first input");
         fs::write(&second_input, b"second").expect("write second input");
 
-        let work_dir = WorkDir::new(None).expect("create work dir");
+        let work_dir = WorkDir::new(None, &first_input, true).expect("create work dir");
         work_dir.link_input(&first_input).expect("link first input");
         let work_mp4 = work_dir
             .link_input(&second_input)
@@ -377,7 +628,8 @@ mod tests {
     /// 各中間ファイルパスの名前が集約されていることを確認する。
     #[test]
     fn intermediate_file_names_are_correct() {
-        let work_dir = WorkDir::new(None).expect("create work dir");
+        let work_dir =
+            WorkDir::new(None, Path::new("/nonexistent-input.mp4"), true).expect("create work dir");
         assert_eq!(work_dir.work_path().file_name().unwrap(), WORK_FILE_NAME);
         assert_eq!(work_dir.dtvi_path().file_name().unwrap(), DTVI_FILE_NAME);
         assert_eq!(work_dir.scp_path().file_name().unwrap(), SCP_FILE_NAME);
@@ -387,5 +639,52 @@ mod tests {
             DETAIL_JLS_FILE_NAME
         );
         work_dir.finish(true);
+    }
+
+    /// `TACHIKAZE_CACHE_DIR` でキャッシュの根を差し替えられる。
+    #[test]
+    fn tachikaze_cache_dir_overrides_default_root() {
+        let _env_guard = ENV_LOCK.lock().unwrap();
+        let cache_root = make_scratch_dir("cache-root-override");
+        let _cache_env = EnvVarGuard::set("TACHIKAZE_CACHE_DIR", &cache_root);
+
+        let input_dir = make_scratch_dir("cache-override-input");
+        let input_path = input_dir.join("IN.mp4");
+        fs::write(&input_path, b"dummy mp4 content").expect("write input");
+
+        let dir = cache_dir_for_input(&input_path).expect("compute cache dir");
+        assert!(
+            dir.starts_with(&cache_root),
+            "TACHIKAZE_CACHE_DIR 配下になるはず: {}",
+            dir.display()
+        );
+
+        fs::remove_dir_all(&input_dir).expect("cleanup input dir");
+        fs::remove_dir_all(&cache_root).expect("cleanup cache root");
+    }
+
+    #[test]
+    fn sanitize_stem_replaces_whitespace_slash_and_control_chars() {
+        assert_eq!(sanitize_stem("hello world"), "hello_world");
+        assert_eq!(sanitize_stem("a/b"), "a_b");
+        assert_eq!(sanitize_stem("a\tb\nc"), "a_b_c");
+        // 日本語はそのまま残る。
+        assert_eq!(sanitize_stem("録画ファイル"), "録画ファイル");
+    }
+
+    #[test]
+    fn sanitize_stem_truncates_to_max_chars() {
+        let long_stem = "a".repeat(SAFE_STEM_MAX_CHARS + 20);
+        let sanitized = sanitize_stem(&long_stem);
+        assert_eq!(sanitized.chars().count(), SAFE_STEM_MAX_CHARS);
+    }
+
+    #[test]
+    fn fnv1a_hex_is_deterministic_and_differs_for_different_input() {
+        let a = fnv1a_hex(b"/path/to/IN.mp4");
+        let b = fnv1a_hex(b"/path/to/IN.mp4");
+        let c = fnv1a_hex(b"/path/to/OTHER.mp4");
+        assert_eq!(a, b, "同じ入力なら同じハッシュのはず");
+        assert_ne!(a, c, "異なる入力なら異なるハッシュのはず");
     }
 }

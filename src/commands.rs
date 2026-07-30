@@ -26,9 +26,19 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
             output,
             report,
             work_dir,
+            no_keep_work,
             jls_set,
             jl_file,
-        } => run_analyze(tool_dir, input, output, report, work_dir, jls_set, jl_file),
+        } => run_analyze(
+            tool_dir,
+            input,
+            output,
+            report,
+            work_dir,
+            no_keep_work,
+            jls_set,
+            jl_file,
+        ),
         Commands::Cut {
             input,
             trim,
@@ -51,6 +61,7 @@ fn run_analyze(
     output: PathBuf,
     show_report: bool,
     work_dir: Option<PathBuf>,
+    no_keep_work: bool,
     jls_set: Vec<String>,
     jl_file: Option<PathBuf>,
 ) -> anyhow::Result<()> {
@@ -64,6 +75,7 @@ fn run_analyze(
         output: output.clone(),
         tool_dir,
         work_dir,
+        no_keep_work,
         jls_set,
         jl_file,
     };

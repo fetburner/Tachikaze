@@ -25,8 +25,17 @@ pub enum Commands {
         #[arg(long)]
         report: bool,
 
+        /// 中間ファイル（`.dtvi` / `trim.avs` / `detail.jls`）の置き場所。未指定
+        /// なら入力ごとに決まる `${XDG_CACHE_HOME:-~/.cache}/tachikaze/` 配下の
+        /// ディレクトリを使い、削除しない（`cut --dtvi` は同じ規則で自動的に
+        /// `work.mp4.dtvi` を見つけられる）。
         #[arg(long)]
         work_dir: Option<PathBuf>,
+
+        /// 既定のキャッシュディレクトリを使わず、従来どおり一時ディレクトリに
+        /// 中間ファイルを作り、成功時に削除する（`--work-dir` とは併用しない）。
+        #[arg(long)]
+        no_keep_work: bool,
 
         /// join_logo_scp の `-set KEY VALUE` を上書き・追加する（`KEY=VALUE` 形式、繰り返し可）。
         /// 同じキーを指定すると既定値を置き換える。
