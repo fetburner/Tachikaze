@@ -335,23 +335,43 @@ fn cache_dir_for_input(input: &Path) -> Result<PathBuf> {
     Ok(cache_root().join(dir_name))
 }
 
+/// `cut --dtvi` 省略時に使う、入力ごとのキャッシュディレクトリ内の `.dtvi` の
+/// パスを返す。`WorkDir::new` の既定（`--work-dir` 未指定時）が使うキャッシュ
+/// パス規則を [`cache_dir_for_input`] 1か所に集約し、`cut` 側もそれをそのまま
+/// 参照する（`analyze` が作ったディレクトリと `cut` が探すディレクトリがずれる
+/// と、無関係な入力の `.dtvi` を指してしまいかねないため）。
+///
+/// ディレクトリの作成は行わない。ファイルが存在するかどうかの確認・存在しない
+/// 場合の扱いは呼び出し側の責務とする（`.dtvi` が無いのに検証を省略してはい
+/// けないため、呼び出し側で明示的に判断させる）。
+pub fn cached_dtvi_path(input: &Path) -> Result<PathBuf> {
+    Ok(cache_dir_for_input(input)?.join(DTVI_FILE_NAME))
+}
+
+/// `TACHIKAZE_CACHE_DIR` を書き換えるテストで共有する仕組み。
+///
+/// `workdir::tests` と `commands::tests`（`cut --dtvi` のキャッシュ自動解決）
+/// の両方が同じ環境変数を書き換える。モジュールごとに別々の `Mutex` を持つと
+/// 互いの書き換えを直列化できずレースする（実際に
+/// `fs::remove_dir_all` が「ディレクトリが空でない」で失敗する形で顕在化した）
+/// ため、1つのロックをここに集約して両モジュールから使う。
 #[cfg(test)]
-mod tests {
-    use super::*;
+pub(crate) mod test_support {
+    use std::env;
     use std::sync::Mutex;
 
-    /// `TACHIKAZE_CACHE_DIR` 等の環境変数の書き換えを伴うテストを直列化する
-    /// ためのロック（`cargo test` はテストを並行実行するため）。
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    /// `TACHIKAZE_CACHE_DIR` の書き換えを伴うテストを直列化するためのロック
+    /// （`cargo test` はテストを並行実行するため）。
+    pub(crate) static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     /// 環境変数を書き換え、Drop で元の値に戻すガード（`ENV_LOCK` と併用する）。
-    struct EnvVarGuard {
+    pub(crate) struct EnvVarGuard {
         key: &'static str,
         original: Option<std::ffi::OsString>,
     }
 
     impl EnvVarGuard {
-        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+        pub(crate) fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
             let original = env::var_os(key);
             env::set_var(key, value);
             Self { key, original }
@@ -366,6 +386,12 @@ mod tests {
             }
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::{EnvVarGuard, ENV_LOCK};
+    use super::*;
 
     /// テスト用に、システムの一時ディレクトリ配下にユニークなディレクトリを作る。
     /// `WorkDir` 自体のテストなので `tempfile` クレートには頼らず、
@@ -420,8 +446,8 @@ mod tests {
             "入力ディレクトリの内容が処理前後で変わってはいけない"
         );
 
-        fs::remove_dir_all(&input_dir).expect("cleanup input dir");
-        fs::remove_dir_all(&cache_root).expect("cleanup cache root");
+        fs::remove_dir_all(&input_dir).ok();
+        fs::remove_dir_all(&cache_root).ok();
     }
 
     /// `--work-dir` 指定時は成功しても中間ファイル（symlink 等）が残る。
@@ -481,8 +507,8 @@ mod tests {
             "既定のキャッシュディレクトリは成功しても削除されないはず"
         );
 
-        fs::remove_dir_all(&input_dir).expect("cleanup input dir");
-        fs::remove_dir_all(&cache_root).expect("cleanup cache root");
+        fs::remove_dir_all(&input_dir).ok();
+        fs::remove_dir_all(&cache_root).ok();
     }
 
     /// 同じ入力に対して2回 `WorkDir::new` すると、同じキャッシュディレクトリを再利用する。
@@ -509,8 +535,8 @@ mod tests {
             "同じ入力なら同じキャッシュディレクトリを再利用するはず"
         );
 
-        fs::remove_dir_all(&input_dir).expect("cleanup input dir");
-        fs::remove_dir_all(&cache_root).expect("cleanup cache root");
+        fs::remove_dir_all(&input_dir).ok();
+        fs::remove_dir_all(&cache_root).ok();
     }
 
     /// 異なる入力に対しては異なるキャッシュディレクトリが割り当てられる。
@@ -539,8 +565,8 @@ mod tests {
             "異なる入力なら異なるキャッシュディレクトリのはず"
         );
 
-        fs::remove_dir_all(&input_dir).expect("cleanup input dir");
-        fs::remove_dir_all(&cache_root).expect("cleanup cache root");
+        fs::remove_dir_all(&input_dir).ok();
+        fs::remove_dir_all(&cache_root).ok();
     }
 
     /// `--no-keep-work` 指定時、成功すると従来どおり一時ディレクトリが消える。
@@ -659,8 +685,8 @@ mod tests {
             dir.display()
         );
 
-        fs::remove_dir_all(&input_dir).expect("cleanup input dir");
-        fs::remove_dir_all(&cache_root).expect("cleanup cache root");
+        fs::remove_dir_all(&input_dir).ok();
+        fs::remove_dir_all(&cache_root).ok();
     }
 
     #[test]

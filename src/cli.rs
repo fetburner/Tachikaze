@@ -65,7 +65,9 @@ pub enum Commands {
         verify: bool,
 
         /// `dtvindex build` が生成した `.dtvi`（オープン GOP 判定と自己検証に必須）。
-        /// `analyze --work-dir <DIR>` を使うと `<DIR>/work.mp4.dtvi` に残る。
+        /// 未指定なら、直前に同じ入力へ `analyze` を実行していればキャッシュ
+        /// （`${XDG_CACHE_HOME:-~/.cache}/tachikaze/`）から自動的に見つかる。
+        /// 見つからない場合は `analyze` を実行するコマンド例を添えて停止する。
         #[arg(long)]
         dtvi: Option<PathBuf>,
 

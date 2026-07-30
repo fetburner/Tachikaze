@@ -14,7 +14,7 @@ use crate::cli::{Cli, Commands};
 use crate::dtvi::Dtvi;
 use crate::mp4io::read::SampleInfo;
 use crate::order::{DecodeIdx, DisplayIdx, OrderMap};
-use crate::{analyze, audio, cli, dtvi, mp4io, plan, report, tools, trim, verify};
+use crate::{analyze, audio, cli, dtvi, mp4io, plan, report, tools, trim, verify, workdir};
 
 /// パース済みの CLI 引数を受け取り、対応するサブコマンドを実行する。
 pub fn run(cli: Cli) -> anyhow::Result<()> {
@@ -150,6 +150,7 @@ fn run_cut(
     let moov = mp4io::read::read_moov(&input)
         .with_context(|| format!("入力 mp4 の読み込みに失敗しました: {}", input.display()))?;
 
+    let dtvi_path = resolve_dtvi_path(dtvi_path, &input)?;
     let dtvi_data = match &dtvi_path {
         Some(path) => {
             let content = fs::read_to_string(path)
@@ -277,6 +278,37 @@ fn run_cut(
     }
 
     Ok(())
+}
+
+/// `--dtvi` を解決する。
+///
+/// - 明示されていればそれを最優先でそのまま使う。
+/// - 未指定なら、`analyze` の既定（`--work-dir` 未指定時）が使うのと同じ
+///   キャッシュパス規則（[`workdir::cached_dtvi_path`]）から
+///   `work.mp4.dtvi` を探す。直前に同じ入力で `analyze` を実行していれば
+///   そのまま見つかる。
+/// - どちらの経路でも見つからない場合は、検証を省略せず停止する（罠3:
+///   オープン GOP 判定と自己検証4に `.dtvi` が必須なため。`.dtvi` が無い
+///   まま処理を続けると間違った位置で切っても例外が飛ばない）。`analyze`
+///   を実行するコマンド例を添えたエラーにする。
+fn resolve_dtvi_path(dtvi_path: Option<PathBuf>, input: &Path) -> anyhow::Result<Option<PathBuf>> {
+    if dtvi_path.is_some() {
+        return Ok(dtvi_path);
+    }
+
+    let cached = workdir::cached_dtvi_path(input)
+        .with_context(|| format!("`.dtvi` の自動解決に失敗しました: {}", input.display()))?;
+    if cached.is_file() {
+        return Ok(Some(cached));
+    }
+
+    bail!(
+        "`--dtvi` が指定されておらず、キャッシュにも `.dtvi` が見つかりませんでした: {}\n\
+         先に次を実行してください:\n  \
+         tachikaze analyze {} -o trim.avs",
+        cached.display(),
+        input.display()
+    );
 }
 
 /// cut パイプラインのうち「どの区間を切り出すか」以外は変わらない入力をまとめたもの。
@@ -556,4 +588,92 @@ fn segment_video_durations(
         offset += count;
     }
     durations
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    // `TACHIKAZE_CACHE_DIR` を書き換えるロックは `workdir::tests` と共有する
+    // （モジュールごとに別ロックを持つと、同じ環境変数を互いに直列化できず
+    // レースする。`crate::workdir` の doc comment 参照）。
+    use crate::workdir::test_support::{EnvVarGuard, ENV_LOCK};
+    use std::env;
+    use std::process;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn make_scratch_dir(label: &str) -> PathBuf {
+        let base = env::temp_dir();
+        let pid = process::id();
+        for attempt in 0..100 {
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let candidate = base.join(format!(
+                "tachikaze-commands-test-{label}-{pid}-{nanos}-{attempt}"
+            ));
+            if fs::create_dir(&candidate).is_ok() {
+                return candidate;
+            }
+        }
+        panic!("scratch dir の作成に失敗しました");
+    }
+
+    #[test]
+    fn resolve_dtvi_path_prefers_explicit_path_over_cache() {
+        // キャッシュに何も無くても、明示された `--dtvi` をそのまま最優先で使う
+        // （キャッシュを探索すらしない）。
+        let explicit = PathBuf::from("/explicit/path/to/some.dtvi");
+        let resolved = resolve_dtvi_path(Some(explicit.clone()), Path::new("/nonexistent.mp4"))
+            .expect("明示指定は解決に失敗しないはず");
+        assert_eq!(resolved, Some(explicit));
+    }
+
+    #[test]
+    fn resolve_dtvi_path_finds_cached_dtvi_left_by_analyze() {
+        let _env_guard = ENV_LOCK.lock().unwrap();
+        let cache_root = make_scratch_dir("resolve-dtvi-found-cache");
+        let _cache_env = EnvVarGuard::set("TACHIKAZE_CACHE_DIR", &cache_root);
+
+        let input_dir = make_scratch_dir("resolve-dtvi-found-input");
+        let input_path = input_dir.join("IN.mp4");
+        fs::write(&input_path, b"dummy mp4 content").expect("write input");
+
+        // analyze が残すのと同じ規則でキャッシュに .dtvi を用意する。
+        let expected = workdir::cached_dtvi_path(&input_path).expect("compute cached dtvi path");
+        fs::create_dir_all(expected.parent().unwrap()).expect("create cache dir");
+        fs::write(&expected, "dummy dtvi content").expect("write cached dtvi");
+
+        let resolved = resolve_dtvi_path(None, &input_path).expect("キャッシュから解決できるはず");
+        assert_eq!(resolved, Some(expected));
+
+        fs::remove_dir_all(&input_dir).ok();
+        fs::remove_dir_all(&cache_root).ok();
+    }
+
+    #[test]
+    fn resolve_dtvi_path_missing_suggests_analyze_command() {
+        let _env_guard = ENV_LOCK.lock().unwrap();
+        let cache_root = make_scratch_dir("resolve-dtvi-missing-cache");
+        let _cache_env = EnvVarGuard::set("TACHIKAZE_CACHE_DIR", &cache_root);
+
+        let input_dir = make_scratch_dir("resolve-dtvi-missing-input");
+        let input_path = input_dir.join("IN.mp4");
+        fs::write(&input_path, b"dummy mp4 content").expect("write input");
+
+        let err = resolve_dtvi_path(None, &input_path)
+            .expect_err("キャッシュに無ければ解決に失敗するはず");
+        let message = err.to_string();
+        assert!(
+            message.contains("tachikaze analyze"),
+            "analyze の実行例が含まれていない: {message}"
+        );
+        assert!(
+            message.contains(&input_path.display().to_string()),
+            "入力パスが含まれていない: {message}"
+        );
+
+        fs::remove_dir_all(&input_dir).ok();
+        fs::remove_dir_all(&cache_root).ok();
+    }
 }
