@@ -162,22 +162,26 @@ fn run_pipeline(config: &AnalyzeConfig, work_dir: &WorkDir) -> Result<AnalyzeOut
         work_dir.path(),
     )?;
 
-    fs::copy(&trim_avs_path, &config.output).with_context(|| {
+    // work_dir 内の trim.avs を先に読む。`-o` が work_dir の trim.avs と同じ
+    // パスだと `fs::copy(src, src)` が空ファイルを生む（macOS で実測。前回の
+    // 手動実行で hit した）。同一パスならコピーを省略する。
+    let output_content = fs::read_to_string(&trim_avs_path).with_context(|| {
         format!(
-            "trim.avs のコピーに失敗しました: {} -> {}",
-            trim_avs_path.display(),
-            config.output.display()
-        )
-    })?;
-
-    let output_content = fs::read_to_string(&config.output).with_context(|| {
-        format!(
-            "コピーした trim.avs の読み込みに失敗しました: {}",
-            config.output.display()
+            "join_logo_scp が生成した trim.avs の読み込みに失敗しました: {}",
+            trim_avs_path.display()
         )
     })?;
     let trim = TrimList::parse(&output_content)
         .map_err(|err| anyhow!("生成された trim.avs のパースに失敗しました: {err}"))?;
+
+    if !same_path(&trim_avs_path, &config.output)? {
+        fs::write(&config.output, &output_content).with_context(|| {
+            format!(
+                "trim.avs の書き出しに失敗しました: {}",
+                config.output.display()
+            )
+        })?;
+    }
 
     let dtvi_content = fs::read_to_string(&dtvi_path).with_context(|| {
         format!(
@@ -208,6 +212,29 @@ fn run_pipeline(config: &AnalyzeConfig, work_dir: &WorkDir) -> Result<AnalyzeOut
 fn require_utf8(path: &Path) -> Result<&str> {
     path.to_str()
         .ok_or_else(|| anyhow!("パスが UTF-8 として扱えません: {}", path.display()))
+}
+
+/// 2 つのパスが同じファイルを指すか（親ディレクトリを canonicalize して比較）。
+///
+/// 出力先がまだ存在しない場合もあるので、ファイル自体ではなく親 + ファイル名で
+/// 判定する。親が存在しないときは文字列比較に落とす。
+fn same_path(a: &Path, b: &Path) -> Result<bool> {
+    if a == b {
+        return Ok(true);
+    }
+    let resolve = |p: &Path| -> PathBuf {
+        match (p.parent(), p.file_name()) {
+            (Some(parent), Some(name)) if parent.as_os_str().is_empty() => {
+                PathBuf::from(".").join(name)
+            }
+            (Some(parent), Some(name)) => match fs::canonicalize(parent) {
+                Ok(abs) => abs.join(name),
+                Err(_) => p.to_path_buf(),
+            },
+            _ => p.to_path_buf(),
+        }
+    };
+    Ok(resolve(a) == resolve(b))
 }
 
 /// join_logo_scp に渡す `-set KEY VALUE ...` の引数列を組み立てる。
@@ -272,6 +299,20 @@ mod tests {
             args,
             to_strings(&["-set", "autocm_sub", "11", "-set", "param_cuttr", "1"])
         );
+    }
+
+    #[test]
+    fn same_path_detects_identical_and_relative_forms() {
+        let dir = unique_scratch_dir("same-path");
+        let a = dir.join("trim.avs");
+        fs::write(&a, "Trim(0,1)\n").unwrap();
+        assert!(same_path(&a, &a).unwrap());
+        // 親を canonicalize して比較するので、存在する親配下なら一致する
+        let b = PathBuf::from(&dir).join("trim.avs");
+        assert!(same_path(&a, &b).unwrap());
+        let other = dir.join("other.avs");
+        assert!(!same_path(&a, &other).unwrap());
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

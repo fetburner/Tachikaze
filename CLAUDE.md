@@ -9,6 +9,8 @@ $ tachikaze analyze IN.mp4 -o trim.avs --report --work-dir work
 $ tachikaze cut IN.mp4 --trim trim.avs -o OUT.mp4 --dtvi work/work.mp4.dtvi
 ```
 
+手元のファイルを一通しで処理するときは `scripts/cmcut.sh`（edit list 除去・パス結線・`--cm-output` 付き cut。既定は analyze 後に確認、`--yes` で省略）。
+
 現在のコマンド構成・モジュール構成・自己検証の一覧は
 [docs/architecture.md](docs/architecture.md)。
 
