@@ -50,6 +50,35 @@ fn is_executable_file(path: &Path) -> bool {
     path.is_file()
 }
 
+/// パスが読み取り専用データファイルとして使えるかを判定する。
+///
+/// 実行権限は問わない（データファイルなので）。[`is_executable_file`] とは
+/// 判定基準が異なるため別関数にしている。
+fn is_regular_file(path: &Path) -> bool {
+    path.is_file()
+}
+
+/// 環境変数を読み、**空文字なら未設定として扱う**（XDG Base Directory 仕様の作法）。
+fn non_empty_env(key: &str) -> Option<String> {
+    env::var(key).ok().filter(|v| !v.is_empty())
+}
+
+/// `${XDG_DATA_HOME:-$HOME/.local/share}` を返す。`$HOME` も取れない場合は `None`。
+fn xdg_data_home() -> Option<PathBuf> {
+    non_empty_env("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share")))
+}
+
+/// `$XDG_DATA_DIRS`（既定 `/usr/local/share:/usr/share`）を絶対パスの列として返す。
+///
+/// XDG 仕様どおり、相対パスの要素は無視する。
+fn xdg_data_dirs() -> Vec<PathBuf> {
+    let raw =
+        non_empty_env("XDG_DATA_DIRS").unwrap_or_else(|| "/usr/local/share:/usr/share".to_string());
+    env::split_paths(&raw).filter(|p| p.is_absolute()).collect()
+}
+
 /// 探索中に実際に調べた候補パスを記録しつつ、最初の当たりを返す。
 #[derive(Debug, Default)]
 struct SearchTrace {
@@ -94,6 +123,44 @@ impl SearchTrace {
             "外部ツール `{name}` が見つかりませんでした。以下の場所を探しました:\n{tried_list}\n\
              `--tool-dir` オプション、環境変数 `TACHIKAZE_TOOL_DIR`、または PATH で解決できる\
              場所に `{name}` を置いてください。"
+        )
+    }
+}
+
+/// 読み取り専用データファイルの探索で調べた候補パスを記録する。
+///
+/// [`SearchTrace`] は「ディレクトリ + 実行ファイル名」の組で候補を作るのに
+/// 対し、こちらは候補パスの組み立て方が段ごとに異なる（`JL/` を挟むかどうか
+/// など）ため、完成した候補パスをそのまま受け取る。
+#[derive(Debug, Default)]
+struct DataFileSearchTrace {
+    tried: Vec<PathBuf>,
+}
+
+impl DataFileSearchTrace {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// `candidate` が既存のデータファイルなら `Some` を返す。見つからなくても
+    /// 調べた場所として記録する。
+    fn try_candidate(&mut self, candidate: PathBuf) -> Option<PathBuf> {
+        let found = is_regular_file(&candidate).then(|| candidate.clone());
+        self.tried.push(candidate);
+        found
+    }
+
+    /// 見つからなかった場合のエラーを、調べた場所を全て列挙して組み立てる。
+    fn not_found_error(&self, file_name: &str) -> anyhow::Error {
+        let tried_list = self
+            .tried
+            .iter()
+            .map(|p| format!("  - {}", p.display()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        anyhow!(
+            "既定の JL コマンドファイル `{file_name}` が見つかりませんでした。以下の場所を探しました:\n{tried_list}\n\
+             環境変数 `TACHIKAZE_JL_DIR`、または `--jl-file` オプションで直接指定してください。"
         )
     }
 }
@@ -145,27 +212,77 @@ pub fn resolve_tool(tool_dir: Option<&Path>, name: &str) -> Result<PathBuf> {
     })
 }
 
-/// `join_logo_scp` バイナリと同じディレクトリの `JL/` から既定の JL コマンド
-/// ファイル（`JL_標準.txt`）を探す。
+/// 既定の JL コマンドファイル（`JL_標準.txt`）を探索順序に従って探す。
 ///
 /// 局別のルールファイル選択は現状不要（`docs/jls-settings.md` 参照）なので、
-/// 既定ファイル固定で十分。
+/// 既定ファイル固定で十分。`--jl-file` が指定された場合はこの関数を呼ばず、
+/// 呼び出し側がそのパスをそのまま使う。
+///
+/// 探索順序（最初に見つかったものを使う）:
+///
+/// 1. `$TACHIKAZE_JL_DIR`（JL ファイルが入っているディレクトリを直接指定）
+/// 2. `${XDG_DATA_HOME:-$HOME/.local/share}/tachikaze/JL/`
+/// 3. `$XDG_DATA_DIRS`（既定 `/usr/local/share:/usr/share`）の各要素 +
+///    `join_logo_scp/JL/`
+/// 4. `<join_logo_scp の実体パス>/../share/join_logo_scp/JL/`（bindir の隣の
+///    share を推定するリロケータブルな段。`join_logo_scp_path` は
+///    [`resolve_tool`] が返す canonicalize 済みのパスを渡すこと。symlink の
+///    まま親を辿ると壊れる）
+/// 5. `<join_logo_scp と同じディレクトリ>/JL/`（現在の 1 ディレクトリ配布との
+///    互換のため最後に残す段）
+///
+/// いずれの場所でも見つからない場合は、探した場所を全て列挙したエラーを返す。
 pub fn default_jl_command_file(join_logo_scp_path: &Path) -> Result<PathBuf> {
-    let dir = join_logo_scp_path.parent().ok_or_else(|| {
-        anyhow!(
-            "join_logo_scp のパスに親ディレクトリがありません: {}",
-            join_logo_scp_path.display()
-        )
-    })?;
-    let candidate = dir.join("JL").join(DEFAULT_JL_COMMAND_FILE);
-    if candidate.is_file() {
-        Ok(candidate)
-    } else {
-        Err(anyhow!(
-            "既定の JL コマンドファイルが見つかりませんでした: {}",
-            candidate.display()
-        ))
+    let mut trace = DataFileSearchTrace::new();
+
+    if let Some(dir) = non_empty_env("TACHIKAZE_JL_DIR") {
+        let candidate = PathBuf::from(dir).join(DEFAULT_JL_COMMAND_FILE);
+        if let Some(found) = trace.try_candidate(candidate) {
+            return Ok(found);
+        }
     }
+
+    if let Some(data_home) = xdg_data_home() {
+        let candidate = data_home
+            .join("tachikaze")
+            .join("JL")
+            .join(DEFAULT_JL_COMMAND_FILE);
+        if let Some(found) = trace.try_candidate(candidate) {
+            return Ok(found);
+        }
+    }
+
+    for data_dir in xdg_data_dirs() {
+        let candidate = data_dir
+            .join("join_logo_scp")
+            .join("JL")
+            .join(DEFAULT_JL_COMMAND_FILE);
+        if let Some(found) = trace.try_candidate(candidate) {
+            return Ok(found);
+        }
+    }
+
+    if let Some(bin_dir) = join_logo_scp_path.parent() {
+        if let Some(prefix_dir) = bin_dir.parent() {
+            let candidate = prefix_dir
+                .join("share")
+                .join("join_logo_scp")
+                .join("JL")
+                .join(DEFAULT_JL_COMMAND_FILE);
+            if let Some(found) = trace.try_candidate(candidate) {
+                return Ok(found);
+            }
+        }
+    }
+
+    if let Some(dir) = join_logo_scp_path.parent() {
+        let candidate = dir.join("JL").join(DEFAULT_JL_COMMAND_FILE);
+        if let Some(found) = trace.try_candidate(candidate) {
+            return Ok(found);
+        }
+    }
+
+    Err(trace.not_found_error(DEFAULT_JL_COMMAND_FILE))
 }
 
 /// `chapter_exe` の起動時ログ（`chapter_exe: AviSynth=enabled, dtvindex=enabled`
@@ -191,6 +308,37 @@ mod tests {
     /// ロック。`cargo test` はデフォルトでテストを並行実行するため、プロセス
     /// 全体で共有される環境変数を書き換えるテストは互いに競合してしまう。
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// 複数の環境変数を差し替え、Drop で元の値に戻すガード（`ENV_LOCK` と併用する）。
+    struct EnvVarGuard {
+        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl EnvVarGuard {
+        fn new(keys: &[&'static str]) -> Self {
+            let saved = keys.iter().map(|&k| (k, env::var_os(k))).collect();
+            Self { saved }
+        }
+
+        fn set(&self, key: &str, value: impl AsRef<std::ffi::OsStr>) {
+            env::set_var(key, value);
+        }
+
+        fn remove(&self, key: &str) {
+            env::remove_var(key);
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            for (k, v) in &self.saved {
+                match v {
+                    Some(v) => env::set_var(k, v),
+                    None => env::remove_var(k),
+                }
+            }
+        }
+    }
 
     /// テスト用の一時ディレクトリを作り、Drop で自動的に削除するガード。
     struct TempDir {
@@ -453,31 +601,242 @@ mod tests {
         assert_eq!(result.expect("should resolve via exe dir"), expected);
     }
 
-    #[test]
-    fn default_jl_command_file_found_next_to_join_logo_scp() {
-        let dir = TempDir::new("jl-command-file-found");
-        let jl_dir = dir.path().join("JL");
-        fs::create_dir_all(&jl_dir).expect("create JL dir");
-        let jl_file = jl_dir.join(DEFAULT_JL_COMMAND_FILE);
-        fs::write(&jl_file, "dummy JL command file").expect("write JL file");
+    /// JL 探索が触る環境変数一式。テストごとに `EnvVarGuard` で保存・復元する。
+    const JL_ENV_KEYS: &[&str] = &["TACHIKAZE_JL_DIR", "XDG_DATA_HOME", "XDG_DATA_DIRS"];
 
-        let join_logo_scp_path = dir.path().join(JOIN_LOGO_SCP);
-        fs::write(&join_logo_scp_path, "dummy").expect("write dummy binary");
+    /// `<bin_dir>/join_logo_scp` ダミーを作り、そのパスを返す。
+    fn make_join_logo_scp(bin_dir: &Path) -> PathBuf {
+        fs::create_dir_all(bin_dir).expect("create bin dir");
+        let path = bin_dir.join(JOIN_LOGO_SCP);
+        fs::write(&path, "dummy").expect("write dummy join_logo_scp");
+        path
+    }
+
+    fn write_jl_file(dir: &Path) -> PathBuf {
+        fs::create_dir_all(dir).expect("create JL dir");
+        let file = dir.join(DEFAULT_JL_COMMAND_FILE);
+        fs::write(&file, "dummy JL command file").expect("write JL file");
+        file
+    }
+
+    #[test]
+    fn default_jl_command_file_prefers_tachikaze_jl_dir_over_all_other_stages() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let env = EnvVarGuard::new(JL_ENV_KEYS);
+
+        let stage1 = TempDir::new("jl-priority-stage1");
+        let stage2_data_home = TempDir::new("jl-priority-stage2");
+        let stage3_data_dirs = TempDir::new("jl-priority-stage3");
+        let prefix = TempDir::new("jl-priority-prefix");
+
+        // 段 1: TACHIKAZE_JL_DIR は JL ファイルが入っているディレクトリを直接指す。
+        let expected = write_jl_file(stage1.path());
+        // 他の段にも同名ファイルを置き、それらが選ばれていないことを保証する。
+        write_jl_file(&stage2_data_home.path().join("tachikaze").join("JL"));
+        write_jl_file(&stage3_data_dirs.path().join("join_logo_scp").join("JL"));
+        let bin_dir = prefix.path().join("bin");
+        let join_logo_scp_path = make_join_logo_scp(&bin_dir);
+        write_jl_file(&prefix.path().join("share").join("join_logo_scp").join("JL"));
+        write_jl_file(&bin_dir.join("JL"));
+
+        env.set("TACHIKAZE_JL_DIR", stage1.path());
+        env.set("XDG_DATA_HOME", stage2_data_home.path());
+        env.set(
+            "XDG_DATA_DIRS",
+            env::join_paths([stage3_data_dirs.path()]).unwrap(),
+        );
+
+        let found = default_jl_command_file(&join_logo_scp_path).expect("should resolve");
+        assert_eq!(found, expected);
+    }
+
+    #[test]
+    fn default_jl_command_file_uses_xdg_data_home_when_no_env_dir() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let env = EnvVarGuard::new(JL_ENV_KEYS);
+
+        let data_home = TempDir::new("jl-data-home");
+        let data_dirs = TempDir::new("jl-data-home-other-dirs");
+        let prefix = TempDir::new("jl-data-home-prefix");
+
+        let expected = write_jl_file(&data_home.path().join("tachikaze").join("JL"));
+        write_jl_file(&data_dirs.path().join("join_logo_scp").join("JL"));
+        let bin_dir = prefix.path().join("bin");
+        let join_logo_scp_path = make_join_logo_scp(&bin_dir);
+        write_jl_file(&bin_dir.join("JL"));
+
+        env.remove("TACHIKAZE_JL_DIR");
+        env.set("XDG_DATA_HOME", data_home.path());
+        env.set(
+            "XDG_DATA_DIRS",
+            env::join_paths([data_dirs.path()]).unwrap(),
+        );
+
+        let found = default_jl_command_file(&join_logo_scp_path).expect("should resolve");
+        assert_eq!(found, expected);
+    }
+
+    #[test]
+    fn default_jl_command_file_uses_xdg_data_dirs_when_no_data_home_match() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let env = EnvVarGuard::new(JL_ENV_KEYS);
+
+        let empty_data_home = TempDir::new("jl-data-dirs-empty-home");
+        let data_dirs_1 = TempDir::new("jl-data-dirs-1");
+        let data_dirs_2 = TempDir::new("jl-data-dirs-2");
+        let prefix = TempDir::new("jl-data-dirs-prefix");
+
+        // data_dirs_1 には置かず、2番目の要素 data_dirs_2 にだけ置く。
+        let expected = write_jl_file(&data_dirs_2.path().join("join_logo_scp").join("JL"));
+        let bin_dir = prefix.path().join("bin");
+        let join_logo_scp_path = make_join_logo_scp(&bin_dir);
+        write_jl_file(&bin_dir.join("JL"));
+
+        env.remove("TACHIKAZE_JL_DIR");
+        env.set("XDG_DATA_HOME", empty_data_home.path());
+        env.set(
+            "XDG_DATA_DIRS",
+            env::join_paths([data_dirs_1.path(), data_dirs_2.path()]).unwrap(),
+        );
+
+        let found = default_jl_command_file(&join_logo_scp_path).expect("should resolve");
+        assert_eq!(found, expected);
+    }
+
+    #[test]
+    fn default_jl_command_file_uses_prefix_relative_share_dir() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let env = EnvVarGuard::new(JL_ENV_KEYS);
+
+        let empty_data_home = TempDir::new("jl-prefix-empty-home");
+        let empty_data_dirs = TempDir::new("jl-prefix-empty-dirs");
+        let prefix = TempDir::new("jl-prefix-share");
+
+        let bin_dir = prefix.path().join("bin");
+        let join_logo_scp_path = make_join_logo_scp(&bin_dir);
+        // 段 5（bin と同じディレクトリの JL/）には置かず、段 4（prefix/share/...）にだけ置く。
+        let expected = write_jl_file(&prefix.path().join("share").join("join_logo_scp").join("JL"));
+
+        env.remove("TACHIKAZE_JL_DIR");
+        env.set("XDG_DATA_HOME", empty_data_home.path());
+        env.set(
+            "XDG_DATA_DIRS",
+            env::join_paths([empty_data_dirs.path()]).unwrap(),
+        );
+
+        let found = default_jl_command_file(&join_logo_scp_path).expect("should resolve");
+        assert_eq!(found, expected);
+    }
+
+    #[test]
+    fn default_jl_command_file_falls_back_to_join_logo_scp_sibling_dir() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let env = EnvVarGuard::new(JL_ENV_KEYS);
+
+        let empty_data_home = TempDir::new("jl-sibling-empty-home");
+        let empty_data_dirs = TempDir::new("jl-sibling-empty-dirs");
+        let dir = TempDir::new("jl-command-file-found");
+
+        // 現在の1ディレクトリ配布と同じ構成: join_logo_scp と同じディレクトリの JL/。
+        let expected = write_jl_file(&dir.path().join("JL"));
+        let join_logo_scp_path = make_join_logo_scp(dir.path());
+
+        env.remove("TACHIKAZE_JL_DIR");
+        env.set("XDG_DATA_HOME", empty_data_home.path());
+        env.set(
+            "XDG_DATA_DIRS",
+            env::join_paths([empty_data_dirs.path()]).unwrap(),
+        );
 
         let found = default_jl_command_file(&join_logo_scp_path).expect("should find JL file");
-        assert_eq!(found, jl_file);
+        assert_eq!(found, expected);
     }
 
     #[test]
     fn default_jl_command_file_missing_is_reported_clearly() {
-        let dir = TempDir::new("jl-command-file-missing");
-        let join_logo_scp_path = dir.path().join(JOIN_LOGO_SCP);
-        fs::write(&join_logo_scp_path, "dummy").expect("write dummy binary");
+        let _guard = ENV_LOCK.lock().unwrap();
+        let env = EnvVarGuard::new(JL_ENV_KEYS);
+
+        let jl_dir = TempDir::new("jl-missing-env-dir");
+        let data_home = TempDir::new("jl-missing-data-home");
+        let data_dirs = TempDir::new("jl-missing-data-dirs");
+        let prefix = TempDir::new("jl-missing-prefix");
+
+        let bin_dir = prefix.path().join("bin");
+        let join_logo_scp_path = make_join_logo_scp(&bin_dir);
+
+        env.set("TACHIKAZE_JL_DIR", jl_dir.path());
+        env.set("XDG_DATA_HOME", data_home.path());
+        env.set(
+            "XDG_DATA_DIRS",
+            env::join_paths([data_dirs.path()]).unwrap(),
+        );
 
         let err = default_jl_command_file(&join_logo_scp_path)
-            .expect_err("JL dir does not exist, should fail");
+            .expect_err("nowhere has the JL file, should fail");
         let message = err.to_string();
-        assert!(message.contains(DEFAULT_JL_COMMAND_FILE));
+
+        assert!(message.contains(
+            &jl_dir
+                .path()
+                .join(DEFAULT_JL_COMMAND_FILE)
+                .display()
+                .to_string()
+        ));
+        assert!(message.contains(
+            &data_home
+                .path()
+                .join("tachikaze")
+                .join("JL")
+                .join(DEFAULT_JL_COMMAND_FILE)
+                .display()
+                .to_string()
+        ));
+        assert!(message.contains(
+            &data_dirs
+                .path()
+                .join("join_logo_scp")
+                .join("JL")
+                .join(DEFAULT_JL_COMMAND_FILE)
+                .display()
+                .to_string()
+        ));
+        assert!(message.contains(
+            &prefix
+                .path()
+                .join("share")
+                .join("join_logo_scp")
+                .join("JL")
+                .join(DEFAULT_JL_COMMAND_FILE)
+                .display()
+                .to_string()
+        ));
+        assert!(message.contains(
+            &bin_dir
+                .join("JL")
+                .join(DEFAULT_JL_COMMAND_FILE)
+                .display()
+                .to_string()
+        ));
+    }
+
+    #[test]
+    fn default_jl_command_file_treats_empty_env_vars_as_unset() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let env = EnvVarGuard::new(JL_ENV_KEYS);
+
+        let dir = TempDir::new("jl-empty-env-fallback");
+        let expected = write_jl_file(&dir.path().join("JL"));
+        let join_logo_scp_path = make_join_logo_scp(dir.path());
+
+        // 空文字は未設定として扱われ、既定（$HOME 相当）へフォールバックしたうえで
+        // 最終的に段 5（sibling JL/）まで落ちてくるはず。
+        env.set("TACHIKAZE_JL_DIR", "");
+        env.set("XDG_DATA_HOME", "");
+        env.set("XDG_DATA_DIRS", "");
+
+        let found = default_jl_command_file(&join_logo_scp_path).expect("should resolve");
+        assert_eq!(found, expected);
     }
 
     #[test]
