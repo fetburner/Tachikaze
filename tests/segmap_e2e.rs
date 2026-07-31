@@ -407,6 +407,69 @@ fn segment_map_is_not_written_when_self_verification_fails() {
     let _ = std::fs::remove_dir_all(&cache_root);
 }
 
+/// 完了条件（レビュー指摘#4）: 一度成功した cut がキャッシュへ区間マップを書いた後、
+/// 同じ入力・同じキャッシュに対して自己検証が失敗する cut を実行すると、古い
+/// マップが削除され、失敗後はキャッシュに区間マップが残らない。`remap-subs` が
+/// 古いマップを鮮度チェックなしに使ってしまう事故を防ぐための検査
+/// （`src/commands.rs::clear_stale_cached_segment_map`）。
+#[test]
+#[ignore = "tests/fixtures/sample.mp4 と ffmpeg/ffprobe が必要。tests/fixtures/gen.sh を先に実行すること"]
+fn stale_segment_map_is_removed_after_a_later_failed_cut() {
+    if common::skip_if_fixture_missing() {
+        return;
+    }
+    if !tools_available() {
+        return;
+    }
+
+    let cache_root = make_tmp_dir("stale-map-cache");
+
+    // 1回目: 正常な .dtvi で成功させ、キャッシュに区間マップを残す。
+    let (tmp_dir1, _out_path1, _segmap_path1, output1) = run_cut(
+        "stale-map-first",
+        TRIM_AVS_CONTENT,
+        &dtvi_path(),
+        &cache_root,
+        false,
+    );
+    assert!(
+        output1.status.success(),
+        "1回目の cut は成功するはず: stderr={}",
+        String::from_utf8_lossy(&output1.stderr)
+    );
+    assert!(
+        find_file_recursively(&cache_root, "work.mp4.segmap.json").is_some(),
+        "1回目成功後はキャッシュに区間マップが残っているはず"
+    );
+
+    // 2回目: 同じ入力・同じキャッシュに対して、壊れた .dtvi で自己検証を失敗させる。
+    let bad_dtvi_dir = make_tmp_dir("stale-map-bad-dtvi");
+    let bad_dtvi_path = bad_dtvi_dir.join("corrupted.dtvi");
+    std::fs::write(&bad_dtvi_path, corrupted_dtvi_content()).expect("壊した .dtvi を書けること");
+
+    let (tmp_dir2, _out_path2, _segmap_path2, output2) = run_cut(
+        "stale-map-second",
+        TRIM_AVS_CONTENT,
+        &bad_dtvi_path,
+        &cache_root,
+        false,
+    );
+    assert!(
+        !output2.status.success(),
+        "2回目の cut は壊れた .dtvi で失敗するはず"
+    );
+
+    assert!(
+        find_file_recursively(&cache_root, "work.mp4.segmap.json").is_none(),
+        "失敗後は古い区間マップがキャッシュから消えているはず"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp_dir1);
+    let _ = std::fs::remove_dir_all(&tmp_dir2);
+    let _ = std::fs::remove_dir_all(&bad_dtvi_dir);
+    let _ = std::fs::remove_dir_all(&cache_root);
+}
+
 /// 完了条件: `--cm-output` 指定時、CM側の区間マップは作られない（保持側だけ出す）。
 /// 保持側のマップの中身が「保持区間」（[0,120)+[360,480)）であって、CM側の補集合
 /// （[120,360)+[480,599)）ではないことも確認する。

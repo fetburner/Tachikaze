@@ -367,7 +367,8 @@ fn resolve_subs_path(
 }
 
 /// `-o` 省略時の出力先。`cut` の既定の出力名 `*_CMcut.mp4`
-/// （`scripts/tachikaze-cmcut` の `build_output_path` と同じ規則）と同じ stem に
+/// （かつて存在したシェルラッパー `scripts/tachikaze-cmcut` の `build_output_path`
+/// も同じ規則だった。`auto` の追加に伴い削除済み、`[E11-7]`）と同じ stem に
 /// することで、多くのプレイヤーが同名の字幕サイドカーを自動的に読み込める形にする
 /// （issue #59「やること」5）。出力は入力の隣に置く（`docs/architecture.md`
 /// 「パス解決」節の「出力」分類と同じ扱い。キャッシュではなく成果物）。
@@ -544,6 +545,15 @@ pub(crate) fn execute_cut(params: CutParams) -> anyhow::Result<CutOutcome> {
         cm_output,
         segment_map_path,
     } = params;
+
+    // 自己検証を通って新しいマップを書けた場合だけ区間マップが残る、という状態に
+    // するため、処理を始める前に既定キャッシュパスの古い区間マップを削除する
+    // （レビュー指摘#4）。cut が一度成功して区間マップを書いた後、同じ入力に対して
+    // 別の trim.avs で再実行して自己検証に失敗すると、古い区間マップがキャッシュに
+    // 残ったままになり、`remap-subs` が鮮度チェックなしにそれを使ってしまう
+    // （古い trim.avs に基づく境界で字幕を張り替えてしまうが、エラーも警告も出ない）。
+    // `--segment-map` で明示されたパスは呼び出し側が管理するファイルなので触らない。
+    clear_stale_cached_segment_map(&input);
 
     // `--snap inward` は保持区間を退化させうる（終端が開始より前になる）。その場合
     // 「保持区間の補集合をそのまま区間リストとして使える」という complement_ranges の
@@ -956,6 +966,46 @@ pub(crate) fn print_cut_report(
     );
     if let Some(av_sync) = &report.av_sync {
         println!("{}", audio::format_av_sync_report(av_sync));
+    }
+}
+
+/// `cut` の処理を始める前に、既定キャッシュパス（`workdir::cached_segment_map_path`）
+/// にある古い区間マップを削除する（[`execute_cut`] 冒頭のコメント、レビュー指摘#4）。
+///
+/// 削除に失敗しても致命的エラーにはしない（警告に留める。区間マップ自体が
+/// 「消えても再生成できるキャッシュ」という位置づけで、その削除の失敗を理由に
+/// `cut` 本体を止める必要が無いため、`workdir.rs` の分類と同じ扱い）。ファイルが
+/// 元々存在しない場合（`NotFound`）は警告すら出さない（毎回の `cut` 実行で
+/// ノイズになるため）。`--segment-map` の明示パスはここでは一切触らない
+/// （呼び出し側が管理するファイルであり、キャッシュではない）。
+fn clear_stale_cached_segment_map(input: &Path) {
+    let path = match workdir::cached_segment_map_path(input) {
+        Ok(path) => path,
+        Err(err) => {
+            eprintln!(
+                "[segmap] 区間マップのキャッシュパス解決に失敗しました（古いマップの削除を\
+                 スキップします）: {err}"
+            );
+            return;
+        }
+    };
+
+    match fs::remove_file(&path) {
+        Ok(()) => {
+            eprintln!(
+                "[segmap] 古い区間マップを削除しました（今回の cut が自己検証を通った場合のみ\
+                 再作成されます）: {}",
+                path.display()
+            );
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            eprintln!(
+                "[segmap] 古い区間マップの削除に失敗しました（警告のみ、処理は続行します）: {} \
+                 ({err})",
+                path.display()
+            );
+        }
     }
 }
 

@@ -5,18 +5,37 @@
 //! この方針は変えない)。回避策の前処理はこれまで `scripts/tachikaze-cmcut` の
 //! `prepare_input`(bash + python3)にあったが、字幕は抽出されずに `-map` 省略の
 //! 既定選択で1本引き継がれ、結局 `check_track_counts` に弾かれていた。`auto`
-//! (#62、未着手)とラッパーが別々に前処理を持つと elst の扱いと字幕の抽出元が
-//! 必ずずれるため、同じコードをここ1か所に置く。
+//! (#62、実装済み、`src/auto.rs`)とラッパーが別々に前処理を持つと elst の扱いと
+//! 字幕の抽出元が必ずずれるため、同じコードをここ1か所に置く。
+//!
+//! # 複数トラックの扱い(レビュー指摘: 黙って1本目だけを残さない)
+//!
+//! `run()` が実際に ffmpeg へ渡すコマンドは `-map 0:v:0 -map 0:a:0` 固定であり、
+//! 映像2本以上・音声2本以上の入力(二重音声放送など)でも黙って1本目だけを
+//! 残してしまう。これは `mp4io::support::check_track_counts` が `cut` に対して
+//! 拒否しているのと同じ構成を、`prepare` が黙って通過させてしまうことを意味する
+//! (`prepare` の目的は「`cut` が受け付けられる形にする」ことであり、`cut` 自体が
+//! 拒否する構成を黙って作ってはいけない)。そのため [`run`] は `read_moov` の
+//! 直後に [`reject_multiple_video_or_audio_tracks`] を呼び、映像・音声のどちらかが
+//! 2本以上あれば ffmpeg を呼ぶ前に明示エラーで停止する。
+//!
+//! 字幕トラックは音声・映像とは深刻度が異なる(無くても本編再生に支障が無い)ため、
+//! 2本以上あってもエラーにはしない。[`subtitle_format_in`] は最初の1本だけを見て
+//! 抽出対象を決める(既存動作を維持)が、[`inspect_moov`] は
+//! [`MoovInspection::subtitle_track_count`] に該当トラックの総数を持たせており、
+//! [`run`] はこれが2以上のとき警告ログを出す(1本目だけを抽出し、残りは破棄する
+//! ことを黙って行わない)。
 //!
 //! # なぜ「除去」ではなく「除去して字幕はここで抽出」なのか
 //!
 //! `use_editlist` は muxer 専用オプション(`ffmpeg -h muxer=mp4` で `E..........`)。
 //! demuxer は既定で edit list を適用して読む(`ignore_editlist=false`)。つまり
 //! elst 除去とは「読みで畳み込んで、書かない」ことであり、strip 後のファイルの
-//! 時間軸は元ファイルとずれる可能性がある(ずれの量は別issue #60が実測する。
-//! ここでは触れるだけに留める)。字幕を元ファイルから別に抽出すると、そのずれが
-//! 字幕にだけ乗ってしまう。だから elst 除去と字幕抽出は**必ず同じ ffmpeg 呼び出し**
-//! で行い、同じ時間軸のずれ(あれば)を両方が等しく受ける。
+//! 時間軸は元ファイルとずれる(ずれの量は #60 で実測済み。AAC で +45.4ms、
+//! Opus で +60.2ms。詳細は docs/measurements.md「elst 除去と A/V 相対時刻」)。
+//! 字幕を元ファイルから別に抽出すると、そのずれが字幕にだけ乗ってしまう。だから
+//! elst 除去と字幕抽出は**必ず同じ ffmpeg 呼び出し**で行い、同じ時間軸のずれを
+//! 両方が等しく受ける。
 //!
 //! # 罠: strip 後、自己検証5は「元ファイル」を見誤る
 //!
@@ -24,13 +43,20 @@
 //! 映像pts−音声ptsが保たれているか」を見る。`prepare` が作った
 //! `input_prepared.mp4` を `cut` の入力として渡すと、この検証は
 //! **strip 後のファイルを「元ファイル」として** 比較する。elst 除去そのものが
-//! 音声・映像のタイムスタンプを変えていた場合(#60 が実測するまで未検証)、
-//! 検証は「strip 後ファイルと最終出力の一致」しか見ておらず、「真の元ファイルと
-//! 最終出力の一致」は見ていない。つまりこの検証は
-//! **strip によるタイムスタンプのずれを検出できない穴**を持つ。elst 除去の
-//! CRC32一致([`mp4io::support`] のドキュメント、docs/architecture.md「未対応の
-//! 入力」)もペイロード(パケットの中身)しか見ておらず、タイムスタンプが保たれる
-//! 根拠にはならない。
+//! 音声・映像のタイムスタンプを変える(#60 で実測済み。上記のとおり AAC で
+//! +45.4ms、Opus で +60.2ms のずれが実際に生じる)ため、検証は「strip 後
+//! ファイルと最終出力の一致」しか見ておらず、「真の元ファイルと最終出力の
+//! 一致」は見ていない。つまりこの検証は
+//! **strip によるタイムスタンプのずれを検出できない穴**を持つ(ずれの量が
+//! 実測済みであることと、この検証がその量を検出できないことは別の話である点に
+//! 注意)。elst 除去の CRC32一致([`mp4io::support`] のドキュメント、
+//! docs/architecture.md「未対応の入力」)もペイロード(パケットの中身)しか
+//! 見ておらず、タイムスタンプが保たれる根拠にはならない。
+//!
+//! なお `prepare`/`auto` は elst を自動除去してよいと判断している
+//! (docs/measurements.md「elst 除去と A/V 相対時刻」の「方針: ずれを許容して
+//! 記録する」参照。Opus は実害なし、AAC の残存ずれはファイルにつき高々1回・
+//! 1フレーム未満・非累積)。
 //!
 //! # 出力先
 //!
@@ -130,8 +156,11 @@ impl SubtitleFormat {
 pub struct MoovInspection {
     /// `elst`(edit list)を持つトラックがあるか。
     pub has_edit_list: bool,
-    /// 字幕トラックがあれば、そのコーデックから判定した抽出形式。
+    /// 字幕トラックがあれば、そのコーデックから判定した抽出形式(最初の1本のみ)。
     pub subtitle: Option<SubtitleFormat>,
+    /// 映像でも音声でもない(字幕などの)トラックの総数。2以上なら [`run`] が
+    /// 警告ログを出す(モジュール doc comment「複数トラックの扱い」参照)。
+    pub subtitle_track_count: usize,
 }
 
 /// `elst`(edit list)を持つトラックがあるかを判定する。
@@ -171,11 +200,55 @@ fn subtitle_format_in(moov: &Moov) -> Option<SubtitleFormat> {
     })
 }
 
+/// 映像・音声・それ以外(字幕など)のトラック数をそれぞれ数える。
+///
+/// `mp4io::support::check_track_counts` と同じ分類基準(`stsd` 先頭コーデックが
+/// `Avc1` なら映像、`is_audio_codec` なら音声、それ以外はすべて「その他」)を使う。
+/// あちらは「エラーにする」ためのチェック、こちらは `prepare` 固有の判断(映像/音声
+/// 2本以上は拒否、字幕相当は警告に留める)に使うため、判定条件だけを共有し関数は
+/// 分けている(`has_edit_list` と同じ理由)。
+fn track_counts(moov: &Moov) -> (usize, usize, usize) {
+    let mut video = 0usize;
+    let mut audio = 0usize;
+    let mut other = 0usize;
+    for trak in &moov.trak {
+        match track_codec(trak) {
+            Some(Codec::Avc1(_)) => video += 1,
+            Some(codec) if is_audio_codec(codec) => audio += 1,
+            _ => other += 1,
+        }
+    }
+    (video, audio, other)
+}
+
+/// 映像トラックが2本以上、または音声トラックが2本以上ある入力を拒否する。
+///
+/// `run()` が実際に ffmpeg へ渡すコマンドは `-map 0:v:0 -map 0:a:0` 固定であり、
+/// この検査が無いと二重音声放送のような入力でも黙って1本目だけを残してしまう
+/// (モジュール doc comment「複数トラックの扱い」参照)。`mp4io::support`
+/// (`check_track_counts`)と同じ制約を `prepare` の入口でも課すことで、`cut` が
+/// 本来拒否すべき構成を `prepare` が黙って作らないようにする。
+fn reject_multiple_video_or_audio_tracks(moov: &Moov) -> Result<()> {
+    let (video, audio, _other) = track_counts(moov);
+    if video >= 2 || audio >= 2 {
+        anyhow::bail!(
+            "prepare: 映像トラックが{video}本、音声トラックが{audio}本あります。\
+             複数トラックには対応していません(cut は映像1本+音声1本の構成のみ受け付けるため、\
+             prepare の `-map 0:v:0 -map 0:a:0` で黙って1本目だけを残すと、cut が本来\
+             拒否すべき構成を素通しさせてしまいます。mp4io::support::check_track_counts と\
+             同じ制約です)。"
+        );
+    }
+    Ok(())
+}
+
 /// `moov` を検査し、elst の有無と字幕トラックの形式を判定する。
 pub fn inspect_moov(moov: &Moov) -> MoovInspection {
+    let (_, _, other) = track_counts(moov);
     MoovInspection {
         has_edit_list: has_edit_list(moov),
         subtitle: subtitle_format_in(moov),
+        subtitle_track_count: other,
     }
 }
 
@@ -219,7 +292,23 @@ pub fn run(
 ) -> Result<PrepareOutcome> {
     let moov = crate::mp4io::read::read_moov(input)
         .with_context(|| format!("入力 mp4 の読み込みに失敗しました: {}", input.display()))?;
+
+    // 映像/音声が2本以上ある入力は、ffmpeg を呼ぶかどうかに関わらずここで明示エラーに
+    // する(モジュール doc comment「複数トラックの扱い」参照)。needs_strip が false
+    // (elst も字幕も無い)場合でも、後続の `cut` が同じ理由で拒否するだけなので早期に
+    // 分かりやすいメッセージを出す。
+    reject_multiple_video_or_audio_tracks(&moov)?;
+
     let inspection = inspect_moov(&moov);
+
+    if inspection.subtitle_track_count >= 2 {
+        eprintln!(
+            "[prepare] 警告: 字幕トラックが{}本あります。先頭の1本のみ抽出し、\
+             残りは破棄します: {}",
+            inspection.subtitle_track_count,
+            input.display()
+        );
+    }
 
     let needs_strip = inspection.has_edit_list || inspection.subtitle.is_some();
 
@@ -402,6 +491,61 @@ mod tests {
         let inspection = inspect_moov(&moov);
         assert!(!inspection.has_edit_list);
         assert_eq!(inspection.subtitle, None);
+        assert_eq!(inspection.subtitle_track_count, 0);
+    }
+
+    // --- レビュー指摘#1: 複数トラックを黙って1本目だけ残さない ---
+
+    #[test]
+    fn reject_multiple_video_or_audio_tracks_accepts_single_video_and_audio() {
+        let moov = Moov {
+            trak: vec![video_trak(), audio_trak()],
+            ..Default::default()
+        };
+        assert!(reject_multiple_video_or_audio_tracks(&moov).is_ok());
+    }
+
+    #[test]
+    fn reject_multiple_video_or_audio_tracks_rejects_two_video_tracks() {
+        let moov = Moov {
+            trak: vec![video_trak(), video_trak(), audio_trak()],
+            ..Default::default()
+        };
+        let err = reject_multiple_video_or_audio_tracks(&moov).expect_err("映像2本は拒否するはず");
+        assert!(err.to_string().contains("複数トラックには対応していません"));
+        assert!(err.to_string().contains("映像トラックが2本"));
+    }
+
+    #[test]
+    fn reject_multiple_video_or_audio_tracks_rejects_two_audio_tracks() {
+        let moov = Moov {
+            trak: vec![video_trak(), audio_trak(), audio_trak()],
+            ..Default::default()
+        };
+        let err = reject_multiple_video_or_audio_tracks(&moov).expect_err("音声2本は拒否するはず");
+        assert!(err.to_string().contains("複数トラックには対応していません"));
+        assert!(err.to_string().contains("音声トラックが2本"));
+    }
+
+    #[test]
+    fn inspect_moov_counts_multiple_subtitle_like_tracks_but_still_picks_first_format() {
+        // 字幕が2本以上あっても `subtitle`(抽出対象)は最初の1本の形式のまま
+        // (既存動作を維持)。`subtitle_track_count` だけが2以上になり、
+        // `run()` がこれを見て警告する(エラーにはしない、モジュール doc comment参照)。
+        let moov = Moov {
+            trak: vec![
+                video_trak(),
+                audio_trak(),
+                trak_with_codec(Codec::Tx3g(Tx3g::default())),
+                trak_with_codec(Codec::Tx3g(Tx3g::default())),
+            ],
+            ..Default::default()
+        };
+        let inspection = inspect_moov(&moov);
+        assert_eq!(inspection.subtitle, Some(SubtitleFormat::Tx3g));
+        assert_eq!(inspection.subtitle_track_count, 2);
+        // 複数あっても字幕はエラー対象ではない(映像/音声のみ拒否する)。
+        assert!(reject_multiple_video_or_audio_tracks(&moov).is_ok());
     }
 
     #[test]
