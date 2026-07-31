@@ -2,7 +2,7 @@
 
 mp4 に変換済みの録画ファイルを、**再エンコードせずに CM カット**するツール。CM 検出は既存ツール（chapter_exe → join_logo_scp）に任せ、本ツールは「Trim リスト → ロスレス出力」だけを担う。
 
-**状態**: **実装完了**（エピック E1〜E10 とそれぞれのサブ issue はすべてクローズ済み。経緯は `git log` の `[E1-1]`〜`[E10-6]`）。言語は Rust、mp4 の読み書きは `mp4-atom` クレート。
+**状態**: `analyze` / `cut` は**実装完了**（エピック E1〜E10 とそれぞれのサブ issue はすべてクローズ済み。経緯は `git log` の `[E1-1]`〜`[E10-6]`）。E11（字幕の保持と `auto`、#56）は issue 化済みで着手前。言語は Rust、mp4 の読み書きは `mp4-atom` クレート。
 
 ```console
 $ tachikaze analyze IN.mp4 -o trim.avs --report
@@ -54,6 +54,21 @@ $ bash tests/fixtures/gen.sh   # フィクスチャ生成（コミットされ�
 3. **表示順とデコード順を型で分ける。** 混同が唯一の重大バグ源で、間違った位置で切っても例外は飛ばない。`.dtvi` のフレーム番号と自前導出の一致を assert する。→ [docs/architecture.md](docs/architecture.md)
 
 4. **音声パケットは「区間先頭サンプルのソース上の DTS」から引き当てる。** 出力側の累積時間を起点に詰めると**長さは合うのに中身が別の位置の音声になる**。合成時刻（pts）を使うと `cts_offset`（並べ替え深度 = 実測 67ms）ぶん**音声が映像より先行する**。どちらも実際に起きた。パケットの集合比較も区間ごとの長さ比較も素通りするので、「元ファイルと出力で『映像 pts − 音声 pts』が保たれているか」を見る検査が必要。→ [docs/lossless-cut.md](docs/lossless-cut.md)
+
+## タスク分解と issue
+
+**タスク分解を頼まれたら、エピック 1 本 + サブ issue に分ける。** 形式は `.github/ISSUE_TEMPLATE/` の 2 つのテンプレート（`epic` / `sub-issue`）に従う。既存の issue を読んで形式を真似る必要はない。
+
+```console
+$ gh issue create --template epic --title '[E11] ...' --label epic
+$ gh issue create --template sub-issue --title '[E11-1] ...' --parent 56 --label area:cli --label lane:mp4
+```
+
+- **サブ issue は自己完結させる。** 分割の目的は「実装する人が余計な文書を読まずに済むこと」であって、進捗管理ではない。**エピックや他の issue を読まないと実装できないサブ issue は分割が失敗している。** エピックの「方針」で決めた共通事項は、参照させずに必要な行を転記する
+- **「読む文書」は節名・関数名まで絞る。** 挙げなかった文書は開かせない
+- **「触るファイル」を必ず列挙する。** 並行して進めるときの衝突を防ぐ。1 ブランチで終わる粒度（触るファイルを列挙できる大きさ）に切る
+- 本文の先頭に `親: #<エピック番号>` を書き、`--parent` でも紐付ける（本文だけ読んでも親が分かるようにする）
+- ラベルはエピックが `epic` + `area:*` + `lane:*`、サブ issue が `area:*` + `lane:*`（ドキュメントのみなら `documentation`）
 
 ## ドキュメントと issue を最新に保つ
 
