@@ -4,7 +4,7 @@ mp4 に変換済みの録画ファイルを、**再エンコードせずに CM �
 
 Amatsukaze は MPEG2-TS を入力して CM カットとエンコードを行い mp4 を出力するが、一度 mp4 にしてしまったファイルは扱えない。そのまま録画してしまったファイルを後から CM カットしたい、という需要に応える。
 
-**状態**: 実装完了（`analyze` / `cut` の両コマンドが動作し、E2E テストでビット一致を確認済み）。残っている未対応構成は [architecture.md](architecture.md) に一覧がある。
+**状態**: 実装完了（`analyze` / `cut` / `prepare` / `remap-subs` / `auto` が動作し、E2E テストでビット一致を確認済み）。残っている未対応構成は [architecture.md](architecture.md) に一覧がある。
 
 **このファイルは入口です。必要な文書だけを開いてください。** 各文書は独立して読めるように書かれています。
 
@@ -21,7 +21,7 @@ Amatsukaze は MPEG2-TS を入力して CM カットとエンコードを行い 
 | 外部ツールを macOS でビルドする | [toolchain-macos.md](toolchain-macos.md) |
 | 実測値（GOP 長・カット精度・検出品質）を見る | [measurements.md](measurements.md) |
 | 現在の構成・自己検証・未対応の入力・未解決事項を知る | [architecture.md](architecture.md) |
-| 手元の mp4 を一連で CM カットする | `tachikaze auto`（prepare→analyze→gate→cut→remap-subs を合成、説明は [architecture.md](architecture.md)「コマンド構成」）。判断不要な手順だけの旧シェルラッパーは `scripts/tachikaze-cmcut` |
+| 手元の mp4 を一連で CM カットする | `tachikaze auto`（`prepare`→`analyze`→gate→`cut`→`remap-subs` を対話なしで合成、説明は [architecture.md](architecture.md)「コマンド構成」） |
 | リポジトリを参照できない場所へインストールして使う | [architecture.md](architecture.md)「パス解決」節、[toolchain-macos.md](toolchain-macos.md)「ビルド後の配置とインストール」 |
 
 ## スコープ

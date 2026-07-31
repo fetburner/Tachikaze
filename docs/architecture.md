@@ -2,7 +2,7 @@
 
 → 入口: [overview.md](overview.md)
 
-**`analyze` / `cut` の実装は完了している。** エピック E1〜E10 とそれぞれのサブ issue に分解したタスクはすべてクローズ済み（経緯は `git log` の `[E1-1]`〜`[E10-6]`）。エピック E11（字幕の保持と `auto`、#56）は区間マップ（#57）・`prepare` サブコマンド（#58）・字幕リマップ（#59）・elst 実測（#60）・gate（#61）・`auto` サブコマンド（#62）まで実装済み。この文書は**現在の構成**と、**まだ対応していないこと**を書く。
+**`analyze` / `cut` / `prepare` / `remap-subs` / `auto` の実装は完了している。** エピック E1〜E11 とそれぞれのサブ issue に分解したタスクはすべてクローズ済み（経緯は `git log` の `[E1-1]`〜`[E11-7]`。E11 は字幕の保持と `auto`、#56）。この文書は**現在の構成**と、**まだ対応していないこと**を書く。
 
 ## コマンド構成
 
@@ -81,16 +81,13 @@ tachikaze auto IN.mp4 [IN2 ...] [-o OUT | --cm-output PATH | --no-cm] [--force]
 
 `.dtvi` はオープン GOP の判定（[lossless-cut.md](lossless-cut.md)）と自己検証 4（表示順/デコード順の突き合わせ）に必須で、これ自体は変わっていない。省略できるようにしたのは**パスの指定**だけで、`.dtvi` 無しで動くようにしたわけではない（`cut --dtvi` を省略すると、`analyze` と同じ入力ごとのキャッシュディレクトリ規則から `work.mp4.dtvi` を自動的に探す。見つからなければ `analyze` を実行するコマンド例を添えて停止する。探索順・キャッシュの場所は次節「パス解決」参照）。
 
-**`tachikaze auto`（#62）は gate（#61）の「疑わしいときだけ止める」判定を使って人手を安全に外す。** 見逃し候補ヒューリスティックが効かない番組もあるため（`src/gate.rs`「見逃し候補ヒューリスティックの限界」）、gate が止めないことは検出が完全に当たっている保証ではない。対話しながら都度確認したい場合は従来どおり `analyze` → 目視 → `cut` を使う。`scripts/tachikaze-cmcut`（判断不要な手順だけを自動化するシェルラッパー、`auto` 登場前からの実装）は残しているが、新規に自動化したい用途は `auto` を使うこと（`prepare`/gate/区間マップ込みの `cut`/`remap-subs` を経由し、シェル側で個別に持っていた edit list 除去・パス結線ロジックを重複させない）。
+**かつては「CLI に `auto` は用意していない」方針だった**（検出の見逃しがあるため、`analyze` と `cut` のあいだに人手を挟める設計を崩さない、という判断）。**この方針を変えて `auto`（#62）を追加した理由は3つ**:
 
-```console
-$ scripts/tachikaze-cmcut IN.mp4                  # analyze → 確認 → cut
-$ scripts/tachikaze-cmcut --yes IN.mp4 [IN2 ...]  # 確認省略（バッチ向き）
-$ scripts/tachikaze-cmcut --analyze-only IN.mp4   # 検出だけ
-$ scripts/tachikaze-cmcut --cut-only --work-dir <work-root>/cmcut_xxx IN.mp4
-```
+1. **やり直しが安い**: `analyze` の中間ファイル（`.dtvi` / `trim.avs` / `detail.jls`）はキャッシュに残り、入力 mp4 自体は無改変（`prepare` の出力もキャッシュに書くだけで `IN.mp4` を書き換えない）。`auto` が誤った判定で走っても、後から `cut` を直接叩き直すだけで直せる（`auto --analyze-only` が出す `cut` コマンド例を使う）
+2. **事後確認の手段がある**: `--cm-output` で CM 側を別ファイルに出せるため、`auto` が黙って本編を欠損させていないかを後から目視できる
+3. **機械可読な判定材料がある**: gate（#61）が `analyze` の成果物だけから「見逃し候補」「除去フレーム数0」を機械的に判定できるようになったため、「疑わしいときだけ人手を呼ぶ」を自動化できる
 
-注意: `analyze -o DIR/trim.avs --work-dir DIR` のように **`-o` と work_dir 内の `trim.avs` を同じパスにすると**、かつては `fs::copy(src, src)` で空ファイルになっていた（macOS で実測）。`analyze` 側で同一パスならコピーを省略するよう直してあるが、ラッパーは `final_trim.avs` / `user_trim.avs` に分けて書く。
+**`tachikaze auto`（#62）は gate（#61）のこの判定を使って人手を安全に外す。** 見逃し候補ヒューリスティックが効かない番組もあるため（`src/gate.rs`「見逃し候補ヒューリスティックの限界」）、gate が止めないことは検出が完全に当たっている保証ではない。対話しながら都度確認したい場合は従来どおり `analyze` → 目視 → `cut` を使う。
 
 ## パス解決
 
@@ -98,9 +95,9 @@ $ scripts/tachikaze-cmcut --cut-only --work-dir <work-root>/cmcut_xxx IN.mp4
 
 | 種類 | 中身 | 探索順・既定 |
 |---|---|---|
-| 実行ファイル | `tachikaze` / `tachikaze-cmcut` / `chapter_exe` / `join_logo_scp` / `dtvindex` | `--tool-dir` → `TACHIKAZE_TOOL_DIR` → 自分の実行ファイルの隣 → `PATH`（`src/tools.rs::resolve_tool`） |
+| 実行ファイル | `tachikaze` / `chapter_exe` / `join_logo_scp` / `dtvindex` | `--tool-dir` → `TACHIKAZE_TOOL_DIR` → 自分の実行ファイルの隣 → `PATH`（`src/tools.rs::resolve_tool`） |
 | 読み取り専用データ | JL コマンドファイル（既定 `JL_標準.txt`） | `TACHIKAZE_JL_DIR` → `${XDG_DATA_HOME:-~/.local/share}/tachikaze/JL/` → `$XDG_DATA_DIRS`（既定 `/usr/local/share:/usr/share`）各要素 + `join_logo_scp/JL/` → `<join_logo_scp の実体パス>/../share/join_logo_scp/JL/` → `<join_logo_scp と同じディレクトリ>/JL/`（`src/tools.rs::default_jl_command_file`） |
-| キャッシュ（再生成可能な中間物） | `work.mp4.dtvi` / `trim.avs` / `detail.jls` / `work.mp4`（入力への symlink） / `work.mp4.segmap.json`（`cut` が書く区間マップ、`src/segmap.rs`、#57） | `TACHIKAZE_CACHE_DIR` → `${XDG_CACHE_HOME:-~/.cache}/tachikaze/<入力ごと>/`（既定。削除せず、同じ入力を再実行すると再利用する。`src/workdir.rs`）。`cut --dtvi` 省略時もこの規則から `work.mp4.dtvi` を自動的に探す。`work.mp4.segmap.json` も同じ規則（`workdir::cached_segment_map_path`）で、`cut --segment-map PATH` で任意の場所にも書ける |
+| キャッシュ（再生成可能な中間物） | `work.mp4.dtvi` / `trim.avs` / `detail.jls` / `work.mp4`（入力への symlink） / `work.mp4.segmap.json`（`cut` が書く区間マップ、`src/segmap.rs`、#57） / `input_prepared.mp4`（`prepare` が elst 除去・字幕除去後に書く前処理済み入力、`src/prepare.rs`、#58） / `subs.ass`・`subs.srt`（`prepare` が mp4 内蔵字幕トラックから抽出した字幕サイドカー。`remap-subs` の入力） | `TACHIKAZE_CACHE_DIR` → `${XDG_CACHE_HOME:-~/.cache}/tachikaze/<入力ごと>/`（既定。削除せず、同じ入力を再実行すると再利用する。`src/workdir.rs`）。`cut --dtvi` 省略時もこの規則から `work.mp4.dtvi` を自動的に探す。`work.mp4.segmap.json` / `input_prepared.mp4` / `subs.*` も同じ規則（`workdir::cached_segment_map_path` / `workdir::prepared_input_path` / `workdir::subs_path`）で、`cut --segment-map PATH` で区間マップだけは任意の場所にも書ける |
 | 出力 | `*_CMcut.mp4` / `*_CM.mp4` / `*_CMcut.ass`・`*_CMcut.srt`（`remap-subs` の既定出力、`src/commands.rs::default_remap_subs_output_path`、#59） | 入力の隣（変更しない）。本編出力と同じ stem にすることでプレイヤーが自動で字幕を読み込める |
 
 `--tool-dir` / `--jl-file` / `--work-dir` / `--dtvi` を明示指定した場合は、いずれも上記の探索より最優先でそのまま使う。`analyze --no-keep-work` を指定すると、既定のキャッシュディレクトリではなく従来どおりの使い捨て一時ディレクトリ（成功時に削除）になる。
@@ -183,15 +180,18 @@ struct DecodeIdx(u32);    // デコード順（mp4 のサンプル番号 / .dtvi
 | `elst`（edit list）あり | `check_no_edit_list` | `moov.clone()` で引き継いだ `elst` の `segment_duration` がカット後のトラック長を超え、`media_time` が新しい先頭の正当なフレームを数フレーム分スキップする——「エラーは出ないが結果が壊れる」の実例を実験で確認済み。**回避策**: `ffmpeg -i IN.mp4 -c copy -use_editlist 0 -movflags +faststart OUT.mp4`（除去後の映像・音声パケットが CRC32 でビット一致することを確認済み。**ただしこれはペイロードのみの確認であり、A/V の相対タイムスタンプは対象外**。除去が A/V 相対時刻に与える影響の実測と方針は [measurements.md](measurements.md)「elst 除去と A/V 相対時刻」） |
 | `stsd` が複数エントリ | `check_single_stsd_entry` | `write.rs` が `sample_description_index: 1` 固定で `stsc` を再構築しているため。対応にはサンプルごとの index 保持（`read.rs` の `SampleInfo` と `write.rs` の両方の変更）が必要。無劣化 remux ではパラメータ差異という原因自体を解消できないので、事前除去の回避策は提示できない |
 | オープン GOP | `check_closed_gop` | 「S の同期サンプルからデコード順に `E - S` パケット取る」規則が成立しない。`.dtvi` の `leading_frame_count` で判定する（`.dtvi` が無い場合も判定不能として停止） |
-| 映像 2 本以上 / 音声 2 本以上 / 字幕などのトラックあり | `check_track_counts` | 映像 1 本 + 音声 1 本のみ対応 |
+| 映像 2 本以上 / 音声 2 本以上 | `check_track_counts` | 映像 1 本 + 音声 1 本のみ対応 |
+| 字幕などのトラックあり | `check_track_counts` | **トラックとしては未対応のまま**（`cut` に直接渡すと明示エラーで止まる）。`prepare`（#58）が `cut` へ渡す前に字幕トラックを ASS/SRT のサイドカーへ抽出し、mp4 側からは除去する（下記「コマンド構成」手順0、以下「方式A」）。字幕トラックをそのまま `cut` に持たせてサンプル単位でコピーする方式（「方式B」: トラックごとの区間選択、字幕のようにサンプルが疎なトラックの扱いが別途要る）は採らなかった。**理由**: (1) ARIB 字幕をデコードした一部のスタイル情報（色・位置などの装飾）は `mov_text` のようなプレーンテキスト中心の字幕コーデックに変換すると失われるため、トラックとして持たせても方式Bだけでは解決しない、(2) 方式Bは対応工数が方式Aより一桁大きい（トラックごとの区間選択とサンプルが疎なトラックの扱いを `mp4io` 全体に持ち込む必要がある）。サイドカー化した字幕の cut 後タイムラインへの追従は `remap-subs`（#59）が区間マップから計算する |
 
 ## 未解決事項
 
 | 項目 | 状況 |
 |---|---|
-| 複数音声トラック / 字幕トラック | **未対応**（上表のとおり明示エラー）。対応するならトラックごとの区間選択と、字幕のようにサンプルが疎なトラックの扱いを決める必要がある |
+| 複数音声トラック | **未対応**（上表のとおり明示エラー）。対応するならトラックごとの区間選択を実装する必要がある |
+| 字幕のトラック対応 | `cut` にトラックとして持たせる方式（方式B）は**未対応のまま**（上表「未対応の入力」参照）。`prepare` のサイドカー方式（方式A）で実用上の字幕保持は満たしているため、方式Bを実装する優先度は無い |
 | 継ぎ目の MDCT 過渡（クリックノイズ） | **許容する方針で決定済み。** 継ぎ目は残存 CM マージンの内側に来る（[lossless-cut.md](lossless-cut.md)） |
 | `--snap inward` と `--cm-output` の併用 | **拒否する。** inward では保持区間が退化（`end < start`）しうるため補集合の順序も壊れる |
+| キャッシュ鍵の弱さ | `${XDG_CACHE_HOME}/tachikaze/<入力ごと>/` のディレクトリ名は入力の**絶対パスのハッシュのみ**から決まる（`workdir::cache_dir_for_input`、FNV-1a）。同じパスに別内容のファイルが後から置かれても（録画ファイルの上書き・再利用）区別できず、古い `.dtvi` / `trim.avs` / `input_prepared.mp4` を新しい入力に対して誤って再利用しうる。`auto` は `analyze`/`prepare` を毎回作り直すことでこの穴を避けているが（`src/auto.rs` の doc comment）、`cut --dtvi` を省略してキャッシュから自動解決する経路には対策が無い。size + mtime の突き合わせなどの対策は、要求されていない現時点では追加しないと判断している（理由は `src/auto.rs` の doc comment参照） |
 
 ## 方針として作らないもの
 
