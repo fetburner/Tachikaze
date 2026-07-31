@@ -14,7 +14,9 @@ use crate::cli::{Cli, Commands};
 use crate::dtvi::Dtvi;
 use crate::mp4io::read::SampleInfo;
 use crate::order::{DecodeIdx, DisplayIdx, OrderMap};
-use crate::{analyze, audio, cli, dtvi, mp4io, plan, report, segmap, tools, trim, verify, workdir};
+use crate::{
+    analyze, audio, cli, dtvi, mp4io, plan, prepare, report, segmap, tools, trim, verify, workdir,
+};
 
 /// パース済みの CLI 引数を受け取り、対応するサブコマンドを実行する。
 pub fn run(cli: Cli) -> anyhow::Result<()> {
@@ -61,7 +63,35 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
             cm_output,
             segment_map,
         ),
+        Commands::Prepare { input, subs } => run_prepare(tool_dir, input, subs),
     }
+}
+
+/// `prepare` サブコマンドの実行。処理本体は [`prepare::run`] に集約してあり、
+/// ここでは結果を人間向けに表示するだけ。
+fn run_prepare(
+    tool_dir: Option<PathBuf>,
+    input: PathBuf,
+    subs: Option<PathBuf>,
+) -> anyhow::Result<()> {
+    let outcome = prepare::run(&input, tool_dir.as_deref(), subs.as_deref())?;
+
+    if outcome.ran_ffmpeg {
+        println!("prepare 完了: {}", outcome.media_path.display());
+        if outcome.had_edit_list {
+            println!("  edit list (elst) を除去しました。");
+        }
+    } else {
+        println!(
+            "prepare 不要: 入力をそのまま使えます: {}",
+            outcome.media_path.display()
+        );
+    }
+    if let Some(subtitle_path) = &outcome.subtitle_path {
+        println!("字幕: {}", subtitle_path.display());
+    }
+
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]

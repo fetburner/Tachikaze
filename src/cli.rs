@@ -86,6 +86,24 @@ pub enum Commands {
         #[arg(long = "segment-map")]
         segment_map: Option<PathBuf>,
     },
+    /// `cut` に渡す前に、elst(edit list) 除去と字幕抽出を1か所にまとめて行う。
+    ///
+    /// `cut` は elst 付き入力と字幕トラック付き入力を明示エラーで拒否する(#41)。
+    /// このコマンドは両方の回避策(ffmpeg での elst 除去、字幕トラックの
+    /// サイドカーへの抽出)を1回の ffmpeg 呼び出しにまとめて行う。出力は入力の
+    /// 隣ではなく、入力ごとの XDG キャッシュディレクトリに書く
+    /// (`docs/architecture.md`「パス解決」節と同じ規則)。
+    Prepare {
+        input: PathBuf,
+
+        /// mp4 内蔵の字幕トラックから抽出する代わりに、指定したファイルを
+        /// そのまま字幕サイドカーとして使う。元が ARIB 字幕由来の外部 `.ass`
+        /// はスタイル情報が mp4 内 `mov_text` より豊富な場合があるための
+        /// 差し替え口。指定時も、mp4 内蔵の字幕トラック自体の除去(elst 除去と
+        /// 同じ ffmpeg 呼び出し)は引き続き行う。
+        #[arg(long)]
+        subs: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]

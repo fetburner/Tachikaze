@@ -27,6 +27,8 @@ pub const JOIN_LOGO_SCP: &str = "join_logo_scp";
 pub const DTVINDEX: &str = "dtvindex";
 /// `ffprobe` の実行ファイル名（`--verify` でのみ必要）。
 pub const FFPROBE: &str = "ffprobe";
+/// `ffmpeg` の実行ファイル名（`prepare` の elst 除去・字幕抽出でのみ必要）。
+pub const FFMPEG: &str = "ffmpeg";
 
 /// 既定の JL コマンドファイル名（ファイル名自体が日本語）。
 pub const DEFAULT_JL_COMMAND_FILE: &str = "JL_標準.txt";
