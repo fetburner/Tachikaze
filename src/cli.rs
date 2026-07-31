@@ -88,7 +88,7 @@ pub enum Commands {
     },
     /// `cut` に渡す前に、elst(edit list) 除去と字幕抽出を1か所にまとめて行う。
     ///
-    /// `cut` は elst 付き入力と字幕トラック付き入力を明示エラーで拒否する(#41)。
+    /// `cut` は elst 付き入力と字幕トラック付き入力を明示エラーで拒否する。
     /// このコマンドは両方の回避策(ffmpeg での elst 除去、字幕トラックの
     /// サイドカーへの抽出)を1回の ffmpeg 呼び出しにまとめて行う。出力は入力の
     /// 隣ではなく、入力ごとの XDG キャッシュディレクトリに書く
@@ -105,7 +105,7 @@ pub enum Commands {
         subs: Option<PathBuf>,
     },
     /// 字幕サイドカー（ASS/SRT）のタイムスタンプを、`cut` が書いた区間マップ
-    /// （`--segment-map`、#57）で cut 後のタイムラインへ張り替える（#59）。
+    /// （`--segment-map`）で cut 後のタイムラインへ張り替える。
     ///
     /// 区間マップ・字幕はどちらもキャッシュから自動解決できる（`cut --dtvi` と
     /// 同じ規則）。区間マップは `workdir::cached_segment_map_path`、字幕は
@@ -131,8 +131,8 @@ pub enum Commands {
         #[arg(short, long)]
         output: Option<PathBuf>,
     },
-    /// `prepare`(#58) → `analyze` → gate 判定(#61) → `cut`(区間マップ込み、#57) →
-    /// `remap-subs`(#59) を対話なしで合成する（#62）。
+    /// `prepare` → `analyze` → gate 判定 → `cut`(区間マップ込み) → `remap-subs`
+    /// を対話なしで合成する。
     ///
     /// アルゴリズムは持たない（`analyze` / `cut` を複製せず呼ぶだけ）。対話プロンプトは
     /// 出さない: gate が疑わしいと判定したら cut を実行せず exit code 2 で停止し、
@@ -197,11 +197,9 @@ pub enum Commands {
         jls_set: Vec<String>,
 
         /// 中間ファイル（`.dtvi` / `trim.avs` / `detail.jls`）の置き場所。区間マップ
-        /// （`work.mp4.segmap.json`）は対象外: 常に入力ごとの既定キャッシュディレクトリ
-        /// （`workdir::cached_segment_map_path`）に書かれ、`--work-dir` の影響を
-        /// 受けない（`auto` は内部で `execute_cut` に `segment_map_path: None` を
-        /// 渡すため）。複数入力時は指定できない（各入力ごとの既定のキャッシュ
-        /// ディレクトリを使う）。
+        /// （`work.mp4.segmap.json`）は対象外で、常に入力ごとの既定キャッシュ
+        /// ディレクトリに書かれる。複数入力時は指定できない（各入力ごとの既定の
+        /// キャッシュディレクトリを使う）。
         #[arg(long)]
         work_dir: Option<PathBuf>,
     },
