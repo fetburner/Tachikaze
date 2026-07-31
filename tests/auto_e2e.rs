@@ -231,12 +231,12 @@ fn auto_completes_full_pipeline_with_fake_tools() {
     assert_eq!(
         video_frame_count(&out_path),
         FULL_SUCCESS_KEPT_PACKET_COUNT,
-        "本編の映像フレーム数は120+120=240のはず"
+        "本編の映像フレーム数は120のはず"
     );
     assert_eq!(
         video_frame_count(&cm_path),
         FULL_SUCCESS_CM_PACKET_COUNT,
-        "CM側の映像フレーム数は599-240=359のはず"
+        "CM側の映像フレーム数は599-120=479のはず"
     );
 
     let _ = std::fs::remove_dir_all(&tmp_dir);
@@ -363,9 +363,9 @@ fn run_auto(args: &[&str], cache_root: &Path) -> std::process::Output {
         .expect("tachikaze auto の起動に失敗した")
 }
 
-/// 完了条件: 複数入力時に `-o` を受け付けない（他の agentが並行して進めている
-/// `--cm-output` / `--work-dir` も同じ検証ロジックを通るので代表して1つだけ
-/// 個別のテストにする。3つとも `src/auto.rs` の単体テストで網羅済み）。
+/// 完了条件: 複数入力時に `-o` を受け付けない（`--cm-output` / `--work-dir` も
+/// 同じ検証ロジックを通るので代表して1つだけ個別のテストにする。3つとも
+/// `src/auto.rs` の単体テストで網羅済み）。
 #[test]
 fn auto_rejects_multiple_inputs_with_explicit_output() {
     let tmp_dir = make_tmp_dir("reject-multi-output");

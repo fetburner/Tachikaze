@@ -294,8 +294,9 @@ fn cache_root() -> PathBuf {
 /// キャッシュディレクトリ名に使う stem を安全化する。
 ///
 /// 空白・`/`・制御文字は `_` に置き換える。日本語などマルチバイト文字は
-/// そのまま残す。`scripts/tachikaze-cmcut` の `safe_stem` と同じ役割だが、
-/// こちらを正とする（シェル側はこの規則に合わせる）。
+/// そのまま残す。かつて存在したシェルラッパー `scripts/tachikaze-cmcut`
+/// （`auto` の追加に伴い削除済み、`[E11-7]`）にも同名の `safe_stem` があり、
+/// この関数と同じ規則（空白・`/`・制御文字を `_` に置換）を実装していた。
 fn sanitize_stem(stem: &str) -> String {
     stem.chars()
         .map(|c| {

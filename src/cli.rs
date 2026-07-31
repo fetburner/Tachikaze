@@ -5,8 +5,8 @@ use clap::{Parser, Subcommand, ValueEnum};
 #[derive(Debug, Parser)]
 #[command(name = "tachikaze")]
 pub struct Cli {
-    /// 外部ツール（chapter_exe / join_logo_scp / dtvindex / ffprobe）を探す
-    /// ディレクトリ。指定すると他の探索方法より優先される。
+    /// 外部ツール（chapter_exe / join_logo_scp / dtvindex / ffmpeg / ffprobe）を
+    /// 探すディレクトリ。指定すると他の探索方法より優先される。
     #[arg(long, global = true)]
     pub tool_dir: Option<PathBuf>,
 
@@ -196,8 +196,12 @@ pub enum Commands {
         #[arg(long = "jls-set")]
         jls_set: Vec<String>,
 
-        /// 中間ファイル（`.dtvi` / `trim.avs` / `detail.jls` / 区間マップ）の置き場所。
-        /// 複数入力時は指定できない（各入力ごとの既定のキャッシュディレクトリを使う）。
+        /// 中間ファイル（`.dtvi` / `trim.avs` / `detail.jls`）の置き場所。区間マップ
+        /// （`work.mp4.segmap.json`）は対象外: 常に入力ごとの既定キャッシュディレクトリ
+        /// （`workdir::cached_segment_map_path`）に書かれ、`--work-dir` の影響を
+        /// 受けない（`auto` は内部で `execute_cut` に `segment_map_path: None` を
+        /// 渡すため）。複数入力時は指定できない（各入力ごとの既定のキャッシュ
+        /// ディレクトリを使う）。
         #[arg(long)]
         work_dir: Option<PathBuf>,
     },

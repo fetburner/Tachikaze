@@ -18,9 +18,10 @@
 //! - **cut**: `cut` の実体（`CutPipeline` の組み立て、`--cm-output` 時の自己検証8・
 //!   atomic rename、区間マップの書き出し）は `src/commands.rs` の `execute_cut` に
 //!   ある。ここを複製すると `cut` 単体のバグ修正が `auto` に伝播しなくなる
-//!   （このエピックが `scripts/tachikaze-cmcut` を消す理由そのもの、CLAUDE.md
-//!   「罠」参照）。そのため `commands::execute_cut` を `pub(crate)` にして
-//!   そのまま呼ぶ（`commands.rs` の doc comment参照）。
+//!   （これが、ロジックを複製していたシェルラッパー `scripts/tachikaze-cmcut` を
+//!   このエピックで削除した理由そのもの、CLAUDE.md「罠」参照）。そのため
+//!   `commands::execute_cut` を `pub(crate)` にしてそのまま呼ぶ（`commands.rs`
+//!   の doc comment参照）。
 //!
 //! ## キャッシュを短絡しない
 //!
@@ -52,13 +53,29 @@
 //! その入力の処理全体をスキップする（バッチの再実行で成果物を黙って
 //! 潰さないため）。判定は実処理（`prepare`/`analyze`/`cut`)を始める前に行うため、
 //! 800MB 級の重い処理を無駄に行わない。
+//!
+//! **例外: 字幕が必要なのに欠けている場合はスキップしない（レビュー指摘#2）。**
+//! `remap_subtitles` は `cut` が本編・CM側を最終パスへ rename した**後**に走る
+//! ため、字幕の張り替えに失敗すると本編/CM側だけが最終パスに残った状態で
+//! この入力全体が失敗扱いになる（字幕を黙って落とさないための意図的な仕様、
+//! 下記「字幕の張り替えと失敗時の扱い」参照）。この状態で次回バッチを
+//! 再実行すると、上記の素朴な判定では「本編がある」だけでスキップと判定されて
+//! しまい、**字幕が永久に欠落したまま「完了」扱いになる**（実処理を始める前の
+//! ファイル存在チェックだけを見ているため、前回が完走したのか途中で
+//! 失敗したのかを区別できない）。これを防ぐため、[`input_has_subtitle_track`]
+//! で入力の `moov` を軽量に読み（`prepare::run` は呼ばず、ffmpeg も起動しない）
+//! 字幕トラックの有無を判定し、「字幕が必要なのに字幕サイドカー出力が無い」場合は
+//! 他の出力が揃っていてもスキップせず、パイプライン全体
+//! （prepare/analyze/cut/remap-subs）を再実行する。`prepare`/`cut` は同じ入力に
+//! 対して常に同じ出力を作る設計（`prepare.rs`/`workdir.rs` の doc comment）なので、
+//! 本編・CM側の再生成は無駄ではあるが安全（内容は変わらない）。
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context};
 
-use crate::{analyze, cli, commands, gate, prepare, report, segmap, subtitle, workdir};
+use crate::{analyze, cli, commands, gate, mp4io, prepare, report, segmap, subtitle, workdir};
 
 /// `auto` サブコマンドの設定（`src/cli.rs::Commands::Auto` の CLI 引数と1対1）。
 #[derive(Debug, Clone)]
@@ -222,15 +239,31 @@ fn process_one(
             existing.push(cm.clone());
         }
     }
-    if !config.no_subtitles {
-        for ext in ["ass", "srt"] {
-            let candidate = commands::default_remap_subs_output_path(input, ext);
-            if candidate.is_file() {
-                existing.push(candidate);
-            }
-        }
-    }
-    if !existing.is_empty() && !config.overwrite {
+    let subs_existing: Vec<PathBuf> = if config.no_subtitles {
+        Vec::new()
+    } else {
+        ["ass", "srt"]
+            .into_iter()
+            .map(|ext| commands::default_remap_subs_output_path(input, ext))
+            .filter(|p| p.is_file())
+            .collect()
+    };
+    existing.extend(subs_existing.iter().cloned());
+
+    // 「字幕が必要なのに字幕サイドカー出力が無い」場合は、他の出力(本編/CM側)が
+    // 揃っていてもスキップしない（本モジュール冒頭 doc comment「既存出力のスキップと
+    // --overwrite」の例外、レビュー指摘#2）。前回 remap-subs が失敗して本編/CM側だけ
+    // 残った状態を、次回バッチ再実行で自動的に再試行できるようにするため。
+    let subs_missing_but_expected =
+        !config.no_subtitles && subs_existing.is_empty() && input_has_subtitle_track(input);
+
+    if subs_missing_but_expected {
+        println!(
+            "[auto] 本編/CM側の出力はありますが、字幕サイドカーが見つかりません\
+             （前回 remap-subs が失敗した可能性があります）。スキップせず再試行します: {}",
+            input.display()
+        );
+    } else if !existing.is_empty() && !config.overwrite {
         println!(
             "[auto] 既存の出力があるためスキップします（--overwrite で上書き）: {}",
             existing
@@ -388,8 +421,21 @@ fn process_one(
     if config.no_subtitles {
         println!("[auto] --no-subtitles のため字幕の張り替えは行いません。");
     } else if let Some(subs_input) = &prepare_outcome.subtitle_path {
-        remap_subtitles(&media_path, subs_input, input)
-            .with_context(|| format!("字幕の張り替えに失敗しました: {}", input.display()))?;
+        if let Err(err) = remap_subtitles(&media_path, subs_input, input) {
+            // 本編/CM側は既に最終パスへ rename 済み（失敗しても削除しない、
+            // モジュール冒頭 doc comment参照）。この入力は従来どおり失敗扱いに
+            // するが（issue #62「やること」7: 本編だけ出して字幕を黙って落とさない）、
+            // 次回バッチ実行時に何が起きるかを明示する（レビュー指摘#2）。
+            eprintln!(
+                "[auto] 警告: 本編{}の出力は完了していますが、字幕の張り替えに失敗しました。\
+                 字幕サイドカーが未作成のため、次回このバッチを（--overwrite なしでも）\
+                 再実行すると自動的に再試行します: {}",
+                if cm_out_path.is_some() { "/CM側" } else { "" },
+                input.display()
+            );
+            return Err(err)
+                .with_context(|| format!("字幕の張り替えに失敗しました: {}", input.display()));
+        }
     } else {
         println!("[auto] 字幕トラックが無いため remap-subs は行いません。");
     }
@@ -482,9 +528,23 @@ fn remap_subtitles(
     Ok(())
 }
 
+/// 入力 mp4 に字幕トラックがあるかどうかを、`prepare::run` を呼ばず（＝ffmpeg を
+/// 起動せず）軽量に判定する。`moov` を読むだけなので800MB級の入力でも安い
+/// （既存出力のスキップ判定「字幕が必要なのに無い」の検出に使う。本モジュール
+/// 冒頭の doc comment「既存出力のスキップと --overwrite」参照）。入力が読めない
+/// 場合は `false` を返す（どのみち後続の `prepare::run` が同じ入力に対して同じ
+/// エラーで失敗するため、ここでエラーの経路を増やす必要が無い）。
+fn input_has_subtitle_track(input: &Path) -> bool {
+    match mp4io::read::read_moov(input) {
+        Ok(moov) => prepare::inspect_moov(&moov).subtitle.is_some(),
+        Err(_) => false,
+    }
+}
+
 /// `input` の隣に `<stem><suffix>.<ext>` という名前のパスを作る
-/// （`*_CMcut.mp4` / `*_CM.mp4` の既定命名規則、`scripts/tachikaze-cmcut` の
-/// `default_out_path` / `default_cm_path` と同じ規則）。
+/// （`*_CMcut.mp4` / `*_CM.mp4` の既定命名規則。かつて存在したシェルラッパー
+/// `scripts/tachikaze-cmcut` の `default_out_path` / `default_cm_path` も
+/// 同じ規則だった。`auto` の追加に伴い削除済み、`[E11-7]`）。
 fn sibling_output_path(input: &Path, suffix: &str, ext: &str) -> PathBuf {
     let dir = input.parent().map(Path::to_path_buf).unwrap_or_default();
     let stem = input
@@ -530,6 +590,16 @@ fn log_file_size(label: &str, path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn input_has_subtitle_track_returns_false_for_unreadable_input() {
+        // mp4 として読めない(そもそも存在しない)入力は false を返す
+        // (後続の prepare::run が同じ理由で失敗するため、ここでは判定不能を
+        // false として扱う。本関数の doc comment参照)。
+        assert!(!input_has_subtitle_track(Path::new(
+            "/nonexistent-for-auto-test.mp4"
+        )));
+    }
 
     #[test]
     fn sibling_output_path_uses_stem_and_suffix() {
