@@ -15,8 +15,8 @@ use crate::dtvi::Dtvi;
 use crate::mp4io::read::SampleInfo;
 use crate::order::{DecodeIdx, DisplayIdx, OrderMap};
 use crate::{
-    analyze, audio, cli, dtvi, gate, mp4io, plan, prepare, report, segmap, tools, trim, verify,
-    workdir,
+    analyze, audio, cli, dtvi, gate, mp4io, plan, prepare, report, segmap, subtitle, tools, trim,
+    verify, workdir,
 };
 
 /// パース済みの CLI 引数を受け取り、対応するサブコマンドを実行する。
@@ -65,6 +65,12 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
             segment_map,
         ),
         Commands::Prepare { input, subs } => run_prepare(tool_dir, input, subs),
+        Commands::RemapSubs {
+            input,
+            segment_map,
+            subs,
+            output,
+        } => run_remap_subs(input, segment_map, subs, output),
     }
 }
 
@@ -93,6 +99,149 @@ fn run_prepare(
     }
 
     Ok(())
+}
+
+/// `remap-subs` サブコマンドの実行。区間マップ・字幕サイドカーを解決し、
+/// [`subtitle::remap_ass`] / [`subtitle::remap_srt`] に処理を委ね、結果を書き出して
+/// 件数を報告する。処理そのもの（分類・時刻変換）は `subtitle` モジュールに集約して
+/// あり、ここでは配線とログ出力だけを行う（`commands.rs` はアルゴリズムを持たない
+/// 方針、本ファイル冒頭の doc comment参照）。
+fn run_remap_subs(
+    input: PathBuf,
+    segment_map_path: Option<PathBuf>,
+    subs_path_arg: Option<PathBuf>,
+    output: Option<PathBuf>,
+) -> anyhow::Result<()> {
+    let segment_map_path = resolve_segment_map_path(segment_map_path, &input)?;
+    let segment_map_json = fs::read_to_string(&segment_map_path).with_context(|| {
+        format!(
+            "区間マップの読み込みに失敗しました: {}",
+            segment_map_path.display()
+        )
+    })?;
+    let segment_map = segmap::SegmentMap::from_json(&segment_map_json)
+        .map_err(|err| anyhow!("区間マップのパースに失敗しました: {err}"))?;
+
+    let (subs_input_path, format) = resolve_subs_path(subs_path_arg, &input)?;
+    let subs_content = fs::read_to_string(&subs_input_path).with_context(|| {
+        format!(
+            "字幕サイドカーの読み込みに失敗しました: {}",
+            subs_input_path.display()
+        )
+    })?;
+
+    let remap_output = match format {
+        subtitle::SubsFormat::Ass => subtitle::remap_ass(
+            &subs_content,
+            &segment_map.segments,
+            segment_map.video_timescale,
+        ),
+        subtitle::SubsFormat::Srt => subtitle::remap_srt(
+            &subs_content,
+            &segment_map.segments,
+            segment_map.video_timescale,
+        ),
+    }
+    .map_err(|err| anyhow!("字幕の張り替えに失敗しました: {err}"))?;
+
+    let output =
+        output.unwrap_or_else(|| default_remap_subs_output_path(&input, format.extension()));
+    fs::write(&output, &remap_output.content)
+        .with_context(|| format!("字幕の書き出しに失敗しました: {}", output.display()))?;
+
+    let stats = &remap_output.stats;
+    println!(
+        "remap-subs 完了: {}（シフト {} 件 / 破棄 {} 件 / クリップ {} 件）",
+        output.display(),
+        stats.shifted,
+        stats.discarded,
+        stats.clipped
+    );
+    if stats.shifted == 0 && stats.clipped == 0 && stats.discarded > 0 {
+        eprintln!(
+            "[remap-subs] 字幕イベントがすべて除去区間(CM)に含まれていたため、出力は\
+             空です: {}",
+            output.display()
+        );
+    }
+    for warning in &stats.warnings {
+        eprintln!("[remap-subs] {warning}");
+    }
+
+    Ok(())
+}
+
+/// `--segment-map` を解決する。[`resolve_dtvi_path`] と同じ方針（明示優先、
+/// 未指定ならキャッシュ、どちらにも無ければ生成コマンド例を添えて停止）。
+fn resolve_segment_map_path(explicit: Option<PathBuf>, input: &Path) -> anyhow::Result<PathBuf> {
+    if let Some(path) = explicit {
+        return Ok(path);
+    }
+
+    let cached = workdir::cached_segment_map_path(input)
+        .with_context(|| format!("区間マップの自動解決に失敗しました: {}", input.display()))?;
+    if cached.is_file() {
+        return Ok(cached);
+    }
+
+    bail!(
+        "--segment-map が指定されておらず、キャッシュにも区間マップが見つかりませんでした: {}\n\
+         先に次を実行してください:\n  \
+         tachikaze cut {} --trim trim.avs -o OUT.mp4",
+        cached.display(),
+        input.display()
+    );
+}
+
+/// `--subs` を解決する。明示されていればその拡張子から形式を判定する。未指定なら
+/// `prepare` が書くキャッシュ（`workdir::subs_path`）を `ass` → `srt` の順に探す
+/// （issue #59 「やること」1）。
+fn resolve_subs_path(
+    explicit: Option<PathBuf>,
+    input: &Path,
+) -> anyhow::Result<(PathBuf, subtitle::SubsFormat)> {
+    if let Some(path) = explicit {
+        let format = subtitle::SubsFormat::from_path(&path).ok_or_else(|| {
+            anyhow!(
+                "字幕ファイルの拡張子から形式を判定できません(ass/ssa/srtのみ対応): {}",
+                path.display()
+            )
+        })?;
+        return Ok((path, format));
+    }
+
+    for format in [subtitle::SubsFormat::Ass, subtitle::SubsFormat::Srt] {
+        let candidate = workdir::subs_path(input, format.extension()).with_context(|| {
+            format!(
+                "字幕サイドカーのキャッシュパスの解決に失敗しました: {}",
+                input.display()
+            )
+        })?;
+        if candidate.is_file() {
+            return Ok((candidate, format));
+        }
+    }
+
+    bail!(
+        "--subs が指定されておらず、キャッシュにも字幕サイドカー(ass/srt)が見つかりませんでした。\n\
+         先に次を実行するか、--subs PATH で明示してください:\n  \
+         tachikaze prepare {}",
+        input.display()
+    );
+}
+
+/// `-o` 省略時の出力先。`cut` の既定の出力名 `*_CMcut.mp4`
+/// （`scripts/tachikaze-cmcut` の `build_output_path` と同じ規則）と同じ stem に
+/// することで、多くのプレイヤーが同名の字幕サイドカーを自動的に読み込める形にする
+/// （issue #59「やること」5）。出力は入力の隣に置く（`docs/architecture.md`
+/// 「パス解決」節の「出力」分類と同じ扱い。キャッシュではなく成果物）。
+fn default_remap_subs_output_path(input: &Path, extension: &str) -> PathBuf {
+    let dir = input.parent().map(Path::to_path_buf).unwrap_or_default();
+    let stem = input
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("output");
+    dir.join(format!("{stem}_CMcut.{extension}"))
 }
 
 #[allow(clippy::too_many_arguments)]
