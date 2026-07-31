@@ -6,8 +6,10 @@
 //! 800 MB 級のファイルでもコピーは発生しない。
 //!
 //! 中間ファイルの名前（`work.mp4` / `work.mp4.dtvi` / `scp.txt` / `trim.avs` /
-//! `detail.jls`）はこのモジュールに集約し、他のモジュールは `WorkDir` の
-//! アクセサ経由でのみパスを得る。
+//! `detail.jls` / `work.mp4.segmap.json`）はこのモジュールに集約し、他のモジュールは
+//! `WorkDir` のアクセサ、または `cut` 専用の [`cached_segment_map_path`]（`.dtvi` の
+//! [`cached_dtvi_path`] と同じ理由。`cut` は `WorkDir` を作らないため）経由でのみ
+//! パスを得る。
 //!
 //! 中間ファイル（`.dtvi` / `trim.avs` / `detail.jls`）はいずれも `analyze` を
 //! 再実行すれば作り直せる**キャッシュ**であり、XDG のキャッシュディレクトリの
@@ -31,6 +33,7 @@ const DTVI_FILE_NAME: &str = "work.mp4.dtvi";
 const SCP_FILE_NAME: &str = "scp.txt";
 const TRIM_FILE_NAME: &str = "trim.avs";
 const DETAIL_JLS_FILE_NAME: &str = "detail.jls";
+const SEGMENT_MAP_FILE_NAME: &str = "work.mp4.segmap.json";
 
 /// キャッシュディレクトリ名に使う stem の長さ上限（文字数）。
 const SAFE_STEM_MAX_CHARS: usize = 80;
@@ -346,6 +349,16 @@ fn cache_dir_for_input(input: &Path) -> Result<PathBuf> {
 /// けないため、呼び出し側で明示的に判断させる）。
 pub fn cached_dtvi_path(input: &Path) -> Result<PathBuf> {
     Ok(cache_dir_for_input(input)?.join(DTVI_FILE_NAME))
+}
+
+/// `cut` が既定で書き出す区間マップ（`work.mp4.segmap.json`）のキャッシュパスを返す。
+///
+/// [`cached_dtvi_path`] と同じ理由で [`cache_dir_for_input`] 1か所に集約する（`cut` は
+/// `.dtvi` と同じ入力ごとのキャッシュディレクトリへ区間マップを書くため、パス規則が
+/// ずれると無関係な入力のマップを指しうる）。ディレクトリの作成は行わない
+/// （書き込み側で必要なら作る）。
+pub fn cached_segment_map_path(input: &Path) -> Result<PathBuf> {
+    Ok(cache_dir_for_input(input)?.join(SEGMENT_MAP_FILE_NAME))
 }
 
 /// `TACHIKAZE_CACHE_DIR` を書き換えるテストで共有する仕組み。
@@ -703,6 +716,35 @@ mod tests {
         let long_stem = "a".repeat(SAFE_STEM_MAX_CHARS + 20);
         let sanitized = sanitize_stem(&long_stem);
         assert_eq!(sanitized.chars().count(), SAFE_STEM_MAX_CHARS);
+    }
+
+    #[test]
+    fn cached_segment_map_path_uses_expected_file_name_and_cache_dir() {
+        let _env_guard = ENV_LOCK.lock().unwrap();
+        let cache_root = make_scratch_dir("cache-root-segmap");
+        let _cache_env = EnvVarGuard::set("TACHIKAZE_CACHE_DIR", &cache_root);
+
+        let input_dir = make_scratch_dir("segmap-input");
+        let input_path = input_dir.join("IN.mp4");
+        fs::write(&input_path, b"dummy mp4 content").expect("write input");
+
+        let segmap_path =
+            cached_segment_map_path(&input_path).expect("compute cached segment map path");
+        let dtvi_path = cached_dtvi_path(&input_path).expect("compute cached dtvi path");
+
+        assert_eq!(
+            segmap_path.file_name().unwrap(),
+            SEGMENT_MAP_FILE_NAME,
+            "ファイル名は work.mp4.segmap.json のはず"
+        );
+        assert_eq!(
+            segmap_path.parent(),
+            dtvi_path.parent(),
+            ".dtvi と同じ入力ごとのキャッシュディレクトリを指すはず"
+        );
+
+        fs::remove_dir_all(&input_dir).ok();
+        fs::remove_dir_all(&cache_root).ok();
     }
 
     #[test]

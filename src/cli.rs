@@ -77,6 +77,14 @@ pub enum Commands {
         /// 出す」節）。`--snap inward` とは併用できない（保持区間が退化しうるため）。
         #[arg(long = "cm-output")]
         cm_output: Option<PathBuf>,
+
+        /// 区間マップ（snap 後の境界と出力タイムライン上の開始時刻。字幕やチャプターを
+        /// cut 後のタイムラインに合わせるための中間データ）を、指定したパスにも書き出す。
+        /// 既定でも入力ごとのキャッシュ（`work.mp4.segmap.json`）に書かれるため、この
+        /// オプションは「任意の場所にも欲しい」場合に使う。`--cm-output` 指定時は保持側
+        /// のマップだけを対象にする（CM 側は検出確認用で、字幕を付ける対象ではない）。
+        #[arg(long = "segment-map")]
+        segment_map: Option<PathBuf>,
     },
 }
 

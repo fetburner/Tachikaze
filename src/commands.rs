@@ -14,7 +14,7 @@ use crate::cli::{Cli, Commands};
 use crate::dtvi::Dtvi;
 use crate::mp4io::read::SampleInfo;
 use crate::order::{DecodeIdx, DisplayIdx, OrderMap};
-use crate::{analyze, audio, cli, dtvi, mp4io, plan, report, tools, trim, verify, workdir};
+use crate::{analyze, audio, cli, dtvi, mp4io, plan, report, segmap, tools, trim, verify, workdir};
 
 /// パース済みの CLI 引数を受け取り、対応するサブコマンドを実行する。
 pub fn run(cli: Cli) -> anyhow::Result<()> {
@@ -48,8 +48,18 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
             verify,
             dtvi,
             cm_output,
+            segment_map,
         } => run_cut(
-            tool_dir, input, trim, output, snap, video_only, verify, dtvi, cm_output,
+            tool_dir,
+            input,
+            trim,
+            output,
+            snap,
+            video_only,
+            verify,
+            dtvi,
+            cm_output,
+            segment_map,
         ),
     }
 }
@@ -132,6 +142,7 @@ fn run_cut(
     verify_with_ffprobe: bool,
     dtvi_path: Option<PathBuf>,
     cm_output: Option<PathBuf>,
+    segment_map_path: Option<PathBuf>,
 ) -> anyhow::Result<()> {
     // `--snap inward` は保持区間を退化させうる（終端が開始より前になる）。その場合
     // 「保持区間の補集合をそのまま区間リストとして使える」という complement_ranges の
@@ -219,8 +230,20 @@ fn run_cut(
 
     match cm_output {
         None => {
-            let report = pipeline.run(&snapped, &video_keep, &output)?;
-            print_cut_report("cut 完了", "保持区間数", &output, &report);
+            let run_output = pipeline.run(&snapped, &video_keep, &output)?;
+            print_cut_report("cut 完了", "保持区間数", &output, &run_output.report);
+            if let Some(dtvi) = dtvi_data.as_ref() {
+                write_segment_map(
+                    &input,
+                    &snapped,
+                    &run_output.video_segment_durations,
+                    &run_output.video_segment_source_starts,
+                    video_info.timescale,
+                    dtvi,
+                    total_frames,
+                    segment_map_path.as_deref(),
+                );
+            }
         }
         Some(cm_output) => {
             let complement = plan::complement_ranges(&snapped, total_frames);
@@ -241,14 +264,13 @@ fn run_cut(
             let tmp_output = sibling_pending_path(&output);
             let tmp_cm_output = sibling_pending_path(&cm_output);
 
-            let write_result =
-                (|| -> anyhow::Result<(verify::VerifyReport, verify::VerifyReport)> {
-                    let report = pipeline.run(&snapped, &video_keep, &tmp_output)?;
-                    let cm_report = pipeline.run(&complement, &cm_keep, &tmp_cm_output)?;
-                    Ok((report, cm_report))
-                })();
+            let write_result = (|| -> anyhow::Result<(CutRunOutput, CutRunOutput)> {
+                let run_output = pipeline.run(&snapped, &video_keep, &tmp_output)?;
+                let cm_run_output = pipeline.run(&complement, &cm_keep, &tmp_cm_output)?;
+                Ok((run_output, cm_run_output))
+            })();
 
-            let (report, cm_report) = match write_result {
+            let (run_output, cm_run_output) = match write_result {
                 Ok(v) => v,
                 Err(err) => {
                     let _ = fs::remove_file(&tmp_output);
@@ -272,8 +294,24 @@ fn run_cut(
                 )
             })?;
 
-            print_cut_report("cut 完了", "保持区間数", &output, &report);
-            print_cut_report("CM 出力完了", "CM区間数", &cm_output, &cm_report);
+            print_cut_report("cut 完了", "保持区間数", &output, &run_output.report);
+            print_cut_report("CM 出力完了", "CM区間数", &cm_output, &cm_run_output.report);
+
+            // 区間マップは保持側だけ出す（CM側は検出確認用で、字幕を付ける対象ではない。
+            // issue #57「やること」6）。両方の rename が終わった後（＝自己検証を通って
+            // 最終出力へ rename できた後）にだけ書く。
+            if let Some(dtvi) = dtvi_data.as_ref() {
+                write_segment_map(
+                    &input,
+                    &snapped,
+                    &run_output.video_segment_durations,
+                    &run_output.video_segment_source_starts,
+                    video_info.timescale,
+                    dtvi,
+                    total_frames,
+                    segment_map_path.as_deref(),
+                );
+            }
         }
     }
 
@@ -343,7 +381,7 @@ impl CutPipeline<'_> {
         snapped: &[plan::SnappedRange],
         video_keep: &[DecodeIdx],
         output: &Path,
-    ) -> anyhow::Result<verify::VerifyReport> {
+    ) -> anyhow::Result<CutRunOutput> {
         let video_segment_durations =
             segment_video_durations(snapped, video_keep, self.video_samples);
         let video_segment_source_starts =
@@ -374,7 +412,7 @@ impl CutPipeline<'_> {
             _ => None,
         };
 
-        if self.verify_with_ffprobe {
+        let report = if self.verify_with_ffprobe {
             let ffprobe_path = tools::resolve_tool(self.tool_dir.as_deref(), tools::FFPROBE)?;
             verify::cut_verify_and_ffprobe_check(
                 self.input,
@@ -404,8 +442,33 @@ impl CutPipeline<'_> {
                 self.dtvi_data,
                 audio_diff_inputs,
             )
-        }
+        }?;
+
+        Ok(CutRunOutput {
+            report,
+            video_segment_durations,
+            video_segment_source_starts,
+        })
     }
+}
+
+/// [`CutPipeline::run`] の戻り値。自己検証を通り、`output` へ書き出し済みの
+/// [`verify::VerifyReport`] に加えて、その書き出しで使った区間ごとの情報
+/// （出力の長さ・ソース上の開始 DTS）も一緒に返す。
+///
+/// この2つは元々 `run` の内部でだけ計算していた値だが、区間マップ（`segmap.rs`、
+/// issue #57）を書くには snap 後の値そのもの（`trim.avs` から再計算した値ではない）
+/// が要る。ここで一緒に返すことで、`run_cut` 側で同じ計算をやり直さずに済む
+/// （計算が2箇所に分かれて食い違うリスクを避ける）。
+struct CutRunOutput {
+    report: verify::VerifyReport,
+    /// 区間ごとの出力側の長さ（映像 timescale 単位）。`segment_video_durations` の
+    /// 戻り値そのもの。
+    video_segment_durations: Vec<u64>,
+    /// 区間ごとの、ソース上の絶対開始 DTS（映像 timescale 単位）。
+    /// `segment_video_source_starts` の戻り値そのもの（PTS ではなく DTS。理由は
+    /// 同関数の doc comment 参照）。
+    video_segment_source_starts: Vec<u64>,
 }
 
 /// 自己検証8（docs/architecture.md「自己検証」節）: `--cm-output` 指定時、保持側とCM側で
@@ -476,6 +539,79 @@ fn print_cut_report(label: &str, range_label: &str, output: &Path, report: &veri
     if let Some(av_sync) = &report.av_sync {
         println!("{}", audio::format_av_sync_report(av_sync));
     }
+}
+
+/// cut が自己検証を通り、最終出力へ rename し終えた**後**に、保持側の区間マップ
+/// （`segmap.rs`、issue #57）を書き出す。
+///
+/// マップは analyze の中間物（`.dtvi` / `trim.avs` / `detail.jls`）と同じ分類の
+/// 再生成できるキャッシュ（docs/architecture.md「パス解決」節）。書き込みに失敗しても
+/// 既に検証済みの mp4（呼び出し元で既に rename 済み）を破棄する理由にはしないため、
+/// ここでは `anyhow::Result` を返さず、失敗時は警告を出すだけにする（次にここを触る
+/// 人へ: `.ok()` で握りつぶさず、警告だけは必ず出すこと）。
+#[allow(clippy::too_many_arguments)]
+fn write_segment_map(
+    input: &Path,
+    snapped: &[plan::SnappedRange],
+    video_segment_durations: &[u64],
+    video_segment_source_starts: &[u64],
+    video_timescale: u32,
+    dtvi: &Dtvi,
+    total_frames: u32,
+    explicit_path: Option<&Path>,
+) {
+    let (frame_rate_num, frame_rate_den) = frame_rate_num_den_from_dtvi(dtvi);
+    let canonical_input = fs::canonicalize(input).unwrap_or_else(|_| input.to_path_buf());
+
+    let map = segmap::SegmentMap::build(
+        snapped,
+        video_segment_source_starts,
+        video_segment_durations,
+        video_timescale,
+        frame_rate_num,
+        frame_rate_den,
+        canonical_input,
+        total_frames,
+    );
+
+    match workdir::cached_segment_map_path(input) {
+        Ok(path) => {
+            if let Err(err) = map.write_to_file(&path) {
+                eprintln!(
+                    "[segmap] キャッシュへの区間マップの書き出しに失敗しました: {} ({err})",
+                    path.display()
+                );
+            }
+        }
+        Err(err) => {
+            eprintln!("[segmap] 区間マップのキャッシュパス解決に失敗しました: {err}");
+        }
+    }
+
+    if let Some(explicit) = explicit_path {
+        if let Err(err) = map.write_to_file(explicit) {
+            eprintln!(
+                "[segmap] {} への区間マップの書き出しに失敗しました: {err}",
+                explicit.display()
+            );
+        }
+    }
+}
+
+/// `.dtvi` ヘッダから `frame_rate_num` / `frame_rate_den` を読む。[`fps_from_dtvi`] と
+/// 同じ既定値（キーが無い、または数値としてパースできない場合は対象素材の実測値
+/// 30000/1001）を使うが、区間マップのヘッダにはヘッダの浮動小数点値ではなく生の
+/// 分数（num/den）をそのまま残す。
+fn frame_rate_num_den_from_dtvi(dtvi: &Dtvi) -> (u32, u32) {
+    let parse = |key: &str, default: u32| {
+        dtvi.header_value(key)
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .unwrap_or(default)
+    };
+    (
+        parse("frame_rate_num", 30000),
+        parse("frame_rate_den", 1001),
+    )
 }
 
 #[derive(Clone, Copy)]
@@ -675,5 +811,78 @@ mod tests {
 
         fs::remove_dir_all(&input_dir).ok();
         fs::remove_dir_all(&cache_root).ok();
+    }
+
+    /// CLAUDE.md の罠4: `segment_video_source_starts`（区間マップの `source_start_dts`
+    /// の元データ）は合成時刻（PTS 相当、`dts + cts_offset`）ではなく DTS を返す
+    /// ことを、`cts_offset` を持つ合成データで固定する。
+    ///
+    /// `mp4io::order_map.rs` の `decode_timestamp_matches_build_derivation` と同じ
+    /// 合成データ（duration 一律1000、`cts_offset` で表示順を入れ替える）を使う。
+    #[test]
+    fn segment_video_source_starts_returns_dts_not_composition_time() {
+        let video_samples = vec![
+            SampleInfo {
+                file_offset: 0,
+                size: 10,
+                duration: 1000,
+                cts_offset: 0,
+                is_sync: true,
+            },
+            SampleInfo {
+                file_offset: 10,
+                size: 10,
+                duration: 1000,
+                cts_offset: 3000,
+                is_sync: false,
+            },
+            SampleInfo {
+                file_offset: 20,
+                size: 10,
+                duration: 1000,
+                cts_offset: -1000,
+                is_sync: false,
+            },
+            SampleInfo {
+                file_offset: 30,
+                size: 10,
+                duration: 1000,
+                cts_offset: -1000,
+                is_sync: false,
+            },
+        ];
+
+        // 合成時刻(cts = dts + cts_offset)昇順の表示順:
+        // decode0(cts=0) -> decode2(cts=1000) -> decode3(cts=2000) -> decode1(cts=4000)
+        let order = OrderMap::new(vec![
+            (DisplayIdx(0), DecodeIdx(0)),
+            (DisplayIdx(1), DecodeIdx(2)),
+            (DisplayIdx(2), DecodeIdx(3)),
+            (DisplayIdx(3), DecodeIdx(1)),
+        ]);
+
+        // 表示順1(=decode2、cts_offset=-1000)から始まる区間。
+        let snapped = vec![plan::SnappedRange {
+            start: plan::SnappedBoundary {
+                original: DisplayIdx(1),
+                snapped: DisplayIdx(1),
+                delta_frames: 0,
+            },
+            end: plan::SnappedBoundary {
+                original: DisplayIdx(3),
+                snapped: DisplayIdx(3),
+                delta_frames: 0,
+            },
+        }];
+
+        let starts = segment_video_source_starts(&snapped, &order, &video_samples)
+            .expect("表示順1に対応するデコード順が見つかるはず");
+
+        // decode2 の DTS = duration[0] + duration[1] = 2000（dts(0)=0 を起点に累積）。
+        assert_eq!(starts, vec![2000]);
+
+        // 合成時刻(PTS相当) は dts + cts_offset = 2000 + (-1000) = 1000 であり、
+        // DTS(2000) とは異なる。ここで合成時刻(1000)を返すと罠4のずれが起きる。
+        assert_ne!(starts[0], 1000, "合成時刻(PTS相当)を返してはいけない(罠4)");
     }
 }

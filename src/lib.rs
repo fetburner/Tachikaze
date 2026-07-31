@@ -32,6 +32,7 @@ pub mod mp4io;
 pub mod order;
 pub mod plan;
 pub mod report;
+pub mod segmap;
 pub mod tools;
 pub mod trim;
 pub mod verify;
