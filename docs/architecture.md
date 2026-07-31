@@ -2,7 +2,7 @@
 
 → 入口: [overview.md](overview.md)
 
-**`analyze` / `cut` の実装は完了している。** エピック E1〜E10 とそれぞれのサブ issue に分解したタスクはすべてクローズ済み（経緯は `git log` の `[E1-1]`〜`[E10-6]`）。エピック E11（字幕の保持と `auto`、#56）は issue 化済みで着手前。この文書は**現在の構成**と、**まだ対応していないこと**を書く。
+**`analyze` / `cut` の実装は完了している。** エピック E1〜E10 とそれぞれのサブ issue に分解したタスクはすべてクローズ済み（経緯は `git log` の `[E1-1]`〜`[E10-6]`）。エピック E11（字幕の保持と `auto`、#56）は区間マップ（#57）・`prepare` サブコマンド（#58）・字幕リマップ（#59）・elst 実測（#60）・gate（#61）まで実装済み。この文書は**現在の構成**と、**まだ対応していないこと**を書く。
 
 ## コマンド構成
 
@@ -39,6 +39,16 @@ tachikaze cut IN.mp4 --trim trim.avs -o OUT.mp4 [--dtvi work.mp4.dtvi]
        出力タイムライン上の開始時刻。外部で作った字幕やチャプターを cut 後のタイムライン
        に合わせるための中間データ、#57）をキャッシュ（work.mp4.segmap.json）へ書く。
        --segment-map PATH で任意の場所にも書ける。--cm-output 指定時も保持側だけに出す
+
+tachikaze remap-subs IN.mp4 [--segment-map PATH] [--subs PATH] [-o OUT.ass|OUT.srt]
+   13. 区間マップ・字幕サイドカー（ASS/SRT）をキャッシュから自動解決
+       （`--dtvi` と同じ規則。明示指定が最優先）
+   14. 区間マップの区分的な線形写像でイベントの Start/End を張り替える
+       （`output_t = output_start_k + (source_t - source_start_dts_k)`、#59）
+   15. 各イベントを 保持区間に完全一致=シフト / どの保持区間とも重ならない=破棄
+       （CM に完全に含まれる字幕を残さない） / 境界を跨ぐ=クリップ に分類し、
+       件数を必ずログに出す。時刻以外のフィールド・行はそのまま素通しする
+       （`src/subtitle.rs`）
 ```
 
 `.dtvi` はオープン GOP の判定（[lossless-cut.md](lossless-cut.md)）と自己検証 4（表示順/デコード順の突き合わせ）に必須で、これ自体は変わっていない。省略できるようにしたのは**パスの指定**だけで、`.dtvi` 無しで動くようにしたわけではない（`cut --dtvi` を省略すると、`analyze` と同じ入力ごとのキャッシュディレクトリ規則から `work.mp4.dtvi` を自動的に探す。見つからなければ `analyze` を実行するコマンド例を添えて停止する。探索順・キャッシュの場所は次節「パス解決」参照）。
@@ -63,7 +73,7 @@ $ scripts/tachikaze-cmcut --cut-only --work-dir <work-root>/cmcut_xxx IN.mp4
 | 実行ファイル | `tachikaze` / `tachikaze-cmcut` / `chapter_exe` / `join_logo_scp` / `dtvindex` | `--tool-dir` → `TACHIKAZE_TOOL_DIR` → 自分の実行ファイルの隣 → `PATH`（`src/tools.rs::resolve_tool`） |
 | 読み取り専用データ | JL コマンドファイル（既定 `JL_標準.txt`） | `TACHIKAZE_JL_DIR` → `${XDG_DATA_HOME:-~/.local/share}/tachikaze/JL/` → `$XDG_DATA_DIRS`（既定 `/usr/local/share:/usr/share`）各要素 + `join_logo_scp/JL/` → `<join_logo_scp の実体パス>/../share/join_logo_scp/JL/` → `<join_logo_scp と同じディレクトリ>/JL/`（`src/tools.rs::default_jl_command_file`） |
 | キャッシュ（再生成可能な中間物） | `work.mp4.dtvi` / `trim.avs` / `detail.jls` / `work.mp4`（入力への symlink） / `work.mp4.segmap.json`（`cut` が書く区間マップ、`src/segmap.rs`、#57） | `TACHIKAZE_CACHE_DIR` → `${XDG_CACHE_HOME:-~/.cache}/tachikaze/<入力ごと>/`（既定。削除せず、同じ入力を再実行すると再利用する。`src/workdir.rs`）。`cut --dtvi` 省略時もこの規則から `work.mp4.dtvi` を自動的に探す。`work.mp4.segmap.json` も同じ規則（`workdir::cached_segment_map_path`）で、`cut --segment-map PATH` で任意の場所にも書ける |
-| 出力 | `*_CMcut.mp4` / `*_CM.mp4` | 入力の隣（変更しない） |
+| 出力 | `*_CMcut.mp4` / `*_CM.mp4` / `*_CMcut.ass`・`*_CMcut.srt`（`remap-subs` の既定出力、`src/commands.rs::default_remap_subs_output_path`、#59） | 入力の隣（変更しない）。本編出力と同じ stem にすることでプレイヤーが自動で字幕を読み込める |
 
 `--tool-dir` / `--jl-file` / `--work-dir` / `--dtvi` を明示指定した場合は、いずれも上記の探索より最優先でそのまま使う。`analyze --no-keep-work` を指定すると、既定のキャッシュディレクトリではなく従来どおりの使い捨て一時ディレクトリ（成功時に削除）になる。
 
@@ -99,7 +109,8 @@ $ scripts/tachikaze-cmcut --cut-only --work-dir <work-root>/cmcut_xxx IN.mp4
 | `plan.rs` | キーフレーム境界へのスナップ、区間の計画、保持区間の補集合 | [lossless-cut.md](lossless-cut.md) |
 | `audio.rs` | 音声パケットの選択（区間のソース時刻から引き当て） | [lossless-cut.md](lossless-cut.md) |
 | `verify.rs` | 自己検証 | 下記 |
-| `segmap.rs` | `cut` が書く区間マップ（snap 後の境界と出力タイムライン上の開始時刻）の構造体と JSON への書き出し | 上記「コマンド構成」手順12 |
+| `segmap.rs` | `cut` が書く区間マップ（snap 後の境界と出力タイムライン上の開始時刻）の構造体、JSON への書き出しと読み込み | 上記「コマンド構成」手順12 |
+| `subtitle.rs` | `remap-subs` 本体: ASS/SRT の Start/End を区間マップの区分的な線形写像で張り替える（シフト/破棄/クリップの分類、丸め方向） | 上記「コマンド構成」手順13〜15 |
 
 **解析側（analyze）は mp4 の読み込みに依存しない。** `--report` が必要とするキーフレーム位置を `.dtvi` から取る設計にしてあるため。**この性質を崩さないこと**（キーフレーム位置を mp4 から取る実装に変えると解析とカットが結合する）。
 

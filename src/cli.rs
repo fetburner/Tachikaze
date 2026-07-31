@@ -104,6 +104,33 @@ pub enum Commands {
         #[arg(long)]
         subs: Option<PathBuf>,
     },
+    /// 字幕サイドカー（ASS/SRT）のタイムスタンプを、`cut` が書いた区間マップ
+    /// （`--segment-map`、#57）で cut 後のタイムラインへ張り替える（#59）。
+    ///
+    /// 区間マップ・字幕はどちらもキャッシュから自動解決できる（`cut --dtvi` と
+    /// 同じ規則）。区間マップは `workdir::cached_segment_map_path`、字幕は
+    /// `workdir::subs_path(input, "ass")` / `subs_path(input, "srt")` の順に探す。
+    /// `--segment-map` / `--subs` を指定すればそちらを最優先で使う。
+    RemapSubs {
+        input: PathBuf,
+
+        /// `cut --segment-map` が書き出した JSON。未指定ならキャッシュ
+        /// （`work.mp4.segmap.json`）から自動的に探す。見つからない場合は
+        /// `cut` を実行するコマンド例を添えて停止する。
+        #[arg(long = "segment-map")]
+        segment_map: Option<PathBuf>,
+
+        /// 張り替える字幕ファイル（`.ass`/`.ssa`/`.srt`）。未指定なら
+        /// キャッシュ（`prepare` が書いた `subs.ass` / `subs.srt`）から順に探す。
+        #[arg(long)]
+        subs: Option<PathBuf>,
+
+        /// 出力先。未指定なら入力の隣に `<入力のstem>_CMcut.<字幕の拡張子>`
+        /// を書く（`cut` の既定の出力名 `*_CMcut.mp4` と同じ stem にすることで、
+        /// プレイヤーが同名の字幕を自動で読み込める）。
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]

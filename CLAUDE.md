@@ -2,7 +2,7 @@
 
 mp4 に変換済みの録画ファイルを、**再エンコードせずに CM カット**するツール。CM 検出は既存ツール（chapter_exe → join_logo_scp）に任せ、本ツールは「Trim リスト → ロスレス出力」だけを担う。
 
-**状態**: `analyze` / `cut` は**実装完了**（エピック E1〜E10 とそれぞれのサブ issue はすべてクローズ済み。経緯は `git log` の `[E1-1]`〜`[E10-6]`）。E11（字幕の保持と `auto`、#56）は issue 化済みで着手前。言語は Rust、mp4 の読み書きは `mp4-atom` クレート。
+**状態**: `analyze` / `cut` は**実装完了**（エピック E1〜E10 とそれぞれのサブ issue はすべてクローズ済み。経緯は `git log` の `[E1-1]`〜`[E10-6]`）。E11（字幕の保持と `auto`、#56）は区間マップ・`prepare`・字幕リマップ（`remap-subs`）・elst 実測・gate（`[E11-1]`〜`[E11-5]`）まで実装済み。言語は Rust、mp4 の読み書きは `mp4-atom` クレート。
 
 ```console
 $ tachikaze analyze IN.mp4 -o trim.avs --report

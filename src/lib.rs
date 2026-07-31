@@ -35,6 +35,7 @@ pub mod plan;
 pub mod prepare;
 pub mod report;
 pub mod segmap;
+pub mod subtitle;
 pub mod tools;
 pub mod trim;
 pub mod verify;
