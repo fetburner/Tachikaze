@@ -14,7 +14,7 @@ use crate::cli::{Cli, Commands};
 use crate::dtvi::Dtvi;
 use crate::mp4io::read::SampleInfo;
 use crate::order::{DecodeIdx, DisplayIdx, OrderMap};
-use crate::{analyze, audio, cli, dtvi, mp4io, plan, report, tools, trim, verify, workdir};
+use crate::{analyze, audio, cli, dtvi, gate, mp4io, plan, report, tools, trim, verify, workdir};
 
 /// パース済みの CLI 引数を受け取り、対応するサブコマンドを実行する。
 pub fn run(cli: Cli) -> anyhow::Result<()> {
@@ -98,6 +98,9 @@ fn run_analyze(
                 println!("{}", report::missed::format_warning(candidate, fps));
             }
         }
+
+        let verdict = gate::evaluate(&result.trim, &result.jls_entries, &result.dtvi);
+        println!("\n{}", gate::format_gate_report(&verdict));
     }
 
     Ok(())
