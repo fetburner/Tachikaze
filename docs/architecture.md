@@ -133,7 +133,7 @@ struct DecodeIdx(u32);    // デコード順（mp4 のサンプル番号 / .dtvi
 
 | 構成 | 判定関数 | 理由と回避策 |
 |---|---|---|
-| `elst`（edit list）あり | `check_no_edit_list` | `moov.clone()` で引き継いだ `elst` の `segment_duration` がカット後のトラック長を超え、`media_time` が新しい先頭の正当なフレームを数フレーム分スキップする——「エラーは出ないが結果が壊れる」の実例を実験で確認済み。**回避策**: `ffmpeg -i IN.mp4 -c copy -use_editlist 0 -movflags +faststart OUT.mp4`（除去後の映像・音声パケットが CRC32 でビット一致することを確認済み） |
+| `elst`（edit list）あり | `check_no_edit_list` | `moov.clone()` で引き継いだ `elst` の `segment_duration` がカット後のトラック長を超え、`media_time` が新しい先頭の正当なフレームを数フレーム分スキップする——「エラーは出ないが結果が壊れる」の実例を実験で確認済み。**回避策**: `ffmpeg -i IN.mp4 -c copy -use_editlist 0 -movflags +faststart OUT.mp4`（除去後の映像・音声パケットが CRC32 でビット一致することを確認済み。**ただしこれはペイロードのみの確認であり、A/V の相対タイムスタンプは対象外**。除去が A/V 相対時刻に与える影響の実測と方針は [measurements.md](measurements.md)「elst 除去と A/V 相対時刻」） |
 | `stsd` が複数エントリ | `check_single_stsd_entry` | `write.rs` が `sample_description_index: 1` 固定で `stsc` を再構築しているため。対応にはサンプルごとの index 保持（`read.rs` の `SampleInfo` と `write.rs` の両方の変更）が必要。無劣化 remux ではパラメータ差異という原因自体を解消できないので、事前除去の回避策は提示できない |
 | オープン GOP | `check_closed_gop` | 「S の同期サンプルからデコード順に `E - S` パケット取る」規則が成立しない。`.dtvi` の `leading_frame_count` で判定する（`.dtvi` が無い場合も判定不能として停止） |
 | 映像 2 本以上 / 音声 2 本以上 / 字幕などのトラックあり | `check_track_counts` | 映像 1 本 + 音声 1 本のみ対応 |
