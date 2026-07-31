@@ -31,6 +31,7 @@ pub mod jls;
 pub mod mp4io;
 pub mod order;
 pub mod plan;
+pub mod prepare;
 pub mod report;
 pub mod tools;
 pub mod trim;

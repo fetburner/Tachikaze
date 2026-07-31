@@ -31,6 +31,11 @@ const DTVI_FILE_NAME: &str = "work.mp4.dtvi";
 const SCP_FILE_NAME: &str = "scp.txt";
 const TRIM_FILE_NAME: &str = "trim.avs";
 const DETAIL_JLS_FILE_NAME: &str = "detail.jls";
+/// `prepare` が作る、elst 除去・字幕トラック除去後のメディアのファイル名。
+const INPUT_PREPARED_FILE_NAME: &str = "input_prepared.mp4";
+/// `prepare` が作る字幕サイドカーのベース名。拡張子（`ass` / `srt`）は
+/// 抽出元コーデックにより `prepare` 側が決めるため、ここでは持たない。
+const SUBS_BASE_NAME: &str = "subs";
 
 /// キャッシュディレクトリ名に使う stem の長さ上限（文字数）。
 const SAFE_STEM_MAX_CHARS: usize = 80;
@@ -346,6 +351,28 @@ fn cache_dir_for_input(input: &Path) -> Result<PathBuf> {
 /// けないため、呼び出し側で明示的に判断させる）。
 pub fn cached_dtvi_path(input: &Path) -> Result<PathBuf> {
     Ok(cache_dir_for_input(input)?.join(DTVI_FILE_NAME))
+}
+
+/// `prepare` が elst 除去・字幕トラック除去後のメディアを書き出すキャッシュパスを返す。
+///
+/// [`cached_dtvi_path`] と同じキャッシュディレクトリ規則([`cache_dir_for_input`])を
+/// 共有する。`analyze` / `cut` / `prepare` がすべて同じ入力に対して同じキャッシュ
+/// ディレクトリを使うことで、`cut` が `prepare` の出力を暗黙に見つけられる余地を
+/// 残す(現時点では `cut` はこのパスを自動探索しない。呼び出し側が明示的に
+/// `prepare` の出力パスを `cut` の入力として渡す)。
+///
+/// ディレクトリの作成は行わない([`cached_dtvi_path`]と同様、呼び出し側の責務)。
+pub fn prepared_input_path(input: &Path) -> Result<PathBuf> {
+    Ok(cache_dir_for_input(input)?.join(INPUT_PREPARED_FILE_NAME))
+}
+
+/// `prepare` が字幕サイドカーを書き出すキャッシュパスを返す。
+///
+/// `extension` には `"ass"` / `"srt"` など、`.` を含まない拡張子を渡す
+/// (どちらを使うかは字幕トラックのコーデックから `prepare` が決める。
+/// `prepare::SubtitleFormat` 参照)。ディレクトリの作成は行わない。
+pub fn subs_path(input: &Path, extension: &str) -> Result<PathBuf> {
+    Ok(cache_dir_for_input(input)?.join(format!("{SUBS_BASE_NAME}.{extension}")))
 }
 
 /// `TACHIKAZE_CACHE_DIR` を書き換えるテストで共有する仕組み。
@@ -665,6 +692,34 @@ mod tests {
             DETAIL_JLS_FILE_NAME
         );
         work_dir.finish(true);
+    }
+
+    /// `prepared_input_path` / `subs_path` が `cached_dtvi_path` と同じ
+    /// キャッシュディレクトリを指すことを確認する(`analyze` / `cut` /
+    /// `prepare` が同じ入力に対して同じディレクトリを共有する前提)。
+    #[test]
+    fn prepared_input_and_subs_paths_share_cache_dir_with_dtvi() {
+        let _env_guard = ENV_LOCK.lock().unwrap();
+        let cache_root = make_scratch_dir("cache-root-prepare-paths");
+        let _cache_env = EnvVarGuard::set("TACHIKAZE_CACHE_DIR", &cache_root);
+
+        let input_dir = make_scratch_dir("prepare-paths-input");
+        let input_path = input_dir.join("IN.mp4");
+        fs::write(&input_path, b"dummy mp4 content").expect("write input");
+
+        let dtvi = cached_dtvi_path(&input_path).expect("compute dtvi path");
+        let prepared = prepared_input_path(&input_path).expect("compute prepared path");
+        let subs_ass = subs_path(&input_path, "ass").expect("compute subs.ass path");
+        let subs_srt = subs_path(&input_path, "srt").expect("compute subs.srt path");
+
+        assert_eq!(dtvi.parent(), prepared.parent());
+        assert_eq!(dtvi.parent(), subs_ass.parent());
+        assert_eq!(prepared.file_name().unwrap(), INPUT_PREPARED_FILE_NAME);
+        assert_eq!(subs_ass.file_name().unwrap(), "subs.ass");
+        assert_eq!(subs_srt.file_name().unwrap(), "subs.srt");
+
+        fs::remove_dir_all(&input_dir).ok();
+        fs::remove_dir_all(&cache_root).ok();
     }
 
     /// `TACHIKAZE_CACHE_DIR` でキャッシュの根を差し替えられる。
