@@ -7,9 +7,14 @@
 ```
 IN.mp4
   │
-  ├─ dtvindex build IN.mp4 -o IN.dtvi        ← 共通フレーム番号の索引
+  ├─ tachikaze prepare IN.mp4                ← elst(edit list) 除去・字幕トラック除去・
+  │     → input_prepared.mp4                    字幕抽出を1回の ffmpeg 呼び出しにまとめる
+  │     → subs.ass / subs.srt                    （前処理が不要なら IN.mp4 をそのまま使い、
+  │                                                字幕が無ければ subs.* も作らない）
   │
-  ├─ chapter_exe -v IN.mp4 -o scp.txt        ← 無音 + シーンチェンジ検出
+  ├─ dtvindex build <prepare後の入力> -o work.mp4.dtvi   ← 共通フレーム番号の索引
+  │
+  ├─ chapter_exe -v <prepare後の入力> -o scp.txt         ← 無音 + シーンチェンジ検出
   │     （FFmpeg 直接入力モード。AviSynth は不要）
   │
   ├─ join_logo_scp -inscp scp.txt -incmd JL_標準.txt \
@@ -18,10 +23,14 @@ IN.mp4
   │
   │   （必要なら trim.avs を人手で修正）
   │
-  └─ [本ツール] trim.avs + IN.mp4 → OUT.mp4  ← ロスレスカット
+  ├─ [本ツール] trim.avs + <prepare後の入力> → OUT.mp4  ← ロスレスカット（cut）。
+  │     区間マップ（work.mp4.segmap.json）も書く
+  │
+  └─ [本ツール] 区間マップ + subs.ass/subs.srt → OUT.ass / OUT.srt
+        ← 字幕タイムスタンプの張り替え（remap-subs）
 ```
 
-上流 3 つは既存ツール。本ツールが実装するのは最後の 1 段と、全体の起動・検証のみ。
+中央 3 つ（dtvindex / chapter_exe / join_logo_scp）は既存ツール。本ツールが実装するのは `prepare`・カット（`cut`）・字幕の張り替え（`remap-subs`）と、これらを対話なしで通す `auto`、および全体の検証。コマンドの詳細な引数・手順番号は [architecture.md](architecture.md)「コマンド構成」を参照。
 
 ## AviSynth が不要な理由
 

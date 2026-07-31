@@ -141,7 +141,7 @@ chapter_exe -v work.mp4 -o scp.txt      # work.mp4.dtvi が作業ディレクト
 |---|---|
 | `chapter_exe` / `dtvindex` / `join_logo_scp` | `$PREFIX/bin`（`PATH` に通せば `tachikaze` 側の探索で解決できる） |
 | `JL/`（ルールファイル群） | `$PREFIX/share/join_logo_scp/JL/` |
-| `tachikaze` / `tachikaze-cmcut`（本リポジトリ） | `make install PREFIX=...`（本リポジトリのルートで実行） |
+| `tachikaze`（本リポジトリ） | `make install PREFIX=...`（本リポジトリのルートで実行） |
 
 例（`$PREFIX = /usr/local`）:
 
@@ -154,4 +154,4 @@ cd <tachikaze リポジトリ>
 make install PREFIX=/usr/local
 ```
 
-この構成であれば、`tachikaze` / `tachikaze-cmcut` は `--tool-dir` も `--jl-file` も指定せずに動く。`$HOME/.local` など非 root なプレフィックスでも同様（`make install PREFIX=$HOME/.local` と `$PREFIX/bin` を `PATH` に追加すればよい）。
+この構成であれば、`tachikaze` は `--tool-dir` も `--jl-file` も指定せずに動く。`$HOME/.local` など非 root なプレフィックスでも同様（`make install PREFIX=$HOME/.local` と `$PREFIX/bin` を `PATH` に追加すればよい）。

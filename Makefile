@@ -11,7 +11,6 @@ DATADIR = $(PREFIX)/share
 # 変数で受ける（既定は cargo の既定と同じ `target`）。
 CARGO_TARGET_DIR ?= target
 TACHIKAZE_BIN = $(CARGO_TARGET_DIR)/release/tachikaze
-CMCUT_SCRIPT = scripts/tachikaze-cmcut
 
 .PHONY: build install uninstall clean test
 
@@ -27,11 +26,9 @@ build:
 install: build
 	install -d "$(DESTDIR)$(BINDIR)"
 	install -m 755 "$(TACHIKAZE_BIN)" "$(DESTDIR)$(BINDIR)/tachikaze"
-	install -m 755 "$(CMCUT_SCRIPT)" "$(DESTDIR)$(BINDIR)/tachikaze-cmcut"
 
 uninstall:
 	rm -f "$(DESTDIR)$(BINDIR)/tachikaze"
-	rm -f "$(DESTDIR)$(BINDIR)/tachikaze-cmcut"
 
 clean:
 	cargo clean

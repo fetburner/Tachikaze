@@ -2,7 +2,7 @@
 
 mp4 に変換済みの録画ファイルを、**再エンコードせずに CM カット**するツール。CM 検出は既存ツール（chapter_exe → join_logo_scp）に任せ、本ツールは「Trim リスト → ロスレス出力」だけを担う。
 
-**状態**: `analyze` / `cut` は**実装完了**（エピック E1〜E10 とそれぞれのサブ issue はすべてクローズ済み。経緯は `git log` の `[E1-1]`〜`[E10-6]`）。E11（字幕の保持と `auto`、#56）は区間マップ・`prepare`・字幕リマップ（`remap-subs`）・elst 実測・gate・`auto`（`[E11-1]`〜`[E11-6]`）まで実装済み。言語は Rust、mp4 の読み書きは `mp4-atom` クレート。
+**状態**: `analyze` / `cut` / `prepare` / `remap-subs` / `auto` は**実装完了**（エピック E1〜E11 とそれぞれのサブ issue はすべてクローズ済み。経緯は `git log` の `[E1-1]`〜`[E11-7]`。E11 は字幕の保持と `auto`、#56）。言語は Rust、mp4 の読み書きは `mp4-atom` クレート。
 
 ```console
 $ tachikaze analyze IN.mp4 -o trim.avs --report
@@ -12,7 +12,7 @@ $ tachikaze auto IN.mp4 [IN2 ...]   # prepare → analyze → gate → cut → r
 
 `--work-dir` / `--dtvi` は省略可（入力ごとの XDG キャッシュディレクトリから自動的に繋がる。探索順は [docs/architecture.md](docs/architecture.md)「パス解決」節）。インストールして使う場合の配置先は [docs/toolchain-macos.md](docs/toolchain-macos.md)「ビルド後の配置とインストール」。
 
-手元のファイルを一通しで処理するときは `tachikaze auto`（gate が疑わしいと判定したら cut せず exit code 2 で停止し、直して `cut` するコマンド例を出す。`--force` で無視できるが gate の判定だけを無視する）。判断を挟みながら進めたい場合は従来どおり `analyze` → 目視 → `cut`。`scripts/tachikaze-cmcut`（`auto` 登場前からの、edit list 除去・パス結線・`--cm-output` 付き cut を行うシェルラッパー。既定は analyze 後に確認、`--yes` で省略）も残っているが、新規の自動化は `auto` を使うこと。
+手元のファイルを一通しで処理するときは `tachikaze auto`（gate が疑わしいと判定したら cut せず exit code 2 で停止し、直して `cut` するコマンド例を出す。`--force` で無視できるが gate の判定だけを無視する）。判断を挟みながら進めたい場合は従来どおり `analyze` → 目視 → `cut`。
 
 現在のコマンド構成・モジュール構成・自己検証の一覧は
 [docs/architecture.md](docs/architecture.md)。
