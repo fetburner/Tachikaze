@@ -27,6 +27,7 @@ pub mod cli;
 pub mod commands;
 pub mod dtvi;
 pub mod external;
+pub mod gate;
 pub mod jls;
 pub mod mp4io;
 pub mod order;
