@@ -23,6 +23,7 @@
 
 pub mod analyze;
 pub mod audio;
+pub mod auto;
 pub mod cli;
 pub mod commands;
 pub mod dtvi;

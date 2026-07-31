@@ -2,13 +2,20 @@
 
 → 入口: [overview.md](overview.md)
 
-**`analyze` / `cut` の実装は完了している。** エピック E1〜E10 とそれぞれのサブ issue に分解したタスクはすべてクローズ済み（経緯は `git log` の `[E1-1]`〜`[E10-6]`）。エピック E11（字幕の保持と `auto`、#56）は区間マップ（#57）・`prepare` サブコマンド（#58）・字幕リマップ（#59）・elst 実測（#60）・gate（#61）まで実装済み。この文書は**現在の構成**と、**まだ対応していないこと**を書く。
+**`analyze` / `cut` の実装は完了している。** エピック E1〜E10 とそれぞれのサブ issue に分解したタスクはすべてクローズ済み（経緯は `git log` の `[E1-1]`〜`[E10-6]`）。エピック E11（字幕の保持と `auto`、#56）は区間マップ（#57）・`prepare` サブコマンド（#58）・字幕リマップ（#59）・elst 実測（#60）・gate（#61）・`auto` サブコマンド（#62）まで実装済み。この文書は**現在の構成**と、**まだ対応していないこと**を書く。
 
 ## コマンド構成
 
 **解析とカットは別のコマンドに分かれている。** 検出の見逃しが実際に起きるため（[jls-settings.md](jls-settings.md)）、目視確認と手動修正を挟めるようにしてある。
 
 ```
+tachikaze prepare IN.mp4 [--subs PATH]
+    0. elst(edit list) 除去・字幕トラック除去・字幕抽出を1回の ffmpeg 呼び出しに
+       まとめる（#58）。`cut` が elst 付き / 字幕トラック付き入力を明示エラーで
+       拒否するため（下記「未対応の入力」）、その回避策をここに集約する。
+       出力は入力ごとの XDG キャッシュディレクトリへ（下記「パス解決」節）
+       elst も字幕も無ければ ffmpeg を呼ばず入力をそのまま返す
+
 tachikaze analyze IN.mp4 -o trim.avs [--report] [--work-dir DIR] [--no-keep-work]
                                      [--jls-set KEY=VALUE]... [--jl-file FILE]
     1. dtvindex build              （外部プロセス）
@@ -19,6 +26,9 @@ tachikaze analyze IN.mp4 -o trim.avs [--report] [--work-dir DIR] [--no-keep-work
        ・各カット境界とキーフレームの距離
        ・余分に残る合計秒数
        ・見逃し候補の警告（既知の CM ブロック長と一致する未カット区間）
+       ・gate 判定（見逃し候補・除去フレーム数0のどちらかで「疑わしいので止める」、
+         保持率・格子誤差ずれは参考値のみ。`src/gate.rs`、#61）。`auto` はこの判定を
+         使って cut するかどうかを機械的に決める（下記参照）
 
 （必要なら trim.avs を人手で編集）
 
@@ -49,11 +59,29 @@ tachikaze remap-subs IN.mp4 [--segment-map PATH] [--subs PATH] [-o OUT.ass|OUT.s
        （CM に完全に含まれる字幕を残さない） / 境界を跨ぐ=クリップ に分類し、
        件数を必ずログに出す。時刻以外のフィールド・行はそのまま素通しする
        （`src/subtitle.rs`）
+
+tachikaze auto IN.mp4 [IN2 ...] [-o OUT | --cm-output PATH | --no-cm] [--force]
+                                [--overwrite] [--analyze-only] [--no-subtitles]
+                                [--snap] [--verify] [--jl-file] [--jls-set] [--work-dir]
+   16. prepare(0) → analyze(1〜4) → gate 判定 → cut(5〜12) → remap-subs(13〜15) を
+       対話なしで合成する（`src/auto.rs`、#62）。アルゴリズムは持たない: 各ステップは
+       上記の関数・処理をそのまま呼ぶ（`commands::execute_cut` を `cut` サブコマンドと
+       共有。詳細は `src/commands.rs` / `src/auto.rs` の doc comment）
+   17. gate が「疑わしいので止める」と判定したら cut せず exit code 2 で停止し、
+       trim.avs のパスと「直して cut する」コマンド例を出す（`--force` で無視できるが、
+       無視できるのは gate の判定だけで自己検証や `.dtvi` 必須は変わらない）
+   18. 複数入力では入力ごとに失敗を隔離し、最後に「完了 N / 判定で停止 M / 失敗 K /
+       既存出力のためスキップ L」の内訳を出す。exit code は 0=完了 / 1=エラー
+       （1本でも失敗があれば）/ 2=判定で停止（失敗が無く1本でも判定停止があれば）
+   19. 出力（`*_CMcut.mp4` / `*_CM.mp4` / 字幕サイドカー）が既に存在すれば既定で
+       その入力をスキップする（`--overwrite` で上書き）。`analyze` はキャッシュが
+       あっても毎回実行する（キャッシュキーが入力の絶対パスのハッシュだけで、
+       内容の変化を検出できないため。`src/auto.rs` の doc comment参照）
 ```
 
 `.dtvi` はオープン GOP の判定（[lossless-cut.md](lossless-cut.md)）と自己検証 4（表示順/デコード順の突き合わせ）に必須で、これ自体は変わっていない。省略できるようにしたのは**パスの指定**だけで、`.dtvi` 無しで動くようにしたわけではない（`cut --dtvi` を省略すると、`analyze` と同じ入力ごとのキャッシュディレクトリ規則から `work.mp4.dtvi` を自動的に探す。見つからなければ `analyze` を実行するコマンド例を添えて停止する。探索順・キャッシュの場所は次節「パス解決」参照）。
 
-**CLI に `tachikaze auto` は用意していない**（検出の見逃しがあるため、analyze と cut のあいだに人手を挟める設計を崩さない）。**この方針は #56 で見直している**（判定を機械化して「疑わしいときだけ止める」形にする）。代わりにパス結線・edit list 除去・出力名決めなど**判断不要な手順だけ**を自動化するラッパーを `scripts/tachikaze-cmcut` に置いてある。既定では analyze 後に確認プロンプトを出し、`--yes` で省略できる。
+**`tachikaze auto`（#62）は gate（#61）の「疑わしいときだけ止める」判定を使って人手を安全に外す。** 見逃し候補ヒューリスティックが効かない番組もあるため（`src/gate.rs`「見逃し候補ヒューリスティックの限界」）、gate が止めないことは検出が完全に当たっている保証ではない。対話しながら都度確認したい場合は従来どおり `analyze` → 目視 → `cut` を使う。`scripts/tachikaze-cmcut`（判断不要な手順だけを自動化するシェルラッパー、`auto` 登場前からの実装）は残しているが、新規に自動化したい用途は `auto` を使うこと（`prepare`/gate/区間マップ込みの `cut`/`remap-subs` を経由し、シェル側で個別に持っていた edit list 除去・パス結線ロジックを重複させない）。
 
 ```console
 $ scripts/tachikaze-cmcut IN.mp4                  # analyze → 確認 → cut
@@ -92,6 +120,7 @@ $ scripts/tachikaze-cmcut --cut-only --work-dir <work-root>/cmcut_xxx IN.mp4
 |---|---|---|
 | `cli.rs` | サブコマンドとオプションの定義 | — |
 | `commands.rs` | 各モジュールを繋ぐ組み立て（アルゴリズムは持たない） | — |
+| `auto.rs` | `auto` コマンドの組み立て（`prepare`→`analyze`→gate→`cut`→`remap-subs`、アルゴリズムは持たない） | 上記「コマンド構成」手順16〜19 |
 | `tools.rs` | 外部ツールと JL ファイルの探索 | 上記「パス解決」節、[toolchain-macos.md](toolchain-macos.md) |
 | `external.rs` | 外部プロセスの起動と出力の回収 | [pipeline.md](pipeline.md) |
 | `workdir.rs` | 作業ディレクトリ（既定は入力ごとの XDG キャッシュ）と symlink | 上記「パス解決」節 |
@@ -100,6 +129,8 @@ $ scripts/tachikaze-cmcut --cut-only --work-dir <work-root>/cmcut_xxx IN.mp4
 | `dtvi.rs` | `.dtvi` のパース（タブ区切りテキスト） | [pipeline.md](pipeline.md) |
 | `jls.rs` | `detail.jls` のパース | [pipeline.md](pipeline.md) |
 | `analyze.rs` | analyze コマンドの組み立て | [jls-settings.md](jls-settings.md) |
+| `prepare.rs` | `prepare` 本体: elst 除去・字幕トラック除去・字幕抽出を1回の ffmpeg 呼び出しにまとめる | 上記「コマンド構成」手順0 |
+| `gate.rs` | `analyze` の成果物（`TrimList`/`JlsEntry`/`Dtvi`）だけから検出結果が機械的に疑わしいか判定する（mp4 は読まない） | 上記「コマンド構成」手順4・16〜17 |
 | `report/mod.rs` | `--report` の出力 | [measurements.md](measurements.md) |
 | `report/missed.rs` | 見逃し候補の警告 | [jls-settings.md](jls-settings.md) |
 | `mp4io/read.rs` | サンプル表の読み込み | [mp4-atom.md](mp4-atom.md) |
@@ -175,6 +206,6 @@ struct DecodeIdx(u32);    // デコード順（mp4 のサンプル番号 / .dtvi
 
 ## 将来的な拡張候補
 
-- **バッチ処理**: ディレクトリを指定して一括処理
+- **バッチ処理**: `auto`（#62）が複数入力の指定（`tachikaze auto IN1.mp4 IN2.mp4 ...`）には対応した。**ディレクトリを指定した一括処理（glob 展開）は未対応**（呼び出し側でシェルのグロブに展開してから渡す運用を想定）
 - **チャプター出力**: dtvindex に `create_join_logo_scp_chapters` があるのでそれを呼ぶだけ
 - **局別 JL ファイルの選択**: 現状は `JL_標準.txt` 既定（`--jl-file` で差し替えは可能）

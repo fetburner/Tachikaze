@@ -131,6 +131,76 @@ pub enum Commands {
         #[arg(short, long)]
         output: Option<PathBuf>,
     },
+    /// `prepare`(#58) → `analyze` → gate 判定(#61) → `cut`(区間マップ込み、#57) →
+    /// `remap-subs`(#59) を対話なしで合成する（#62）。
+    ///
+    /// アルゴリズムは持たない（`analyze` / `cut` を複製せず呼ぶだけ）。対話プロンプトは
+    /// 出さない: gate が疑わしいと判定したら cut を実行せず exit code 2 で停止し、
+    /// `trim.avs` のパスと「直して `cut` する」コマンド例を表示する（`--force` で
+    /// 無視できるが、無視できるのは gate の判定だけで、自己検証や `.dtvi` 必須は
+    /// 変わらない）。exit code は 0=完了 / 1=エラー / 2=判定で停止 の3種類のみ。
+    Auto {
+        /// 処理する入力 mp4。複数指定するとバッチ処理になり、その場合
+        /// `-o` / `--cm-output` / `--work-dir` は指定できない（各入力の隣に既定の
+        /// 名前で出力し、各入力ごとの既定キャッシュディレクトリを使う）。
+        inputs: Vec<PathBuf>,
+
+        /// 本編の出力先。既定は入力の隣の `<stem>_CMcut.mp4`。複数入力時は指定できない。
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+
+        /// CM 側（保持区間の補集合）の出力先。既定は入力の隣の `<stem>_CM.mp4`。
+        /// `--no-cm` とは併用できない。複数入力時は指定できない。
+        #[arg(long = "cm-output")]
+        cm_output: Option<PathBuf>,
+
+        /// CM 側ファイルを出さない（既定では `<stem>_CM.mp4` を出す）。
+        #[arg(long)]
+        no_cm: bool,
+
+        /// gate が疑わしいと判定しても cut まで進む。gate の判定だけを無視する
+        /// （自己検証1〜8や `.dtvi` 必須は緩めない）。
+        #[arg(long)]
+        force: bool,
+
+        /// 既存の出力（本編・CM側・字幕サイドカーのいずれか）があっても上書きする。
+        /// 未指定では、既存の出力があるファイルはそのバッチ実行をスキップする
+        /// （バッチの再実行で成果物を黙って潰さないため）。
+        #[arg(long)]
+        overwrite: bool,
+
+        /// `prepare` + `analyze` + gate 判定までで止め、`cut` / `remap-subs` を
+        /// 実行しない。止めたあとに `trim.avs` を人手で直して `cut` を直接実行できる
+        /// （`--dtvi` も明示のパスを表示するので `cut` 単体で完結する）。
+        #[arg(long = "analyze-only")]
+        analyze_only: bool,
+
+        /// 字幕の抽出・張り替えを行わない。未指定の場合、字幕の張り替えに失敗すると
+        /// 既定でハードエラーになる（本編だけ出して字幕を黙って落とさないため）。
+        #[arg(long = "no-subtitles")]
+        no_subtitles: bool,
+
+        #[arg(long, value_enum, default_value_t = Snap::Outward)]
+        snap: Snap,
+
+        /// `cut` に `--verify` を付ける（ffprobe のパケット単位 CRC32 比較）。
+        #[arg(long)]
+        verify: bool,
+
+        /// join_logo_scp の JL コマンドファイルを差し替える（`analyze --jl-file` と同じ）。
+        #[arg(long = "jl-file")]
+        jl_file: Option<PathBuf>,
+
+        /// join_logo_scp の `-set KEY VALUE` を上書き・追加する
+        /// （`analyze --jls-set` と同じ、`KEY=VALUE` 形式、繰り返し可）。
+        #[arg(long = "jls-set")]
+        jls_set: Vec<String>,
+
+        /// 中間ファイル（`.dtvi` / `trim.avs` / `detail.jls` / 区間マップ）の置き場所。
+        /// 複数入力時は指定できない（各入力ごとの既定のキャッシュディレクトリを使う）。
+        #[arg(long)]
+        work_dir: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]

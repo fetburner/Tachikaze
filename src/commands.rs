@@ -15,12 +15,32 @@ use crate::dtvi::Dtvi;
 use crate::mp4io::read::SampleInfo;
 use crate::order::{DecodeIdx, DisplayIdx, OrderMap};
 use crate::{
-    analyze, audio, cli, dtvi, gate, mp4io, plan, prepare, report, segmap, subtitle, tools, trim,
-    verify, workdir,
+    analyze, audio, auto, cli, dtvi, gate, mp4io, plan, prepare, report, segmap, subtitle, tools,
+    trim, verify, workdir,
 };
 
+/// `main.rs` が終了コードを決めるための、サブコマンド実行結果。
+///
+/// - [`ExitOutcome::Success`]: 0 で終了する。
+/// - [`ExitOutcome::GateStopped`]: 2 で終了する。
+///
+/// `auto`（#62）の gate が疑わしいと判定して cut を実行せず止まった場合にだけ
+/// [`ExitOutcome::GateStopped`] を返す。`analyze` / `cut` / `prepare` / `remap-subs`
+/// はこの値を返す経路を持たない（常に `Ok(ExitOutcome::Success)` か `Err`
+/// （呼び出し元の `main.rs` で exit code 1 になる、変更前と同じ挙動）のどちらかで、
+/// **既存の CLI 挙動を一切変えない**）。
+///
+/// `auto` が複数入力を処理した場合の優先順位は [`auto::run`] の doc comment 参照
+/// （「1本でも失敗があれば `Err`」「失敗が無く1本でも gate 停止があれば
+/// `GateStopped`」「全部完了なら `Success`」）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExitOutcome {
+    Success,
+    GateStopped,
+}
+
 /// パース済みの CLI 引数を受け取り、対応するサブコマンドを実行する。
-pub fn run(cli: Cli) -> anyhow::Result<()> {
+pub fn run(cli: Cli) -> anyhow::Result<ExitOutcome> {
     let tool_dir = cli.tool_dir.clone();
 
     match cli.command {
@@ -32,16 +52,19 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
             no_keep_work,
             jls_set,
             jl_file,
-        } => run_analyze(
-            tool_dir,
-            input,
-            output,
-            report,
-            work_dir,
-            no_keep_work,
-            jls_set,
-            jl_file,
-        ),
+        } => {
+            run_analyze(
+                tool_dir,
+                input,
+                output,
+                report,
+                work_dir,
+                no_keep_work,
+                jls_set,
+                jl_file,
+            )?;
+            Ok(ExitOutcome::Success)
+        }
         Commands::Cut {
             input,
             trim,
@@ -52,26 +75,139 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
             dtvi,
             cm_output,
             segment_map,
-        } => run_cut(
-            tool_dir,
-            input,
-            trim,
-            output,
-            snap,
-            video_only,
-            verify,
-            dtvi,
-            cm_output,
-            segment_map,
-        ),
-        Commands::Prepare { input, subs } => run_prepare(tool_dir, input, subs),
+        } => {
+            run_cut(
+                tool_dir,
+                input,
+                trim,
+                output,
+                snap,
+                video_only,
+                verify,
+                dtvi,
+                cm_output,
+                segment_map,
+            )?;
+            Ok(ExitOutcome::Success)
+        }
+        Commands::Prepare { input, subs } => {
+            run_prepare(tool_dir, input, subs)?;
+            Ok(ExitOutcome::Success)
+        }
         Commands::RemapSubs {
             input,
             segment_map,
             subs,
             output,
-        } => run_remap_subs(input, segment_map, subs, output),
+        } => {
+            run_remap_subs(input, segment_map, subs, output)?;
+            Ok(ExitOutcome::Success)
+        }
+        Commands::Auto {
+            inputs,
+            output,
+            cm_output,
+            no_cm,
+            force,
+            overwrite,
+            analyze_only,
+            no_subtitles,
+            snap,
+            verify,
+            jl_file,
+            jls_set,
+            work_dir,
+        } => run_auto(
+            tool_dir,
+            inputs,
+            output,
+            cm_output,
+            no_cm,
+            force,
+            overwrite,
+            analyze_only,
+            no_subtitles,
+            snap,
+            verify,
+            jl_file,
+            jls_set,
+            work_dir,
+        ),
     }
+}
+
+/// `auto` サブコマンドの実行。処理本体は [`auto::run`] に集約してあり（`commands.rs`
+/// はアルゴリズムを持たない方針、本ファイル冒頭の doc comment参照）、ここでは
+/// [`auto::AutoConfig`] の組み立てと、バッチ集計から exit code（[`ExitOutcome`]）への
+/// 変換だけを行う。
+///
+/// 変換方針: 1本でも失敗（[`auto::BatchTally::failed`] > 0）があれば `Err` を返す
+/// （`main.rs` で exit code 1 になる）。失敗が無く1本でも gate 停止
+/// （[`auto::BatchTally::gate_stopped`] > 0）があれば [`ExitOutcome::GateStopped`]
+/// （exit code 2）。すべて完了 / スキップなら [`ExitOutcome::Success`]（exit code 0）。
+/// 失敗を最優先するのは、「止まった」（人手を待っているだけ）より「壊れた」方が
+/// 深刻度が高く、バッチ運用で見逃してはいけないため。
+#[allow(clippy::too_many_arguments)]
+fn run_auto(
+    tool_dir: Option<PathBuf>,
+    inputs: Vec<PathBuf>,
+    output: Option<PathBuf>,
+    cm_output: Option<PathBuf>,
+    no_cm: bool,
+    force: bool,
+    overwrite: bool,
+    analyze_only: bool,
+    no_subtitles: bool,
+    snap: cli::Snap,
+    verify: bool,
+    jl_file: Option<PathBuf>,
+    jls_set: Vec<String>,
+    work_dir: Option<PathBuf>,
+) -> anyhow::Result<ExitOutcome> {
+    let config = auto::AutoConfig {
+        tool_dir,
+        output,
+        cm_output,
+        no_cm,
+        force,
+        overwrite,
+        analyze_only,
+        no_subtitles,
+        snap,
+        verify,
+        jl_file,
+        jls_set,
+        work_dir,
+    };
+
+    let tally = auto::run(&config, &inputs)?;
+    exit_outcome_for_tally(&tally)
+}
+
+/// [`auto::BatchTally`] から [`ExitOutcome`] を決める、副作用の無い純粋関数。
+///
+/// `run_auto` 本体から切り出してあるのは、この決定ロジック（優先順位:
+/// 失敗 > gate停止 > 完了）を `dtvindex` 等の外部ツールを一切使わずに単体テスト
+/// できるようにするため（この環境には外部ツールが無く、実際に gate 停止に
+/// 到達する E2E は組めない。`tests/auto_e2e.rs` の doc comment参照）。
+///
+/// 優先順位の根拠は [`ExitOutcome`] の doc comment参照（「止まった」より
+/// 「壊れた」の方が深刻度が高く、バッチ運用で見逃してはいけないため）。
+fn exit_outcome_for_tally(tally: &auto::BatchTally) -> anyhow::Result<ExitOutcome> {
+    if tally.failed > 0 {
+        bail!(
+            "{} 本が失敗しました（内訳: 完了 {} / 判定で停止 {} / 既存出力のため\
+             スキップ {}）。詳細は上記ログを参照してください",
+            tally.failed,
+            tally.completed,
+            tally.gate_stopped,
+            tally.skipped
+        );
+    }
+    if tally.gate_stopped > 0 {
+        return Ok(ExitOutcome::GateStopped);
+    }
+    Ok(ExitOutcome::Success)
 }
 
 /// `prepare` サブコマンドの実行。処理本体は [`prepare::run`] に集約してあり、
@@ -235,7 +371,10 @@ fn resolve_subs_path(
 /// することで、多くのプレイヤーが同名の字幕サイドカーを自動的に読み込める形にする
 /// （issue #59「やること」5）。出力は入力の隣に置く（`docs/architecture.md`
 /// 「パス解決」節の「出力」分類と同じ扱い。キャッシュではなく成果物）。
-fn default_remap_subs_output_path(input: &Path, extension: &str) -> PathBuf {
+///
+/// `pub(crate)`: `auto::run`（#62）が `remap-subs` と同じ字幕出力先の規則を
+/// 複製せずに再利用するため。
+pub(crate) fn default_remap_subs_output_path(input: &Path, extension: &str) -> PathBuf {
     let dir = input.parent().map(Path::to_path_buf).unwrap_or_default();
     let stem = input
         .file_stem()
@@ -299,7 +438,10 @@ fn run_analyze(
 /// `.dtvi` ヘッダの `frame_rate_num` / `frame_rate_den` から fps を求める。
 /// キーが無い、または数値としてパースできない場合は対象素材の実測値
 /// （30000/1001 ≈ 29.97fps）を既定にする。
-fn fps_from_dtvi(dtvi: &dtvi::Dtvi) -> f64 {
+///
+/// `pub(crate)`: `auto::run`（#62）が見逃し候補の警告表示に同じ fps を使うため
+/// （`analyze --report` と同じ計算式で重複させないための共有）。
+pub(crate) fn fps_from_dtvi(dtvi: &dtvi::Dtvi) -> f64 {
     let parse = |key: &str, default: f64| {
         dtvi.header_value(key)
             .and_then(|v| v.trim().parse::<f64>().ok())
@@ -314,6 +456,17 @@ fn fps_from_dtvi(dtvi: &dtvi::Dtvi) -> f64 {
     }
 }
 
+/// `cut` サブコマンドの実行。処理本体は [`execute_cut`] に集約してあり、ここでは
+/// CLI 引数から [`CutParams`] を組み立て、結果を人間向けに表示するだけ。
+///
+/// この分離は `auto`（#62、`src/auto.rs`）が `cut` と同じ処理（`--cm-output` の
+/// 自己検証8・保持側/CM側の atomic rename・区間マップの書き出しを含む）を複製せずに
+/// 再利用するために導入した（CLAUDE.md「analyze/cut のロジックを複製しない」）。
+/// `run_cut` 自体は `pub` にせず（CLI のオプション構成は変えたくない）、
+/// [`execute_cut`] / [`CutParams`] / [`CutOutcome`] を `pub(crate)` にして
+/// 同一クレート内の `auto` から呼べるようにした。この変更で `cut` サブコマンド自体の
+/// 標準出力・exit code は変わらない（`tests/segmap_e2e.rs` 等の既存 E2E がそのまま通る
+/// ことで確認済み）。
 #[allow(clippy::too_many_arguments)]
 fn run_cut(
     tool_dir: Option<PathBuf>,
@@ -327,11 +480,79 @@ fn run_cut(
     cm_output: Option<PathBuf>,
     segment_map_path: Option<PathBuf>,
 ) -> anyhow::Result<()> {
+    let outcome = execute_cut(CutParams {
+        tool_dir,
+        input,
+        trim_path,
+        output,
+        snap,
+        video_only,
+        verify_with_ffprobe,
+        dtvi_path,
+        cm_output,
+        segment_map_path,
+    })?;
+
+    print_cut_report("cut 完了", "保持区間数", &outcome.output, &outcome.report);
+    if let (Some(cm_output), Some(cm_report)) =
+        (outcome.cm_output.as_ref(), outcome.cm_report.as_ref())
+    {
+        print_cut_report("CM 出力完了", "CM区間数", cm_output, cm_report);
+    }
+
+    Ok(())
+}
+
+/// [`execute_cut`] にまとめて渡す引数。フィールドの意味は `cut` の CLI オプション
+/// （`src/cli.rs::Commands::Cut`）と1対1に対応する。
+pub(crate) struct CutParams {
+    pub tool_dir: Option<PathBuf>,
+    pub input: PathBuf,
+    pub trim_path: PathBuf,
+    pub output: PathBuf,
+    pub snap: cli::Snap,
+    pub video_only: bool,
+    pub verify_with_ffprobe: bool,
+    pub dtvi_path: Option<PathBuf>,
+    pub cm_output: Option<PathBuf>,
+    pub segment_map_path: Option<PathBuf>,
+}
+
+/// [`execute_cut`] の戻り値。呼び出し側（`run_cut` / `auto::run`）が結果を
+/// 表示するのに必要な情報だけを持つ（`print_cut_report` にそのまま渡せる形）。
+pub(crate) struct CutOutcome {
+    pub output: PathBuf,
+    pub report: verify::VerifyReport,
+    /// `--cm-output` 指定時のみ `Some`。
+    pub cm_output: Option<PathBuf>,
+    pub cm_report: Option<verify::VerifyReport>,
+}
+
+/// `cut` パイプライン本体。`run_cut`（CLI ハンドラ）と `auto::run` の両方から呼ばれる
+/// （`auto` がこのロジックを複製しないための唯一の入口。上記 `run_cut` の doc comment
+/// 参照）。標準出力への `println!` は一切行わない（結果表示は呼び出し側の責務）。
+pub(crate) fn execute_cut(params: CutParams) -> anyhow::Result<CutOutcome> {
+    let CutParams {
+        tool_dir,
+        input,
+        trim_path,
+        output,
+        snap,
+        video_only,
+        verify_with_ffprobe,
+        dtvi_path,
+        cm_output,
+        segment_map_path,
+    } = params;
+
     // `--snap inward` は保持区間を退化させうる（終端が開始より前になる）。その場合
     // 「保持区間の補集合をそのまま区間リストとして使える」という complement_ranges の
     // 前提（区間が昇順・非重複）が崩れ、CM側の区間の順序も壊れる
     // （docs/lossless-cut.md「CM 側（除去した区間）を別ファイルに出す」節）。
-    // 実害が出る前に、ここで明示エラーにして止める。
+    // 実害が出る前に、ここで明示エラーにして止める。`auto::run` は「既定で
+    // --cm-output 相当を付ける」という auto 固有の文脈に沿った、より分かりやすい
+    // メッセージで同じ組み合わせを事前に弾く（`auto.rs` の doc comment参照）ため、
+    // ここに来た時点では通常 `cut` を直接叩いた場合のメッセージでよい。
     if cm_output.is_some() && snap == cli::Snap::Inward {
         bail!(
             "--snap inward と --cm-output は併用できません。inward スナップでは保持区間が \
@@ -414,7 +635,6 @@ fn run_cut(
     match cm_output {
         None => {
             let run_output = pipeline.run(&snapped, &video_keep, &output)?;
-            print_cut_report("cut 完了", "保持区間数", &output, &run_output.report);
             if let Some(dtvi) = dtvi_data.as_ref() {
                 write_segment_map(
                     &input,
@@ -427,6 +647,12 @@ fn run_cut(
                     segment_map_path.as_deref(),
                 );
             }
+            Ok(CutOutcome {
+                output,
+                report: run_output.report,
+                cm_output: None,
+                cm_report: None,
+            })
         }
         Some(cm_output) => {
             let complement = plan::complement_ranges(&snapped, total_frames);
@@ -477,9 +703,6 @@ fn run_cut(
                 )
             })?;
 
-            print_cut_report("cut 完了", "保持区間数", &output, &run_output.report);
-            print_cut_report("CM 出力完了", "CM区間数", &cm_output, &cm_run_output.report);
-
             // 区間マップは保持側だけ出す（CM側は検出確認用で、字幕を付ける対象ではない。
             // issue #57「やること」6）。両方の rename が終わった後（＝自己検証を通って
             // 最終出力へ rename できた後）にだけ書く。
@@ -495,10 +718,15 @@ fn run_cut(
                     segment_map_path.as_deref(),
                 );
             }
+
+            Ok(CutOutcome {
+                output,
+                report: run_output.report,
+                cm_output: Some(cm_output),
+                cm_report: Some(cm_run_output.report),
+            })
         }
     }
-
-    Ok(())
 }
 
 /// `--dtvi` を解決する。
@@ -713,7 +941,14 @@ fn sibling_pending_path(path: &Path) -> PathBuf {
 
 /// cut 完了時の結果表示。保持側/CM側で見出しと区間数のラベルだけを変える
 /// （`docs/architecture.md`「コマンド構成」節の表示例参照）。
-fn print_cut_report(label: &str, range_label: &str, output: &Path, report: &verify::VerifyReport) {
+///
+/// `pub(crate)`: `auto::run`（#62）が `cut` と同じ完了表示を再利用するため。
+pub(crate) fn print_cut_report(
+    label: &str,
+    range_label: &str,
+    output: &Path,
+    report: &verify::VerifyReport,
+) {
     println!("{label}: {}", output.display());
     println!(
         "映像パケット数: {} / {range_label}: {}",
@@ -919,6 +1154,72 @@ mod tests {
     use std::env;
     use std::process;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    // --- exit_outcome_for_tally: auto の exit code 決定ロジック ---
+    //
+    // 実際に gate 停止まで到達する E2E はこの環境には無い外部ツール
+    // （dtvindex/chapter_exe/join_logo_scp）が要るため組めない
+    // （`tests/auto_e2e.rs` の doc comment参照）。決定ロジック自体は純粋関数
+    // なので、ここで `BatchTally` を直接組み立てて exit code 0/1/2 の区別を検証する
+    // （issue #62 完了条件「exit code 0 / 1 / 2 が区別されていることをテストしている」）。
+
+    #[test]
+    fn exit_outcome_is_success_when_all_completed() {
+        let tally = auto::BatchTally {
+            completed: 3,
+            gate_stopped: 0,
+            failed: 0,
+            skipped: 0,
+        };
+        assert_eq!(
+            exit_outcome_for_tally(&tally).expect("成功のはず"),
+            ExitOutcome::Success
+        );
+    }
+
+    #[test]
+    fn exit_outcome_is_success_when_some_skipped_but_none_failed_or_stopped() {
+        // スキップは「既存の出力があるので何もしなかった」だけで、失敗でも
+        // 判定停止でもない（`auto.rs` の doc comment参照）。
+        let tally = auto::BatchTally {
+            completed: 1,
+            gate_stopped: 0,
+            failed: 0,
+            skipped: 2,
+        };
+        assert_eq!(
+            exit_outcome_for_tally(&tally).expect("成功のはず"),
+            ExitOutcome::Success
+        );
+    }
+
+    #[test]
+    fn exit_outcome_is_gate_stopped_when_no_failures_but_one_stopped() {
+        let tally = auto::BatchTally {
+            completed: 1,
+            gate_stopped: 1,
+            failed: 0,
+            skipped: 0,
+        };
+        assert_eq!(
+            exit_outcome_for_tally(&tally).expect("gate 停止のはず"),
+            ExitOutcome::GateStopped
+        );
+    }
+
+    #[test]
+    fn exit_outcome_is_error_when_any_failed_even_with_gate_stopped_present() {
+        // 失敗が最優先（「止まった」より「壊れた」の方が深刻度が高い、
+        // `ExitOutcome` の doc comment参照）。
+        let tally = auto::BatchTally {
+            completed: 0,
+            gate_stopped: 5,
+            failed: 1,
+            skipped: 0,
+        };
+        let err = exit_outcome_for_tally(&tally).expect_err("失敗が1件でもエラーになるはず");
+        assert!(err.to_string().contains("失敗"));
+    }
 
     fn make_scratch_dir(label: &str) -> PathBuf {
         let base = env::temp_dir();
