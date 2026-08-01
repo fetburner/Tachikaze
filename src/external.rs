@@ -147,6 +147,21 @@ mod tests {
     use std::sync::Mutex;
 
     /// cwd を書き換えるテストを直列化するためのロック。
+    ///
+    /// **このロックは書き換える側どうししか直列化できない。** cwd はプロセス全体で
+    /// 共有されるため、ロックを取らずに相対パスでファイルを開くテストが並行して
+    /// 走っていると、そちらが巻き添えで失敗する。実際に
+    /// `mp4io::order_map::tests` がフィクスチャを相対パス
+    /// `tests/fixtures/sample.mp4` で開いていて、この下の
+    /// `run_resolves_relative_program_against_caller_cwd_not_work_dir` と同時に
+    /// 走ったときだけ「No such file or directory」で落ちた。しかも
+    /// `skip_if_fixture_missing` 系のヘルパは存在確認も相対パスで行うため、
+    /// **落ちずに無言でスキップして緑になる**経路もあった。
+    ///
+    /// 対処として `src/` 側のフィクスチャ参照はすべて
+    /// `concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/...")` の絶対パスに
+    /// 統一した（`tests/*.rs` の E2E は元から同じ方式）。**フィクスチャを相対パスで
+    /// 参照するテストを新しく足さないこと。**
     static CWD_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]

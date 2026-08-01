@@ -1227,7 +1227,8 @@ mod tests {
     // 実フィクスチャ + .dtvi を使った統合テスト。
     // ---------------------------------------------------------------
 
-    const FIXTURE: &str = "tests/fixtures/sample.mp4";
+    // cwd 非依存にする（`external::tests` がプロセスの cwd を一時的に変えるため）。
+    const FIXTURE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/sample.mp4");
     const DTVI_SAMPLE: &str = include_str!("../tests/data/sample.dtvi");
 
     fn skip_if_fixture_missing() -> bool {
@@ -1875,29 +1876,62 @@ mod tests {
             .arg("--nocapture")
             .env_remove("TACHIKAZE_TOOL_DIR")
             .env("PATH", "")
+            .env(CHILD_MARKER_ENV, "1")
             .output()
             .expect("子プロセス(自分自身)を起動できること");
 
+        let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(
             output.status.success(),
             "PATH が空の子プロセスで resolve_tool(FFPROBE) がエラーにならなかった: \
-             stdout={}\nstderr={}",
-            String::from_utf8_lossy(&output.stdout),
+             stdout={stdout}\nstderr={}",
             String::from_utf8_lossy(&output.stderr)
+        );
+        // 子が「隔離環境ではない」と判断して素通りした場合も終了コードは 0 に
+        // なる。マーカーの受け渡しが壊れたときに、検証していないのに緑になる
+        // のを防ぐため、実際にアサートまで到達した印を確認する。
+        assert!(
+            stdout.contains(CHILD_RAN_MARKER),
+            "子プロセスが本体のアサートまで到達していない（{CHILD_MARKER_ENV} が \
+             伝わっていない可能性）: stdout={stdout}"
         );
     }
 
+    /// 下の子テストを「親から起動されたときだけ本体を実行する」ように切り替える
+    /// ための環境変数。`cargo test -- --ignored` は `#[ignore]` の付いた子テスト
+    /// も直接実行してしまい、その場合 `PATH` は通常どおり通っているので
+    /// `resolve_tool` が成功してアサートが落ちる。ignore 属性だけでは
+    /// 「親経由でのみ実行する」を表現できないため、マーカーで判別する。
+    const CHILD_MARKER_ENV: &str = "TACHIKAZE_TEST_EMPTY_PATH_CHILD";
+
+    /// 子テストが本体のアサートまで到達したことを親へ伝える印（標準出力）。
+    const CHILD_RAN_MARKER: &str = "empty-path-child: asserted";
+
     /// 上のテストからのみ、子プロセスとして起動される。`--ignored` を付けているのは
     /// 単体の `cargo test` 実行では走らせず、必ず親経由の隔離された環境で実行するため。
+    ///
+    /// ただし `cargo test -- --ignored`（CLAUDE.md が E2E 用に挙げているコマンド）は
+    /// このテストも直接実行する。そのときは `PATH` が通っているので本体を走らせると
+    /// 必ず落ちる。[`CHILD_MARKER_ENV`] が無ければ隔離環境ではないと判断して
+    /// 何もしない（親から起動されたかどうかは、この環境変数だけで判別する）。
     #[test]
     #[ignore = "resolve_tool_ffprobe_not_found_when_path_is_empty からのみ子プロセスとして起動する"]
     fn assert_resolve_tool_fails_without_path_child() {
+        if std::env::var_os(CHILD_MARKER_ENV).is_none() {
+            println!(
+                "empty-path-child: {CHILD_MARKER_ENV} が無いため素通りする\
+                 （親テスト resolve_tool_ffprobe_not_found_when_path_is_empty から実行される）"
+            );
+            return;
+        }
+
         let result = crate::tools::resolve_tool(None, crate::tools::FFPROBE);
         assert!(
             result.is_err(),
             "PATH が空(かつ tool_dir/TACHIKAZE_TOOL_DIR も無し)なら ffprobe は \
              見つからないはず: {result:?}"
         );
+        println!("{CHILD_RAN_MARKER}");
     }
 
     /// 完了条件3: 意図的に1パケット壊した出力で不一致が検出され、出力が破棄される。

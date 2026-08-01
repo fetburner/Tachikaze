@@ -709,7 +709,8 @@ mod tests {
         use crate::plan;
         use crate::trim::TrimList;
 
-        const FIXTURE: &str = "tests/fixtures/sample.mp4";
+        // cwd 非依存にする（`external::tests` がプロセスの cwd を一時的に変えるため）。
+        const FIXTURE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/sample.mp4");
         if !Path::new(FIXTURE).exists() {
             eprintln!(
                 "{FIXTURE} が無いためスキップします。`tests/fixtures/gen.sh` を実行してください。"

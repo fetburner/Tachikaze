@@ -236,7 +236,8 @@ mod tests {
 
     /// フィクスチャ: H.264 (Avc1) + Opus, GOP 120, 30000/1001fps の mp4。
     /// `tests/fixtures/gen.sh`（issue #15）で生成する。無ければスキップする。
-    const FIXTURE: &str = "tests/fixtures/sample.mp4";
+    // cwd 非依存にする（`external::tests` がプロセスの cwd を一時的に変えるため）。
+    const FIXTURE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/sample.mp4");
 
     fn skip_if_fixture_missing() -> bool {
         if std::path::Path::new(FIXTURE).exists() {

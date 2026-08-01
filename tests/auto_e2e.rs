@@ -363,6 +363,30 @@ fn run_auto(args: &[&str], cache_root: &Path) -> std::process::Output {
         .expect("tachikaze auto の起動に失敗した")
 }
 
+/// 外部ツール（dtvindex / chapter_exe / join_logo_scp）を**確実に見つけられない**
+/// 状態で `tachikaze auto` を起動する。
+///
+/// `analyze` が必ず失敗する状態を作るためのもの。以前はこれらのテストが
+/// 「この環境には dtvindex が無い」という暗黙の前提の上に立っていて、
+/// `docs/toolchain-macos.md` の手順どおりに3ツールを `PATH` へ入れた開発環境
+/// （＝本来の想定環境）では `analyze` が成功してしまい落ちていた。
+///
+/// `resolve_tool` の探索順序は tool_dir → `TACHIKAZE_TOOL_DIR` → 実行ファイルの
+/// ディレクトリ → `PATH`（`src/tools.rs` の doc comment）。子プロセスの環境
+/// だけを空にすれば、親（テストプロセス）の状態には触れずに全段を空振りさせ
+/// られる。`ffmpeg` も引けなくなるが、これらのテストは elst も字幕も無い
+/// フィクスチャを使うので `prepare` は外部プロセスを起動しない。
+fn run_auto_without_tools(args: &[&str], cache_root: &Path) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_tachikaze"))
+        .arg("auto")
+        .args(args)
+        .env("TACHIKAZE_CACHE_DIR", cache_root)
+        .env("PATH", "")
+        .env_remove("TACHIKAZE_TOOL_DIR")
+        .output()
+        .expect("tachikaze auto の起動に失敗した")
+}
+
 /// 完了条件: 複数入力時に `-o` を受け付けない（`--cm-output` / `--work-dir` も
 /// 同じ検証ロジックを通るので代表して1つだけ個別のテストにする。3つとも
 /// `src/auto.rs` の単体テストで網羅済み）。
@@ -452,7 +476,7 @@ fn auto_skips_existing_output_without_overwrite() {
 }
 
 /// 完了条件: `--overwrite` を付けるとスキップせず実処理（`prepare` 以降）に進む。
-/// この環境には `dtvindex` が無いため `analyze` で失敗するが、それは
+/// [`run_auto_without_tools`] で `analyze` を必ず失敗させるが、それは
 /// 「スキップした」のではなく「実際に処理を試みて失敗した」ことの証拠になる
 /// （スキップのメッセージが出ないこと、`prepare` の実行ログが出ることで確認する）。
 #[test]
@@ -467,14 +491,14 @@ fn auto_overwrite_bypasses_skip_and_reaches_analyze() {
     let existing_out = tmp_dir.join("IN_CMcut.mp4");
     std::fs::write(&existing_out, b"stale placeholder").expect("既存出力を書けること");
 
-    let output = run_auto(
+    let output = run_auto_without_tools(
         &["--overwrite", input.to_str().unwrap()],
         &tmp_dir.join("cache"),
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
-    // dtvindex が無い環境なので analyze で失敗する = exit code 1。
+    // 外部ツールを引けない子プロセスなので analyze で失敗する = exit code 1。
     assert_eq!(
         output.status.code(),
         Some(1),
@@ -533,10 +557,13 @@ fn auto_batch_isolates_failures_and_reports_tally() {
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }
 
-/// 完了条件: `--analyze-only` で止めたあと、`cut` 単体で続けられる（`trim`/`dtvi`
-/// のパスが明示的に表示される）。この環境では `dtvindex` が無いため実際には
-/// analyze で失敗するが、失敗するのが `cut` ではなく `analyze` の段階であること
+/// 完了条件: `--analyze-only` で `cut` へ進まない。[`run_auto_without_tools`] で
+/// analyze を必ず失敗させ、失敗するのが `cut` ではなく `analyze` の段階であること
 /// （`prepare` は実行されるが `[auto] cut:` は出ないこと）を確認する。
+///
+/// 「止めたあと `cut` 単体で続けられる（`trim`/`dtvi` のパスが表示される）」側は
+/// analyze が成功しないと確認できないため、実ツールを使う `#[ignore]` 付きの
+/// E2E が担当する。
 #[test]
 fn auto_analyze_only_stops_before_cut() {
     if common::skip_if_fixture_missing() {
@@ -547,7 +574,7 @@ fn auto_analyze_only_stops_before_cut() {
     let input = tmp_dir.join("IN.mp4");
     std::fs::copy(common::fixture_path(), &input).expect("フィクスチャをコピーできること");
 
-    let output = run_auto(
+    let output = run_auto_without_tools(
         &["--analyze-only", input.to_str().unwrap()],
         &tmp_dir.join("cache"),
     );

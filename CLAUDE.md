@@ -38,9 +38,11 @@ docs/architecture.md        現在の構成・自己検証・未対応の入力�
 
 ```console
 $ cargo test                  # 単体テスト
-$ cargo test -- --ignored     # E2E（要 ffmpeg / ffprobe とフィクスチャ）
+$ cargo test -- --ignored     # E2E（要 ffmpeg / ffprobe / 外部3ツールとフィクスチャ）
 $ bash tests/fixtures/gen.sh   # フィクスチャ生成（コミットされていない）
 ```
+
+外部3ツール（chapter_exe / join_logo_scp / dtvindex）の用意は [docs/toolchain-macos.md](docs/toolchain-macos.md)。**テストは3ツールが有る環境でも無い環境でも通る**（どちらか一方でしか通らない状態にしないこと）。「ツールが見つからない」ことを期待するテストは、ツールを `PATH` に入れた環境では前提が崩れるため、子プロセスの `PATH` を空にして自分で条件を作る（`tests/auto_e2e.rs` の `run_auto_without_tools`、`src/analyze.rs` の `run_propagates_tool_resolution_failure_with_searched_locations`）。
 
 フィクスチャの**音声は時間変化する信号**にしてある（定常サイン波ではコーデックによって音声パケットが同一バイト列になり、罠 4 を検出できない）。`gen.sh` は Opus 版 `sample.mp4` と AAC 版 `sample_aac.mp4` を同じ映像条件で生成する。映像側のパラメータを変えると `tests/data/sample.dtvi` が使えなくなるので変えないこと。
 

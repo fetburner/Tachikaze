@@ -223,7 +223,8 @@ mod tests {
     use std::collections::HashMap;
     use std::path::Path;
 
-    const FIXTURE: &str = "tests/fixtures/sample.mp4";
+    // cwd 非依存にする（`external::tests` がプロセスの cwd を一時的に変えるため）。
+    const FIXTURE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/sample.mp4");
 
     /// `stsd` に指定したコーデックだけを持つ、それ以外はデフォルトの `Trak`。
     ///

@@ -578,7 +578,8 @@ mod tests {
 
     // --- write_mp4: フィクスチャを使った統合テスト ---
 
-    const FIXTURE: &str = "tests/fixtures/sample.mp4";
+    // cwd 非依存にする（`external::tests` がプロセスの cwd を一時的に変えるため）。
+    const FIXTURE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/sample.mp4");
 
     fn skip_if_fixture_missing() -> bool {
         if Path::new(FIXTURE).exists() {

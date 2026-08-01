@@ -302,6 +302,11 @@ pub fn parse_jls_set_arg(raw: &str) -> Result<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // `TACHIKAZE_CACHE_DIR` を書き換えるロックは `workdir::tests` /
+    // `commands::tests` と共有する（`crate::workdir::test_support` の doc
+    // comment 参照）。このモジュールは環境変数を書き換えないが、`WorkDir` 経由で
+    // **読む**テストがあるため、同じロックを取る必要がある（下記参照）。
+    use crate::workdir::test_support::{EnvVarGuard, ENV_LOCK};
     use std::process;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -441,6 +446,19 @@ mod tests {
         // 探したかが分かるエラーになることを確認する。`resolve_tool` が既に
         // その情報を組み立てているので、ここでは `run` から素通しで伝わる
         // ことだけを確認する。
+        //
+        // `resolve_from_dirs` は tool_dir が空振りすると最後に `PATH` へ
+        // フォールバックする（`crate::tools` の doc comment の探索順序 4）。
+        // したがって `docs/toolchain-macos.md` の手順どおりに3ツールを `PATH`
+        // へ入れた環境では、空の tool_dir を渡しても解決が**成功**してしまい、
+        // このテストは「見つからない」前提を失う。`PATH` を空にして隔離する
+        // （`tools::tests::resolve_from_dirs_reports_all_searched_locations_when_missing`
+        // と同じ手法。環境変数はプロセス全体で共有されるので `ENV_LOCK` が要る）。
+        let _env_guard = ENV_LOCK.lock().unwrap();
+        let _path_env = EnvVarGuard::set("PATH", "");
+        let env_tool_dir = unique_scratch_dir("missing-tools-env");
+        let _tool_dir_env = EnvVarGuard::set("TACHIKAZE_TOOL_DIR", &env_tool_dir);
+
         let empty_tool_dir = unique_scratch_dir("missing-tools");
         let output_dir = unique_scratch_dir("missing-tools-output");
         let output = output_dir.join("trim.avs");
@@ -468,6 +486,7 @@ mod tests {
         );
 
         fs::remove_dir_all(&empty_tool_dir).ok();
+        fs::remove_dir_all(&env_tool_dir).ok();
         fs::remove_dir_all(&output_dir).ok();
     }
 
@@ -477,6 +496,17 @@ mod tests {
         // stderr を出す。chapter_exe を失敗させ、(1) エラーメッセージに
         // chapter_exe の stderr が含まれること、(2) 後段の join_logo_scp が
         // 一度も起動されないこと（マーカーファイルが作られない）を確認する。
+        //
+        // このテストは入力が実在し `work_dir: None` / `no_keep_work: false` の
+        // ため `WorkDir::new` が `TACHIKAZE_CACHE_DIR` を**読む**。環境変数は
+        // プロセス全体で共有されるので、読むだけでも `ENV_LOCK` を取らないと、
+        // 並行して書き換える側（`commands::tests` / `workdir::tests`）の値が
+        // 漏れ込む。実際に、このテストが `commands::tests` のキャッシュ
+        // ディレクトリを掴んで失敗した。自分のキャッシュ位置も明示して隔離する。
+        let _env_guard = ENV_LOCK.lock().unwrap();
+        let cache_root = unique_scratch_dir("stop-on-failure-cache");
+        let _cache_env = EnvVarGuard::set("TACHIKAZE_CACHE_DIR", &cache_root);
+
         let tool_dir = unique_scratch_dir("stop-on-failure-tools");
         let input_dir = unique_scratch_dir("stop-on-failure-input");
         let output_dir = unique_scratch_dir("stop-on-failure-output");
@@ -531,6 +561,7 @@ mod tests {
         fs::remove_dir_all(&tool_dir).ok();
         fs::remove_dir_all(&input_dir).ok();
         fs::remove_dir_all(&output_dir).ok();
+        fs::remove_dir_all(&cache_root).ok();
     }
 
     // --- 統合テスト（実バイナリが必要） ---
@@ -539,17 +570,29 @@ mod tests {
     /// analyze パイプライン全体が `Trim(...)` を含む `TrimList` を返すことを
     /// 確認する統合テスト。
     ///
-    /// この環境には3ツールの実バイナリがビルドされておらず、用意にも時間が
-    /// かかる（`docs/toolchain-macos.md` 参照）ため既定では無視する。実行する
-    /// 場合は該当手順でビルドした上で `TACHIKAZE_TOOL_DIR`（または
-    /// `--tool-dir` 相当）と実サンプル mp4 のパスを用意し、
-    /// `cargo test -- --ignored` で回すこと。
+    /// 3ツールの実バイナリはリポジトリに含まれず、用意にも時間がかかる
+    /// （`docs/toolchain-macos.md` 参照）ため既定では無視する。実行する場合は
+    /// 該当手順でビルドし、`PATH` か `TACHIKAZE_TOOL_DIR`（または `--tool-dir`
+    /// 相当）から引けるようにした上で、`tests/fixtures/gen.sh` でフィクスチャを
+    /// 生成し `cargo test -- --ignored` で回すこと。
     #[test]
     #[ignore = "dtvindex/chapter_exe/join_logo_scp の実バイナリと実サンプルmp4が必要（docs/toolchain-macos.md）"]
     fn analyze_run_produces_trim_list_with_real_tools() {
+        // 上の `run_stops_pipeline_and_surfaces_stderr_on_first_failure` と同じ
+        // 理由で `ENV_LOCK` を取る（実在する入力 + `work_dir: None` なので
+        // `WorkDir::new` が `TACHIKAZE_CACHE_DIR` を読む）。あわせて利用者の
+        // 実際のキャッシュ（`~/.cache/tachikaze`）を汚さないようにする。
+        let _env_guard = ENV_LOCK.lock().unwrap();
+        let cache_root = unique_scratch_dir("integration-cache");
+        let _cache_env = EnvVarGuard::set("TACHIKAZE_CACHE_DIR", &cache_root);
+
         let output_dir = unique_scratch_dir("integration-output");
         let config = AnalyzeConfig {
-            input: PathBuf::from("tests/fixtures/sample.mp4"),
+            // cwd 非依存にする（`external::tests` がプロセスの cwd を一時的に変えるため）。
+            input: PathBuf::from(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/sample.mp4"
+            )),
             output: output_dir.join("trim.avs"),
             tool_dir: None,
             work_dir: None,
@@ -562,5 +605,6 @@ mod tests {
         assert!(!output.trim.ranges().is_empty());
 
         fs::remove_dir_all(&output_dir).ok();
+        fs::remove_dir_all(&cache_root).ok();
     }
 }
