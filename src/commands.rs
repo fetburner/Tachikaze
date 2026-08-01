@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, bail, Context};
 use mp4_atom::{Codec, Moov};
 
-use crate::cli::{Cli, Commands};
+use crate::cli::{AnalyzeArgs, AutoArgs, Cli, Commands, CutArgs, PrepareArgs, RemapSubsArgs};
 use crate::dtvi::Dtvi;
 use crate::mp4io::read::SampleInfo;
 use crate::order::{DecodeIdx, DisplayIdx, OrderMap};
@@ -44,95 +44,11 @@ pub fn run(cli: Cli) -> anyhow::Result<ExitOutcome> {
     let tool_dir = cli.tool_dir.clone();
 
     match cli.command {
-        Commands::Analyze {
-            input,
-            output,
-            report,
-            work_dir,
-            no_keep_work,
-            jls_set,
-            jl_file,
-        } => {
-            run_analyze(
-                tool_dir,
-                input,
-                output,
-                report,
-                work_dir,
-                no_keep_work,
-                jls_set,
-                jl_file,
-            )?;
-            Ok(ExitOutcome::Success)
-        }
-        Commands::Cut {
-            input,
-            trim,
-            output,
-            snap,
-            video_only,
-            verify,
-            dtvi,
-            cm_output,
-            segment_map,
-        } => {
-            run_cut(
-                tool_dir,
-                input,
-                trim,
-                output,
-                snap,
-                video_only,
-                verify,
-                dtvi,
-                cm_output,
-                segment_map,
-            )?;
-            Ok(ExitOutcome::Success)
-        }
-        Commands::Prepare { input, subs } => {
-            run_prepare(tool_dir, input, subs)?;
-            Ok(ExitOutcome::Success)
-        }
-        Commands::RemapSubs {
-            input,
-            segment_map,
-            subs,
-            output,
-        } => {
-            run_remap_subs(input, segment_map, subs, output)?;
-            Ok(ExitOutcome::Success)
-        }
-        Commands::Auto {
-            inputs,
-            output,
-            cm_output,
-            no_cm,
-            force,
-            overwrite,
-            analyze_only,
-            no_subtitles,
-            snap,
-            verify,
-            jl_file,
-            jls_set,
-            work_dir,
-        } => run_auto(
-            tool_dir,
-            inputs,
-            output,
-            cm_output,
-            no_cm,
-            force,
-            overwrite,
-            analyze_only,
-            no_subtitles,
-            snap,
-            verify,
-            jl_file,
-            jls_set,
-            work_dir,
-        ),
+        Commands::Analyze(args) => run_analyze(tool_dir, args).map(|()| ExitOutcome::Success),
+        Commands::Cut(args) => run_cut(tool_dir, args).map(|()| ExitOutcome::Success),
+        Commands::Prepare(args) => run_prepare(tool_dir, args).map(|()| ExitOutcome::Success),
+        Commands::RemapSubs(args) => run_remap_subs(args).map(|()| ExitOutcome::Success),
+        Commands::Auto(args) => run_auto(tool_dir, args),
     }
 }
 
@@ -147,23 +63,23 @@ pub fn run(cli: Cli) -> anyhow::Result<ExitOutcome> {
 /// （exit code 2）。すべて完了 / スキップなら [`ExitOutcome::Success`]（exit code 0）。
 /// 失敗を最優先するのは、「止まった」（人手を待っているだけ）より「壊れた」方が
 /// 深刻度が高く、バッチ運用で見逃してはいけないため。
-#[allow(clippy::too_many_arguments)]
-fn run_auto(
-    tool_dir: Option<PathBuf>,
-    inputs: Vec<PathBuf>,
-    output: Option<PathBuf>,
-    cm_output: Option<PathBuf>,
-    no_cm: bool,
-    force: bool,
-    overwrite: bool,
-    analyze_only: bool,
-    no_subtitles: bool,
-    snap: cli::Snap,
-    verify: bool,
-    jl_file: Option<PathBuf>,
-    jls_set: Vec<String>,
-    work_dir: Option<PathBuf>,
-) -> anyhow::Result<ExitOutcome> {
+fn run_auto(tool_dir: Option<PathBuf>, args: AutoArgs) -> anyhow::Result<ExitOutcome> {
+    let AutoArgs {
+        inputs,
+        output,
+        cm_output,
+        no_cm,
+        force,
+        overwrite,
+        analyze_only,
+        no_subtitles,
+        snap,
+        verify,
+        jl_file,
+        jls_set,
+        work_dir,
+    } = args;
+
     let config = auto::AutoConfig {
         tool_dir,
         output,
@@ -212,11 +128,8 @@ fn exit_outcome_for_tally(tally: &auto::BatchTally) -> anyhow::Result<ExitOutcom
 
 /// `prepare` サブコマンドの実行。処理本体は [`prepare::run`] に集約してあり、
 /// ここでは結果を人間向けに表示するだけ。
-fn run_prepare(
-    tool_dir: Option<PathBuf>,
-    input: PathBuf,
-    subs: Option<PathBuf>,
-) -> anyhow::Result<()> {
+fn run_prepare(tool_dir: Option<PathBuf>, args: PrepareArgs) -> anyhow::Result<()> {
+    let PrepareArgs { input, subs } = args;
     let outcome = prepare::run(&input, tool_dir.as_deref(), subs.as_deref())?;
 
     if outcome.ran_ffmpeg {
@@ -242,12 +155,13 @@ fn run_prepare(
 /// 件数を報告する。処理そのもの（分類・時刻変換）は `subtitle` モジュールに集約して
 /// あり、ここでは配線とログ出力だけを行う（`commands.rs` はアルゴリズムを持たない
 /// 方針、本ファイル冒頭の doc comment参照）。
-fn run_remap_subs(
-    input: PathBuf,
-    segment_map_path: Option<PathBuf>,
-    subs_path_arg: Option<PathBuf>,
-    output: Option<PathBuf>,
-) -> anyhow::Result<()> {
+fn run_remap_subs(args: RemapSubsArgs) -> anyhow::Result<()> {
+    let RemapSubsArgs {
+        input,
+        segment_map: segment_map_path,
+        subs: subs_path_arg,
+        output,
+    } = args;
     let segment_map_path = resolve_segment_map_path(segment_map_path, &input)?;
     let segment_map_json = fs::read_to_string(&segment_map_path).with_context(|| {
         format!(
@@ -384,17 +298,17 @@ pub(crate) fn default_remap_subs_output_path(input: &Path, extension: &str) -> P
     dir.join(format!("{stem}_CMcut.{extension}"))
 }
 
-#[allow(clippy::too_many_arguments)]
-fn run_analyze(
-    tool_dir: Option<PathBuf>,
-    input: PathBuf,
-    output: PathBuf,
-    show_report: bool,
-    work_dir: Option<PathBuf>,
-    no_keep_work: bool,
-    jls_set: Vec<String>,
-    jl_file: Option<PathBuf>,
-) -> anyhow::Result<()> {
+fn run_analyze(tool_dir: Option<PathBuf>, args: AnalyzeArgs) -> anyhow::Result<()> {
+    let AnalyzeArgs {
+        input,
+        output,
+        report: show_report,
+        work_dir,
+        no_keep_work,
+        jls_set,
+        jl_file,
+    } = args;
+
     let jls_set = jls_set
         .iter()
         .map(|raw| analyze::parse_jls_set_arg(raw))
@@ -468,19 +382,19 @@ pub(crate) fn fps_from_dtvi(dtvi: &dtvi::Dtvi) -> f64 {
 /// 同一クレート内の `auto` から呼べるようにした。この変更で `cut` サブコマンド自体の
 /// 標準出力・exit code は変わらない（`tests/segmap_e2e.rs` 等の既存 E2E がそのまま通る
 /// ことで確認済み）。
-#[allow(clippy::too_many_arguments)]
-fn run_cut(
-    tool_dir: Option<PathBuf>,
-    input: PathBuf,
-    trim_path: PathBuf,
-    output: PathBuf,
-    snap: cli::Snap,
-    video_only: bool,
-    verify_with_ffprobe: bool,
-    dtvi_path: Option<PathBuf>,
-    cm_output: Option<PathBuf>,
-    segment_map_path: Option<PathBuf>,
-) -> anyhow::Result<()> {
+fn run_cut(tool_dir: Option<PathBuf>, args: CutArgs) -> anyhow::Result<()> {
+    let CutArgs {
+        input,
+        trim: trim_path,
+        output,
+        snap,
+        video_only,
+        verify: verify_with_ffprobe,
+        dtvi: dtvi_path,
+        cm_output,
+        segment_map: segment_map_path,
+    } = args;
+
     let outcome = execute_cut(CutParams {
         tool_dir,
         input,
