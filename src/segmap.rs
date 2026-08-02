@@ -508,7 +508,9 @@ mod tests {
     #[test]
     fn from_json_rejects_malformed_syntax() {
         let err = SegmentMap::from_json("{ not json").expect_err("構文エラーのはず");
-        assert!(err.to_string().contains("区間マップのJSONパースに失敗しました"));
+        assert!(err
+            .to_string()
+            .contains("区間マップのJSONパースに失敗しました"));
     }
 
     #[test]
