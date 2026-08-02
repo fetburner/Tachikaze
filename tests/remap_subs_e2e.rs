@@ -120,6 +120,8 @@ fn run_cut_with_segment_map(tmp_dir: &Path, cache_root: &Path) -> (PathBuf, Path
     std::fs::write(&trim_path, TRIM_AVS_CONTENT).expect("trim.avs を書けること");
 
     let output = Command::new(env!("CARGO_BIN_EXE_tachikaze"))
+        .arg("--cache-dir")
+        .arg(cache_root)
         .arg("cut")
         .arg(&fixture)
         .arg("--trim")
@@ -130,7 +132,6 @@ fn run_cut_with_segment_map(tmp_dir: &Path, cache_root: &Path) -> (PathBuf, Path
         .arg(dtvi_path())
         .arg("--segment-map")
         .arg(&segmap_path)
-        .env("TACHIKAZE_CACHE_DIR", cache_root)
         .output()
         .expect("tachikaze cut の起動に失敗した");
     assert!(
@@ -478,6 +479,8 @@ fn remap_subs_resolves_from_cache_and_explicit_args_take_priority() {
     let out_path = tmp_dir.join("out.mp4");
     std::fs::write(&trim_path, TRIM_AVS_CONTENT).expect("trim.avs を書けること");
     let cut_output = Command::new(env!("CARGO_BIN_EXE_tachikaze"))
+        .arg("--cache-dir")
+        .arg(&cache_root)
         .arg("cut")
         .arg(&fixture)
         .arg("--trim")
@@ -486,25 +489,16 @@ fn remap_subs_resolves_from_cache_and_explicit_args_take_priority() {
         .arg(&out_path)
         .arg("--dtvi")
         .arg(dtvi_path())
-        .env("TACHIKAZE_CACHE_DIR", &cache_root)
         .output()
         .expect("tachikaze cut の起動に失敗した");
     assert!(cut_output.status.success());
 
     // `prepare` を経由せず、`workdir::subs_path` が指すキャッシュの場所へ直接
     // 字幕を置く(このテストの関心は remap-subs のパス解決であって prepare の
-    // 抽出処理ではないため)。`workdir::subs_path` は現在の**プロセス**の
-    // `TACHIKAZE_CACHE_DIR` を見る(子プロセスの `.env()` とは別)ため、ここだけ
-    // 一時的にプロセス環境変数を差し替える。他のテストは `Command::env` で
-    // 子プロセスにだけ渡しており、プロセス全体の環境変数には触れないため競合しない。
-    let original_cache_dir = std::env::var_os("TACHIKAZE_CACHE_DIR");
-    std::env::set_var("TACHIKAZE_CACHE_DIR", &cache_root);
-    let cache_subs_path =
-        workdir::subs_path(&fixture, "ass").expect("cache subs path を計算できること");
-    match original_cache_dir {
-        Some(v) => std::env::set_var("TACHIKAZE_CACHE_DIR", v),
-        None => std::env::remove_var("TACHIKAZE_CACHE_DIR"),
-    }
+    // 抽出処理ではないため)。キャッシュの根を引数で直接渡せる(E12-2)ため、
+    // 環境変数をプロセス全体で差し替える必要はない。
+    let cache_subs_path = workdir::subs_path(Some(&cache_root), &fixture, "ass")
+        .expect("cache subs path を計算できること");
     std::fs::create_dir_all(cache_subs_path.parent().unwrap()).expect("親ディレクトリを作れること");
     let cache_ass_content = "[Events]\r\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\r\nDialogue: 0,0:00:00.00,0:00:00.50,Default,,0,0,0,,from cache\r\n";
     std::fs::write(&cache_subs_path, cache_ass_content).expect("キャッシュへ字幕を書けること");
@@ -516,9 +510,10 @@ fn remap_subs_resolves_from_cache_and_explicit_args_take_priority() {
     ));
     let _ = std::fs::remove_file(&default_out); // 前回実行の残骸を消しておく
     let auto_output = Command::new(env!("CARGO_BIN_EXE_tachikaze"))
+        .arg("--cache-dir")
+        .arg(&cache_root)
         .arg("remap-subs")
         .arg(&fixture)
-        .env("TACHIKAZE_CACHE_DIR", &cache_root)
         .output()
         .expect("tachikaze remap-subs(自動解決) の起動に失敗した");
     assert!(
@@ -551,6 +546,8 @@ fn remap_subs_resolves_from_cache_and_explicit_args_take_priority() {
     // (中身がキャッシュのものと同一でも、経路が明示指定であることを確認できれば
     // 十分)。
     let cut_output2 = Command::new(env!("CARGO_BIN_EXE_tachikaze"))
+        .arg("--cache-dir")
+        .arg(&cache_root)
         .arg("cut")
         .arg(&fixture)
         .arg("--trim")
@@ -561,13 +558,14 @@ fn remap_subs_resolves_from_cache_and_explicit_args_take_priority() {
         .arg(dtvi_path())
         .arg("--segment-map")
         .arg(&explicit_segmap)
-        .env("TACHIKAZE_CACHE_DIR", &cache_root)
         .output()
         .expect("tachikaze cut(2回目) の起動に失敗した");
     assert!(cut_output2.status.success());
 
     let explicit_out = tmp_dir.join("explicit_result.ass");
     let explicit_run = Command::new(env!("CARGO_BIN_EXE_tachikaze"))
+        .arg("--cache-dir")
+        .arg(&cache_root)
         .arg("remap-subs")
         .arg(&fixture)
         .arg("--segment-map")
@@ -576,7 +574,6 @@ fn remap_subs_resolves_from_cache_and_explicit_args_take_priority() {
         .arg(&explicit_subs)
         .arg("-o")
         .arg(&explicit_out)
-        .env("TACHIKAZE_CACHE_DIR", &cache_root)
         .output()
         .expect("tachikaze remap-subs(明示指定) の起動に失敗した");
     assert!(

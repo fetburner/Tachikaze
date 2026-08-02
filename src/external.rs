@@ -45,23 +45,23 @@ fn tail_lines(text: &str, max_lines: usize) -> String {
 ///
 /// - `program`: 実行ファイル（PATH 解決に従う。絶対パスも可）
 /// - `args`: コマンドライン引数
-/// - `work_dir`: 作業ディレクトリ（カレントディレクトリとして設定する）
+/// - `cwd`: 作業ディレクトリ（カレントディレクトリとして設定する）
 ///
 /// stdout / stderr は逐次転送せず、`Command::output()` により文字列として
 /// 丸ごと回収する。終了コードが 0 以外、または起動自体に失敗した場合はエラーを返す。
 /// 実行時間は `eprintln!` でログに出す（解析全体で数秒〜十数秒が正常）。
 ///
-/// `program` と `work_dir` が相対パスのとき、呼び出し元のカレントディレクトリを
+/// `program` と `cwd` が相対パスのとき、呼び出し元のカレントディレクトリを
 /// 基準に絶対パスへ直してから起動する。`Command::current_dir` は相対の実行
 /// ファイルパスも新しい cwd 基準で解決するため、`PATH` に `tools` のような
-/// 相対エントリが含まれる場合、そのまま起動すると `work_dir` 配下の
+/// 相対エントリが含まれる場合、そのまま起動すると `cwd` 配下の
 /// `tools/...` を探しにいって `No such file or directory` になる。
-pub fn run(program: &str, args: &[&str], work_dir: &Path) -> anyhow::Result<ExternalOutput> {
+pub fn run(program: &str, args: &[&str], cwd: &Path) -> anyhow::Result<ExternalOutput> {
     let absolute_program = absolutize_program(program)?;
-    let absolute_work_dir = absolutize_path(work_dir).with_context(|| {
+    let absolute_cwd = absolutize_path(cwd).with_context(|| {
         format!(
             "作業ディレクトリの絶対パス解決に失敗しました: {}",
-            work_dir.display()
+            cwd.display()
         )
     })?;
     let program_display = absolute_program.to_string_lossy();
@@ -70,19 +70,19 @@ pub fn run(program: &str, args: &[&str], work_dir: &Path) -> anyhow::Result<Exte
 
     let output = Command::new(&absolute_program)
         .args(args)
-        .current_dir(&absolute_work_dir)
+        .current_dir(&absolute_cwd)
         .output()
         .with_context(|| {
             format!(
-                "外部プロセスの起動に失敗しました: `{cmdline}` (work_dir: {})",
-                absolute_work_dir.display()
+                "外部プロセスの起動に失敗しました: `{cmdline}` (cwd: {})",
+                absolute_cwd.display()
             )
         })?;
 
     let elapsed = started.elapsed();
     eprintln!(
-        "[external] `{cmdline}` を実行 (work_dir: {}, 所要時間: {:.3}秒)",
-        absolute_work_dir.display(),
+        "[external] `{cmdline}` を実行 (cwd: {}, 所要時間: {:.3}秒)",
+        absolute_cwd.display(),
         elapsed.as_secs_f64()
     );
 
@@ -92,8 +92,8 @@ pub fn run(program: &str, args: &[&str], work_dir: &Path) -> anyhow::Result<Exte
     if !output.status.success() {
         let stderr_tail = tail_lines(&stderr, 20);
         bail!(
-            "外部プロセスが失敗しました: `{cmdline}`\n  work_dir: {}\n  終了コード: {}\n  stderr (末尾20行):\n{}",
-            work_dir.display(),
+            "外部プロセスが失敗しました: `{cmdline}`\n  cwd: {}\n  終了コード: {}\n  stderr (末尾20行):\n{}",
+            cwd.display(),
             output
                 .status
                 .code()
@@ -153,7 +153,7 @@ mod tests {
     /// 走っていると、そちらが巻き添えで失敗する。実際に
     /// `mp4io::order_map::tests` がフィクスチャを相対パス
     /// `tests/fixtures/sample.mp4` で開いていて、この下の
-    /// `run_resolves_relative_program_against_caller_cwd_not_work_dir` と同時に
+    /// `run_resolves_relative_program_against_caller_cwd_not_new_cwd` と同時に
     /// 走ったときだけ「No such file or directory」で落ちた。しかも
     /// `skip_if_fixture_missing` 系のヘルパは存在確認も相対パスで行うため、
     /// **落ちずに無言でスキップして緑になる**経路もあった。
@@ -166,16 +166,16 @@ mod tests {
 
     #[test]
     fn run_captures_stdout() {
-        let work_dir = std::env::temp_dir();
-        let result = run("/bin/echo", &["hello"], &work_dir).expect("echo should succeed");
+        let cwd = std::env::temp_dir();
+        let result = run("/bin/echo", &["hello"], &cwd).expect("echo should succeed");
         assert_eq!(result.stdout.trim(), "hello");
     }
 
     #[test]
     fn run_fails_with_nonzero_exit_code() {
-        let work_dir = std::env::temp_dir();
-        let err = run("/bin/sh", &["-c", "exit 3"], &work_dir)
-            .expect_err("exit code 3 should be an error");
+        let cwd = std::env::temp_dir();
+        let err =
+            run("/bin/sh", &["-c", "exit 3"], &cwd).expect_err("exit code 3 should be an error");
         let message = err.to_string();
         assert!(
             message.contains("終了コード: 3") || message.contains("3"),
@@ -189,8 +189,8 @@ mod tests {
 
     #[test]
     fn run_reports_missing_program_clearly() {
-        let work_dir = std::env::temp_dir();
-        let err = run("this-binary-does-not-exist-tachikaze", &[], &work_dir)
+        let cwd = std::env::temp_dir();
+        let err = run("this-binary-does-not-exist-tachikaze", &[], &cwd)
             .expect_err("missing binary should be an error");
         let message = err.to_string();
         assert!(
@@ -200,7 +200,7 @@ mod tests {
     }
 
     #[test]
-    fn run_resolves_relative_program_against_caller_cwd_not_work_dir() {
+    fn run_resolves_relative_program_against_caller_cwd_not_new_cwd() {
         // `tools/dummy_tool` のような相対パスを、`current_dir(work)` の後でも
         // 呼び出し元 cwd 基準で解決できることを確認する。
         let _guard = CWD_LOCK.lock().unwrap();
@@ -208,9 +208,9 @@ mod tests {
         let root =
             std::env::temp_dir().join(format!("tachikaze-external-rel-{}", std::process::id()));
         let relative_bin_dir = root.join("tools");
-        let work_dir = root.join("work");
+        let cwd = root.join("work");
         fs::create_dir_all(&relative_bin_dir).unwrap();
-        fs::create_dir_all(&work_dir).unwrap();
+        fs::create_dir_all(&cwd).unwrap();
 
         #[cfg(unix)]
         {

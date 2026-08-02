@@ -15,16 +15,24 @@
 //! 再実行すれば作り直せる**キャッシュ**であり、XDG のキャッシュディレクトリの
 //! 定義（消えても再生成できるデータ）と一致する。既定では入力ファイルごとに
 //! 決まるキャッシュディレクトリを使い、削除しないことで `cut --dtvi` へ
-//! そのまま繋げられるようにしている（`--no-keep-work` で従来の使い捨て
-//! 一時ディレクトリに戻せる）。
+//! そのまま繋げられるようにしている。
+//!
+//! ## キャッシュの根の決め方（E12-2）
+//!
+//! かつては `TACHIKAZE_CACHE_DIR` → `XDG_CACHE_HOME` → `HOME` → `env::temp_dir()`
+//! の4段の環境変数フォールバックと、CLI の `--work-dir` / `--no-keep-work` を
+//! 合わせて6つの口が同じ「キャッシュの置き場所」を決めていた。どれが効いているか
+//! 読んで確かめないと分からず、環境変数を書き換えるテストがプロセス共有の状態を
+//! 触るため直列化用の `Mutex` が必要になっていた。
+//!
+//! 今は CLI のグローバルオプション `--cache-dir <DIR>`（[`crate::cli::Cli::cache_dir`]）
+//! → [`cache_root`] の既定値の2段だけにしてある。`--work-dir` / `--no-keep-work` は
+//! 削除した（使い捨てにしたい場合は `--cache-dir "$(mktemp -d)"` を使う）。
 
-use std::env;
 use std::fs;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
-use std::process;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 
@@ -45,75 +53,41 @@ const SAFE_STEM_MAX_CHARS: usize = 80;
 
 /// analyze / cut の中間ファイルを置く作業ディレクトリ。
 ///
-/// - `--work-dir` で明示された場合: そのディレクトリを使い、処理後も削除しない
-///   （中間ファイルを見たい場合があるため）。
-/// - 未指定・既定の場合: 入力ファイルごとに決まる XDG キャッシュディレクトリを
-///   使い、処理後も削除しない。同じ入力を再度 `analyze` すると同じディレクトリ
-///   を再利用し、中間ファイルは上書きされる（`dtvindex` / `chapter_exe` /
-///   `join_logo_scp` はいずれも既存の出力先へ実害なく上書きすることを実機で
-///   確認済み）。
-/// - `--no-keep-work` 指定時: 従来どおり一時ディレクトリを作り、成功時のみ
-///   削除する。
-///
-/// いずれの場合も失敗時は原因調査のため中間ファイルを残す。
+/// 入力ファイルごとに決まるキャッシュディレクトリ（[`cache_dir_for_input`]）を
+/// 使う。処理後も削除しない: 同じ入力を再度 `analyze` すると同じディレクトリを
+/// 再利用し、中間ファイルは上書きされる（`dtvindex` / `chapter_exe` /
+/// `join_logo_scp` はいずれも既存の出力先へ実害なく上書きすることを実機で
+/// 確認済み）。失敗時も原因調査のため中間ファイルを残す。
 #[derive(Debug)]
 pub struct WorkDir {
     path: PathBuf,
-    /// `true` なら `finish` で削除しない（`--work-dir` 指定時、または既定の
-    /// キャッシュディレクトリ使用時）。
-    keep: bool,
 }
 
 impl WorkDir {
-    /// 作業ディレクトリを用意する。
+    /// 作業ディレクトリ（入力ごとのキャッシュディレクトリ）を用意する。
     ///
-    /// - `explicit` が `Some` の場合: そのディレクトリを使う（無ければ作る）。
-    ///   `finish` では削除しない。`input` / `no_keep_work` は無視する。
-    /// - `explicit` が `None` の場合:
-    ///   - `no_keep_work == true`: OS の一時ディレクトリ配下にユニークな
-    ///     ディレクトリを新規作成する。`finish(true)` で削除される
-    ///     （`--no-keep-work` 指定時の従来どおりの挙動）。
-    ///   - `no_keep_work == false`（既定）: `input` の絶対パスから決まる
-    ///     XDG キャッシュディレクトリを使う（無ければ作る）。`finish` では
-    ///     削除しない。
-    pub fn new(explicit: Option<PathBuf>, input: &Path, no_keep_work: bool) -> Result<Self> {
-        match explicit {
-            Some(path) => {
-                fs::create_dir_all(&path).with_context(|| {
-                    format!("作業ディレクトリの作成に失敗しました: {}", path.display())
-                })?;
-                // 相対パスのまま保持すると、`external::run` が `current_dir` を
-                // このディレクトリに切り替えたあと、引数の `work/work.mp4` などが
-                // 二重にネストして解決される。作成直後に絶対化しておく。
-                let path = fs::canonicalize(&path).with_context(|| {
-                    format!(
-                        "作業ディレクトリの絶対パス解決に失敗しました: {}",
-                        path.display()
-                    )
-                })?;
-                Ok(Self { path, keep: true })
-            }
-            None if no_keep_work => {
-                let path = create_unique_temp_dir()?;
-                Ok(Self { path, keep: false })
-            }
-            None => {
-                let path = cache_dir_for_input(input)?;
-                fs::create_dir_all(&path).with_context(|| {
-                    format!(
-                        "キャッシュディレクトリの作成に失敗しました: {}",
-                        path.display()
-                    )
-                })?;
-                let path = fs::canonicalize(&path).with_context(|| {
-                    format!(
-                        "キャッシュディレクトリの絶対パス解決に失敗しました: {}",
-                        path.display()
-                    )
-                })?;
-                Ok(Self { path, keep: true })
-            }
-        }
+    /// - `cache_dir`: `--cache-dir`（キャッシュの根）。`None` なら [`cache_root`]
+    ///   の既定値を使う。
+    /// - `input`: このキャッシュディレクトリを持つ入力ファイル。絶対パスの
+    ///   ハッシュからディレクトリ名を決める（[`cache_dir_for_input`]）。
+    pub fn new(cache_dir: Option<&Path>, input: &Path) -> Result<Self> {
+        let path = cache_dir_for_input(cache_dir, input)?;
+        fs::create_dir_all(&path).with_context(|| {
+            format!(
+                "キャッシュディレクトリの作成に失敗しました: {}",
+                path.display()
+            )
+        })?;
+        // 相対パスのまま保持すると、`external::run` が `current_dir` を
+        // このディレクトリに切り替えたあと、引数の `work/work.mp4` などが
+        // 二重にネストして解決される。作成直後に絶対化しておく。
+        let path = fs::canonicalize(&path).with_context(|| {
+            format!(
+                "キャッシュディレクトリの絶対パス解決に失敗しました: {}",
+                path.display()
+            )
+        })?;
+        Ok(Self { path })
     }
 
     /// 作業ディレクトリのパス。
@@ -197,98 +171,114 @@ impl WorkDir {
 
     /// 処理完了時に呼ぶ。
     ///
-    /// - `--work-dir` 指定時、または既定のキャッシュディレクトリ使用時
-    ///   （`keep == true`）: ディレクトリは削除しない。成功時は `cut --dtvi`
-    ///   にそのまま渡せる `.dtvi` の場所をログへ出す。
-    /// - `--no-keep-work` 指定時（`keep == false`）:
-    ///   - `success == true`: 一時ディレクトリを削除する。
-    ///   - `success == false`: 削除せず、調査用にパスをログへ出す
-    ///     （再解析は数秒だが、失敗の調査には中間ファイルが要る）。
+    /// キャッシュは既定で残すため、削除は一切行わない（`--no-keep-work` 相当の
+    /// 使い捨て経路は削除済み。使い捨てにしたい場合は呼び出し側で
+    /// `--cache-dir "$(mktemp -d)"` を使う）。成功時は `cut --dtvi` にそのまま
+    /// 渡せる `.dtvi` の場所をログへ出すだけ。
     pub fn finish(self, success: bool) {
-        if self.keep {
-            if success {
-                eprintln!(
-                    "[workdir] 中間ファイルを残しました: {}（cut --dtvi {} で使えます）",
-                    self.path.display(),
-                    self.dtvi_path().display()
-                );
-            }
-            return;
-        }
-
         if success {
-            if let Err(err) = fs::remove_dir_all(&self.path) {
-                eprintln!(
-                    "[workdir] 一時ディレクトリの削除に失敗しました: {} ({err})",
-                    self.path.display()
-                );
-            }
-        } else {
             eprintln!(
-                "[workdir] 処理に失敗したため、調査用に一時ディレクトリを残しました: {}",
-                self.path.display()
+                "[workdir] 中間ファイルを残しました: {}（cut --dtvi {} で使えます）",
+                self.path.display(),
+                self.dtvi_path().display()
             );
         }
     }
 }
 
-/// OS の一時ディレクトリ配下にユニークな作業ディレクトリを作成し、そのパスを返す。
+/// キャッシュディレクトリの根を決める。
 ///
-/// `tempfile` クレートに依存せず、PID + ナノ秒タイムスタンプで名前を作り、
-/// 衝突時はリトライする素朴な実装（`mkdtemp` 相当）。
-fn create_unique_temp_dir() -> Result<PathBuf> {
-    let base = std::env::temp_dir();
-    let pid = process::id();
-
-    for attempt in 0..100 {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let candidate = base.join(format!("tachikaze-{pid}-{nanos}-{attempt}"));
-
-        match fs::create_dir(&candidate) {
-            Ok(()) => return Ok(candidate),
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(err) => {
-                return Err(err).with_context(|| {
-                    format!(
-                        "一時ディレクトリの作成に失敗しました: {}",
-                        candidate.display()
-                    )
-                })
-            }
-        }
+/// - `explicit`（`--cache-dir`）があれば、絶対化して使う（[`absolutize_cache_dir`]）。
+/// - 無ければ `std::env::home_dir()` から既定値を組み立てる
+///   （[`default_cache_root`]）。
+///
+/// `std::env::home_dir()` の呼び出しをここに1か所だけ持つ理由は
+/// [`default_cache_root`] の doc comment参照（テストが `env` を触らずに
+/// エラー文言を検証できるよう、ホームを引数で受け取る純粋関数に分離した）。
+fn cache_root(explicit: Option<&Path>) -> Result<PathBuf> {
+    if let Some(dir) = explicit {
+        return absolutize_cache_dir(dir);
     }
-
-    anyhow::bail!(
-        "一時ディレクトリの作成に{}回失敗しました（{}配下）",
-        100,
-        base.display()
-    );
+    default_cache_root(std::env::home_dir().as_deref())
 }
 
-/// 環境変数を読み、**空文字なら未設定として扱う**（XDG Base Directory 仕様の作法）。
-fn non_empty_env(key: &str) -> Option<std::ffi::OsString> {
-    env::var_os(key).filter(|v| !v.is_empty())
+/// `--cache-dir` の値を絶対パスにする。
+///
+/// 相対パスのまま `cache_dir_for_input` の戻り値（`<cache_dir>/<入力ハッシュ>-<stem>/`）
+/// を使うと、二重解決の罠を踏む: `src/prepare.rs` は `cache_dir_for_input` の
+/// 戻り値の親ディレクトリを `external::run` の作業ディレクトリ（`current_dir`）
+/// として渡す一方、同じ戻り値を ffmpeg の出力先パスの**引数**としても渡す。
+/// `external::run` は自分の cwd 引数だけを絶対化するため、cwd 引数は絶対化
+/// されても ffmpeg への出力先引数が相対のままだと、ffmpeg はそれを新しい cwd
+/// （既に `<cache_dir>/...` を含む）からの相対として解釈し、`<cache_dir>/...`
+/// が二重にネストしたパスを探しに行って `No such file or directory` になる
+/// （実機で `tachikaze --cache-dir relcache prepare IN.mp4` で再現した）。
+/// ここで根を1か所で絶対化しておけば、そこから導出するあらゆるパス
+/// （`cache_dir_for_input` の戻り値を含む）が常に絶対パスになり、この罠を
+/// 踏まなくなる。
+///
+/// 存在しないディレクトリ（まだ作られていないキャッシュの根）も想定されるため、
+/// `fs::canonicalize` は使わない（symlink 解決が要らない用途なので、
+/// `env::current_dir()` との `join` で十分。`src/external.rs::absolutize_path`
+/// の「存在しないパスは cwd を join するだけに留める」と同じ考え方）。
+fn absolutize_cache_dir(dir: &Path) -> Result<PathBuf> {
+    if dir.is_absolute() {
+        return Ok(dir.to_path_buf());
+    }
+    let cwd = std::env::current_dir().context("カレントディレクトリの取得に失敗しました")?;
+    Ok(cwd.join(dir))
 }
 
-/// キャッシュディレクトリの根（`$TACHIKAZE_CACHE_DIR` →
-/// `${XDG_CACHE_HOME:-$HOME/.cache}/tachikaze`）を返す。
+/// `home` から既定のキャッシュルート（`<home>/.cache/tachikaze`）を組み立てる。
 ///
-/// `$HOME` が取れない環境（コンテナ等）でも `$TMPDIR` にフォールバックし、
-/// エラーにはしない。
-fn cache_root() -> PathBuf {
-    if let Some(dir) = non_empty_env("TACHIKAZE_CACHE_DIR") {
-        return PathBuf::from(dir);
-    }
-    if let Some(data_home) = non_empty_env("XDG_CACHE_HOME") {
-        return PathBuf::from(data_home).join("tachikaze");
-    }
-    if let Some(home) = non_empty_env("HOME") {
-        return PathBuf::from(home).join(".cache").join("tachikaze");
-    }
-    env::temp_dir().join("tachikaze-cache")
+/// [`cache_root`] から `std::env::home_dir()` の呼び出しを分離した純粋関数。
+/// こうすることで、「ホームディレクトリが特定できない」経路（`home: None`）を
+/// 実際に `$HOME` や passwd を触らずに `None` を渡すだけでテストできる
+/// （通常の実行環境では passwd にユーザーエントリが無いような状況を作らないと
+/// 到達できないため、実環境でのテストが書けない）。
+///
+/// ## ディレクトリ名は XDG から借りるが、環境変数は読まない
+///
+/// `.cache/tachikaze` という名前自体は XDG Base Directory 仕様の既定
+/// （`${XDG_CACHE_HOME:-~/.cache}`）と同じものを借りている（利用者にとって
+/// 見慣れた場所にするため）が、`XDG_CACHE_HOME` / `TACHIKAZE_CACHE_DIR` と
+/// いった環境変数は一切読まない。置き場所を決める口を `--cache-dir` 1本に
+/// 絞ることが本モジュールの目的（E12-2）であり、環境変数を読む経路を残すと
+/// `--cache-dir` を渡しても環境変数が別の場所を指していればどちらが効くか
+/// コードを読まないと分からなくなる。
+///
+/// ## `$TMPDIR` へフォールバックしない理由
+///
+/// `home` が取れない環境（コンテナ等）でも、`env::temp_dir()`（`$TMPDIR` 相当）
+/// へ黙ってフォールバックすることはしない。フォールバックしても「キャッシュが
+/// 知らない場所に増える」だけで何も嬉しくなく、むしろ危険: 次に別のプロセスが
+/// 別の `$TMPDIR` を引けば同じ入力に対して別のキャッシュディレクトリを掴んでしまい、
+/// `analyze` → `cut`（`--dtvi` 省略）の暗黙の受け渡しが**エラーを出さずに**外れる。
+/// 「置き場所が決まらない」ことを `--cache-dir` を促すエラーで明示させる方が、
+/// 黙って別の場所に作るより安全。
+///
+/// ## `HOME` が未設定でも、たいていエラーにはならない
+///
+/// `home` は呼び出し元（[`cache_root`]）が `std::env::home_dir()` の戻り値を
+/// そのまま渡す。`std::env::home_dir()` は Windows での挙動の問題から非推奨
+/// 扱いだった時期があるが、rustc 1.97.1 時点では非推奨警告が出ず、Unix では
+/// `$HOME` 環境変数が unset でも `getpwuid` 経由でホームディレクトリを引ける
+/// （実測済み）。つまりこの関数が実際に `None` を受け取る（＝エラーになる）のは
+/// 「`$HOME` が無い」だけでは足りず、「呼び出しユーザーの passwd エントリすら
+/// 無い」ような環境（コンテナで存在しない UID として動かす等）に限られる。
+/// Go の `os.UserCacheDir` は `$HOME` 環境変数の有無だけを見てエラーにするため
+/// 挙動が異なる点に注意（あちらは `$HOME` が無ければ即エラー、こちらは
+/// passwd 由来のホームまで見るぶん範囲が狭い）。本ツールは macOS 専用
+/// （CLAUDE.md「前提」）なので Windows の問題は関係しない。
+fn default_cache_root(home: Option<&Path>) -> Result<PathBuf> {
+    let home = home.ok_or_else(|| {
+        anyhow::anyhow!(
+            "ホームディレクトリを特定できませんでした。--cache-dir でキャッシュの\
+             置き場所を明示してください（使い捨てにしたい場合は\
+             --cache-dir \"$(mktemp -d)\"）"
+        )
+    })?;
+    Ok(home.join(".cache").join("tachikaze"))
 }
 
 /// キャッシュディレクトリ名に使う stem を安全化する。
@@ -326,9 +316,13 @@ fn fnv1a_hex(bytes: &[u8]) -> String {
 /// 入力ファイルの絶対パスから、この入力専用のキャッシュディレクトリのパスを
 /// 求める。`<cache_root>/<入力絶対パスのハッシュ>-<安全化したstem>/`。
 ///
+/// `cache_dir` は [`cache_root`] にそのまま渡す（`--cache-dir` は**根だけ**を
+/// 差し替え、この入力ごとのサブディレクトリ規則自体には触れない。触ると
+/// `analyze` → `cut`（`--dtvi` 省略）の受け渡しが**エラーを出さずに**外れる）。
+///
 /// ハッシュだけでなく stem も併記するのは、万が一ハッシュが衝突しても別入力が
 /// 同じディレクトリを共有しないようにするため（人間が見て区別しやすくもなる）。
-fn cache_dir_for_input(input: &Path) -> Result<PathBuf> {
+fn cache_dir_for_input(cache_dir: Option<&Path>, input: &Path) -> Result<PathBuf> {
     let absolute = fs::canonicalize(input).with_context(|| {
         format!(
             "入力ファイルの絶対パス解決に失敗しました: {}",
@@ -341,20 +335,20 @@ fn cache_dir_for_input(input: &Path) -> Result<PathBuf> {
         .and_then(|s| s.to_str())
         .unwrap_or("input");
     let dir_name = format!("{hash}-{}", sanitize_stem(stem));
-    Ok(cache_root().join(dir_name))
+    Ok(cache_root(cache_dir)?.join(dir_name))
 }
 
 /// `cut --dtvi` 省略時に使う、入力ごとのキャッシュディレクトリ内の `.dtvi` の
-/// パスを返す。`WorkDir::new` の既定（`--work-dir` 未指定時）が使うキャッシュ
-/// パス規則を [`cache_dir_for_input`] 1か所に集約し、`cut` 側もそれをそのまま
-/// 参照する（`analyze` が作ったディレクトリと `cut` が探すディレクトリがずれる
-/// と、無関係な入力の `.dtvi` を指してしまいかねないため）。
+/// パスを返す。`WorkDir::new` が使うキャッシュパス規則を [`cache_dir_for_input`]
+/// 1か所に集約し、`cut` 側もそれをそのまま参照する（`analyze` が作った
+/// ディレクトリと `cut` が探すディレクトリがずれると、無関係な入力の `.dtvi` を
+/// 指してしまいかねないため）。
 ///
 /// ディレクトリの作成は行わない。ファイルが存在するかどうかの確認・存在しない
 /// 場合の扱いは呼び出し側の責務とする（`.dtvi` が無いのに検証を省略してはい
 /// けないため、呼び出し側で明示的に判断させる）。
-pub fn cached_dtvi_path(input: &Path) -> Result<PathBuf> {
-    Ok(cache_dir_for_input(input)?.join(DTVI_FILE_NAME))
+pub fn cached_dtvi_path(cache_dir: Option<&Path>, input: &Path) -> Result<PathBuf> {
+    Ok(cache_dir_for_input(cache_dir, input)?.join(DTVI_FILE_NAME))
 }
 
 /// `cut` が既定で書き出す区間マップ（`work.mp4.segmap.json`）のキャッシュパスを返す。
@@ -363,8 +357,8 @@ pub fn cached_dtvi_path(input: &Path) -> Result<PathBuf> {
 /// `.dtvi` と同じ入力ごとのキャッシュディレクトリへ区間マップを書くため、パス規則が
 /// ずれると無関係な入力のマップを指しうる）。ディレクトリの作成は行わない
 /// （書き込み側で必要なら作る）。
-pub fn cached_segment_map_path(input: &Path) -> Result<PathBuf> {
-    Ok(cache_dir_for_input(input)?.join(SEGMENT_MAP_FILE_NAME))
+pub fn cached_segment_map_path(cache_dir: Option<&Path>, input: &Path) -> Result<PathBuf> {
+    Ok(cache_dir_for_input(cache_dir, input)?.join(SEGMENT_MAP_FILE_NAME))
 }
 
 /// `prepare` が elst 除去・字幕トラック除去後のメディアを書き出すキャッシュパスを返す。
@@ -376,8 +370,8 @@ pub fn cached_segment_map_path(input: &Path) -> Result<PathBuf> {
 /// `prepare` の出力パスを `cut` の入力として渡す)。
 ///
 /// ディレクトリの作成は行わない([`cached_dtvi_path`]と同様、呼び出し側の責務)。
-pub fn prepared_input_path(input: &Path) -> Result<PathBuf> {
-    Ok(cache_dir_for_input(input)?.join(INPUT_PREPARED_FILE_NAME))
+pub fn prepared_input_path(cache_dir: Option<&Path>, input: &Path) -> Result<PathBuf> {
+    Ok(cache_dir_for_input(cache_dir, input)?.join(INPUT_PREPARED_FILE_NAME))
 }
 
 /// `prepare` が字幕サイドカーを書き出すキャッシュパスを返す。
@@ -385,58 +379,22 @@ pub fn prepared_input_path(input: &Path) -> Result<PathBuf> {
 /// `extension` には `"ass"` / `"srt"` など、`.` を含まない拡張子を渡す
 /// (どちらを使うかは字幕トラックのコーデックから `prepare` が決める。
 /// `prepare::SubtitleFormat` 参照)。ディレクトリの作成は行わない。
-pub fn subs_path(input: &Path, extension: &str) -> Result<PathBuf> {
-    Ok(cache_dir_for_input(input)?.join(format!("{SUBS_BASE_NAME}.{extension}")))
-}
-
-/// `TACHIKAZE_CACHE_DIR` を書き換えるテストで共有する仕組み。
-///
-/// `workdir::tests` と `commands::tests`（`cut --dtvi` のキャッシュ自動解決）
-/// の両方が同じ環境変数を書き換える。モジュールごとに別々の `Mutex` を持つと
-/// 互いの書き換えを直列化できずレースする（実際に
-/// `fs::remove_dir_all` が「ディレクトリが空でない」で失敗する形で顕在化した）
-/// ため、1つのロックをここに集約して両モジュールから使う。
-#[cfg(test)]
-pub(crate) mod test_support {
-    use std::env;
-    use std::sync::Mutex;
-
-    /// `TACHIKAZE_CACHE_DIR` の書き換えを伴うテストを直列化するためのロック
-    /// （`cargo test` はテストを並行実行するため）。
-    pub(crate) static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    /// 環境変数を書き換え、Drop で元の値に戻すガード（`ENV_LOCK` と併用する）。
-    pub(crate) struct EnvVarGuard {
-        key: &'static str,
-        original: Option<std::ffi::OsString>,
-    }
-
-    impl EnvVarGuard {
-        pub(crate) fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
-            let original = env::var_os(key);
-            env::set_var(key, value);
-            Self { key, original }
-        }
-    }
-
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            match &self.original {
-                Some(v) => env::set_var(self.key, v),
-                None => env::remove_var(self.key),
-            }
-        }
-    }
+pub fn subs_path(cache_dir: Option<&Path>, input: &Path, extension: &str) -> Result<PathBuf> {
+    Ok(cache_dir_for_input(cache_dir, input)?.join(format!("{SUBS_BASE_NAME}.{extension}")))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::test_support::{EnvVarGuard, ENV_LOCK};
     use super::*;
+    use std::process;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     /// テスト用に、システムの一時ディレクトリ配下にユニークなディレクトリを作る。
-    /// `WorkDir` 自体のテストなので `tempfile` クレートには頼らず、
-    /// `create_unique_temp_dir` と同じ素朴な方式で自前実装する。
+    /// `WorkDir` 自体のテストなので `tempfile` クレートには頼らず、素朴な方式で
+    /// 自前実装する。`--cache-dir` を明示的に渡すことでプロセス共有の環境変数を
+    /// 一切触らずに済むため（E12-2 以前は `TACHIKAZE_CACHE_DIR` の書き換えを
+    /// 直列化するための `Mutex` が必要だったが、根を引数で受け取る形にしたことで
+    /// 不要になった）、テストは並行実行しても競合しない。
     fn make_scratch_dir(label: &str) -> PathBuf {
         let base = std::env::temp_dir();
         let pid = process::id();
@@ -464,12 +422,9 @@ mod tests {
 
     /// 入力ファイルのあるディレクトリに、analyze 相当の処理（作業ディレクトリ作成 →
     /// symlink 張り → finish）を通しても新規ファイルが作られないことを確認する。
-    /// `--work-dir` 未指定・既定（キャッシュディレクトリ使用）での検証。
     #[test]
     fn does_not_create_files_next_to_input() {
-        let _env_guard = ENV_LOCK.lock().unwrap();
         let cache_root = make_scratch_dir("cache-root-no-pollution");
-        let _cache_env = EnvVarGuard::set("TACHIKAZE_CACHE_DIR", &cache_root);
 
         let input_dir = make_scratch_dir("input-dir");
         let input_path = input_dir.join("IN.mp4");
@@ -477,9 +432,9 @@ mod tests {
 
         let before = dir_entries(&input_dir);
 
-        let work_dir = WorkDir::new(None, &input_path, false).expect("create work dir");
-        work_dir.link_input(&input_path).expect("link input");
-        work_dir.finish(true);
+        let work = WorkDir::new(Some(&cache_root), &input_path).expect("create work dir");
+        work.link_input(&input_path).expect("link input");
+        work.finish(true);
 
         let after = dir_entries(&input_dir);
         assert_eq!(
@@ -491,57 +446,26 @@ mod tests {
         fs::remove_dir_all(&cache_root).ok();
     }
 
-    /// `--work-dir` 指定時は成功しても中間ファイル（symlink 等）が残る。
-    #[test]
-    fn explicit_work_dir_is_kept_after_success() {
-        let input_dir = make_scratch_dir("explicit-input");
-        let input_path = input_dir.join("IN.mp4");
-        fs::write(&input_path, b"dummy mp4 content").expect("write input");
-
-        let explicit_dir = make_scratch_dir("explicit-workdir");
-
-        let work_dir =
-            WorkDir::new(Some(explicit_dir.clone()), &input_path, false).expect("create work dir");
-        let work_mp4 = work_dir.link_input(&input_path).expect("link input");
-        assert!(work_mp4.exists(), "symlink 先が存在するはず");
-        work_dir.finish(true);
-
-        assert!(
-            explicit_dir.exists(),
-            "--work-dir 指定時は成功してもディレクトリが残るはず"
-        );
-        assert!(
-            work_mp4.exists(),
-            "--work-dir 指定時は成功しても work.mp4 が残るはず"
-        );
-
-        fs::remove_dir_all(&input_dir).expect("cleanup input dir");
-        fs::remove_dir_all(&explicit_dir).expect("cleanup explicit dir");
-    }
-
-    /// 既定（`--work-dir` も `--no-keep-work` も未指定）では、入力ごとのキャッシュ
-    /// ディレクトリが使われ、成功しても削除されない。
+    /// キャッシュディレクトリは成功しても削除されない。
     #[test]
     fn default_cache_dir_is_kept_after_success() {
-        let _env_guard = ENV_LOCK.lock().unwrap();
         let cache_root = make_scratch_dir("cache-root-kept");
-        let _cache_env = EnvVarGuard::set("TACHIKAZE_CACHE_DIR", &cache_root);
 
         let input_dir = make_scratch_dir("cache-kept-input");
         let input_path = input_dir.join("IN.mp4");
         fs::write(&input_path, b"dummy mp4 content").expect("write input");
 
-        let work_dir = WorkDir::new(None, &input_path, false).expect("create work dir");
-        let path = work_dir.path().to_path_buf();
+        let work = WorkDir::new(Some(&cache_root), &input_path).expect("create work dir");
+        let path = work.path().to_path_buf();
         // `path` は WorkDir::new 内で canonicalize 済み（macOS では
         // /var → /private/var）なので、比較対象の cache_root も canonicalize する。
         let cache_root_canon = fs::canonicalize(&cache_root).expect("canonicalize cache root");
         assert!(
             path.starts_with(&cache_root_canon),
-            "既定のキャッシュディレクトリは TACHIKAZE_CACHE_DIR 配下のはず"
+            "既定のキャッシュディレクトリは指定した --cache-dir 配下のはず"
         );
-        work_dir.link_input(&input_path).expect("link input");
-        work_dir.finish(true);
+        work.link_input(&input_path).expect("link input");
+        work.finish(true);
 
         assert!(
             path.exists(),
@@ -555,19 +479,17 @@ mod tests {
     /// 同じ入力に対して2回 `WorkDir::new` すると、同じキャッシュディレクトリを再利用する。
     #[test]
     fn default_cache_dir_is_reused_for_same_input() {
-        let _env_guard = ENV_LOCK.lock().unwrap();
         let cache_root = make_scratch_dir("cache-root-reuse");
-        let _cache_env = EnvVarGuard::set("TACHIKAZE_CACHE_DIR", &cache_root);
 
         let input_dir = make_scratch_dir("cache-reuse-input");
         let input_path = input_dir.join("IN.mp4");
         fs::write(&input_path, b"dummy mp4 content").expect("write input");
 
-        let first = WorkDir::new(None, &input_path, false).expect("create work dir (1st)");
+        let first = WorkDir::new(Some(&cache_root), &input_path).expect("create work dir (1st)");
         let first_path = first.path().to_path_buf();
         first.finish(true);
 
-        let second = WorkDir::new(None, &input_path, false).expect("create work dir (2nd)");
+        let second = WorkDir::new(Some(&cache_root), &input_path).expect("create work dir (2nd)");
         let second_path = second.path().to_path_buf();
         second.finish(true);
 
@@ -583,9 +505,7 @@ mod tests {
     /// 異なる入力に対しては異なるキャッシュディレクトリが割り当てられる。
     #[test]
     fn default_cache_dir_differs_for_different_inputs() {
-        let _env_guard = ENV_LOCK.lock().unwrap();
         let cache_root = make_scratch_dir("cache-root-differ");
-        let _cache_env = EnvVarGuard::set("TACHIKAZE_CACHE_DIR", &cache_root);
 
         let input_dir = make_scratch_dir("cache-differ-input");
         let first_input = input_dir.join("FIRST.mp4");
@@ -593,11 +513,11 @@ mod tests {
         fs::write(&first_input, b"first").expect("write first input");
         fs::write(&second_input, b"second").expect("write second input");
 
-        let first = WorkDir::new(None, &first_input, false).expect("create work dir (1st)");
+        let first = WorkDir::new(Some(&cache_root), &first_input).expect("create work dir (1st)");
         let first_path = first.path().to_path_buf();
         first.finish(true);
 
-        let second = WorkDir::new(None, &second_input, false).expect("create work dir (2nd)");
+        let second = WorkDir::new(Some(&cache_root), &second_input).expect("create work dir (2nd)");
         let second_path = second.path().to_path_buf();
         second.finish(true);
 
@@ -610,44 +530,10 @@ mod tests {
         fs::remove_dir_all(&cache_root).ok();
     }
 
-    /// `--no-keep-work` 指定時、成功すると従来どおり一時ディレクトリが消える。
-    #[test]
-    fn no_keep_work_removes_temp_dir_after_success() {
-        let input_dir = make_scratch_dir("no-keep-work-input");
-        let input_path = input_dir.join("IN.mp4");
-        fs::write(&input_path, b"dummy mp4 content").expect("write input");
-
-        let work_dir = WorkDir::new(None, &input_path, true).expect("create work dir");
-        let path = work_dir.path().to_path_buf();
-        work_dir.link_input(&input_path).expect("link input");
-        work_dir.finish(true);
-
-        assert!(!path.exists(), "成功時は一時ディレクトリが削除されるはず");
-
-        fs::remove_dir_all(&input_dir).expect("cleanup input dir");
-    }
-
-    /// `--no-keep-work` 指定時、失敗すると一時ディレクトリは残る（調査用）。
-    #[test]
-    fn no_keep_work_keeps_temp_dir_after_failure() {
-        let input_dir = make_scratch_dir("no-keep-work-fail-input");
-        let input_path = input_dir.join("IN.mp4");
-        fs::write(&input_path, b"dummy mp4 content").expect("write input");
-
-        let work_dir = WorkDir::new(None, &input_path, true).expect("create work dir");
-        let path = work_dir.path().to_path_buf();
-        work_dir.link_input(&input_path).expect("link input");
-        work_dir.finish(false);
-
-        assert!(path.exists(), "失敗時は一時ディレクトリが残るはず");
-
-        fs::remove_dir_all(&path).expect("cleanup work dir");
-        fs::remove_dir_all(&input_dir).expect("cleanup input dir");
-    }
-
     /// 入力が既に symlink だった場合も、その解決先へ張り替えて動く。
     #[test]
     fn link_input_works_when_input_is_already_a_symlink() {
+        let cache_root = make_scratch_dir("symlink-cache");
         let input_dir = make_scratch_dir("symlink-input");
         let real_path = input_dir.join("REAL.mp4");
         fs::write(&real_path, b"dummy mp4 content").expect("write real input");
@@ -655,8 +541,8 @@ mod tests {
         let symlink_input = input_dir.join("IN.mp4");
         symlink(&real_path, &symlink_input).expect("create input symlink");
 
-        let work_dir = WorkDir::new(None, &symlink_input, true).expect("create work dir");
-        let work_mp4 = work_dir.link_input(&symlink_input).expect("link input");
+        let work = WorkDir::new(Some(&cache_root), &symlink_input).expect("create work dir");
+        let work_mp4 = work.link_input(&symlink_input).expect("link input");
 
         let resolved = fs::canonicalize(&work_mp4).expect("resolve work.mp4");
         let expected = fs::canonicalize(&real_path).expect("resolve real path");
@@ -665,47 +551,57 @@ mod tests {
             "symlink の解決先が実ファイルと一致するはず"
         );
 
-        work_dir.finish(true);
-        fs::remove_dir_all(&input_dir).expect("cleanup input dir");
+        work.finish(true);
+        fs::remove_dir_all(&input_dir).ok();
+        fs::remove_dir_all(&cache_root).ok();
     }
 
     /// 既に work.mp4 がある場合は張り替える。
     #[test]
     fn link_input_replaces_existing_work_mp4() {
+        let cache_root = make_scratch_dir("relink-cache");
         let input_dir = make_scratch_dir("relink-input");
         let first_input = input_dir.join("FIRST.mp4");
         let second_input = input_dir.join("SECOND.mp4");
         fs::write(&first_input, b"first").expect("write first input");
         fs::write(&second_input, b"second").expect("write second input");
 
-        let work_dir = WorkDir::new(None, &first_input, true).expect("create work dir");
-        work_dir.link_input(&first_input).expect("link first input");
-        let work_mp4 = work_dir
-            .link_input(&second_input)
-            .expect("link second input");
+        let work = WorkDir::new(Some(&cache_root), &first_input).expect("create work dir");
+        work.link_input(&first_input).expect("link first input");
+        let work_mp4 = work.link_input(&second_input).expect("link second input");
 
         let resolved = fs::canonicalize(&work_mp4).expect("resolve work.mp4");
         let expected = fs::canonicalize(&second_input).expect("resolve second input");
         assert_eq!(resolved, expected, "張り替え後は2番目の入力を指すはず");
 
-        work_dir.finish(true);
-        fs::remove_dir_all(&input_dir).expect("cleanup input dir");
+        work.finish(true);
+        fs::remove_dir_all(&input_dir).ok();
+        fs::remove_dir_all(&cache_root).ok();
     }
 
     /// 各中間ファイルパスの名前が集約されていることを確認する。
+    ///
+    /// `WorkDir::new` は入力の絶対パス解決（`fs::canonicalize`）を必ず行うため
+    /// （使い捨て一時ディレクトリの経路は削除済み、E12-2）、実在する入力が要る。
     #[test]
     fn intermediate_file_names_are_correct() {
-        let work_dir =
-            WorkDir::new(None, Path::new("/nonexistent-input.mp4"), true).expect("create work dir");
-        assert_eq!(work_dir.work_path().file_name().unwrap(), WORK_FILE_NAME);
-        assert_eq!(work_dir.dtvi_path().file_name().unwrap(), DTVI_FILE_NAME);
-        assert_eq!(work_dir.scp_path().file_name().unwrap(), SCP_FILE_NAME);
-        assert_eq!(work_dir.trim_path().file_name().unwrap(), TRIM_FILE_NAME);
+        let cache_root = make_scratch_dir("names-cache");
+        let input_dir = make_scratch_dir("names-input");
+        let input_path = input_dir.join("IN.mp4");
+        fs::write(&input_path, b"dummy mp4 content").expect("write input");
+
+        let work = WorkDir::new(Some(&cache_root), &input_path).expect("create work dir");
+        assert_eq!(work.work_path().file_name().unwrap(), WORK_FILE_NAME);
+        assert_eq!(work.dtvi_path().file_name().unwrap(), DTVI_FILE_NAME);
+        assert_eq!(work.scp_path().file_name().unwrap(), SCP_FILE_NAME);
+        assert_eq!(work.trim_path().file_name().unwrap(), TRIM_FILE_NAME);
         assert_eq!(
-            work_dir.detail_jls_path().file_name().unwrap(),
+            work.detail_jls_path().file_name().unwrap(),
             DETAIL_JLS_FILE_NAME
         );
-        work_dir.finish(true);
+        work.finish(true);
+        fs::remove_dir_all(&input_dir).ok();
+        fs::remove_dir_all(&cache_root).ok();
     }
 
     /// `prepared_input_path` / `subs_path` が `cached_dtvi_path` と同じ
@@ -713,18 +609,19 @@ mod tests {
     /// `prepare` が同じ入力に対して同じディレクトリを共有する前提)。
     #[test]
     fn prepared_input_and_subs_paths_share_cache_dir_with_dtvi() {
-        let _env_guard = ENV_LOCK.lock().unwrap();
         let cache_root = make_scratch_dir("cache-root-prepare-paths");
-        let _cache_env = EnvVarGuard::set("TACHIKAZE_CACHE_DIR", &cache_root);
 
         let input_dir = make_scratch_dir("prepare-paths-input");
         let input_path = input_dir.join("IN.mp4");
         fs::write(&input_path, b"dummy mp4 content").expect("write input");
 
-        let dtvi = cached_dtvi_path(&input_path).expect("compute dtvi path");
-        let prepared = prepared_input_path(&input_path).expect("compute prepared path");
-        let subs_ass = subs_path(&input_path, "ass").expect("compute subs.ass path");
-        let subs_srt = subs_path(&input_path, "srt").expect("compute subs.srt path");
+        let dtvi = cached_dtvi_path(Some(&cache_root), &input_path).expect("compute dtvi path");
+        let prepared =
+            prepared_input_path(Some(&cache_root), &input_path).expect("compute prepared path");
+        let subs_ass =
+            subs_path(Some(&cache_root), &input_path, "ass").expect("compute subs.ass path");
+        let subs_srt =
+            subs_path(Some(&cache_root), &input_path, "srt").expect("compute subs.srt path");
 
         assert_eq!(dtvi.parent(), prepared.parent());
         assert_eq!(dtvi.parent(), subs_ass.parent());
@@ -736,26 +633,92 @@ mod tests {
         fs::remove_dir_all(&cache_root).ok();
     }
 
-    /// `TACHIKAZE_CACHE_DIR` でキャッシュの根を差し替えられる。
+    /// `--cache-dir`（明示的な根）でキャッシュの根を差し替えられる。
     #[test]
-    fn tachikaze_cache_dir_overrides_default_root() {
-        let _env_guard = ENV_LOCK.lock().unwrap();
+    fn explicit_cache_dir_overrides_default_root() {
         let cache_root = make_scratch_dir("cache-root-override");
-        let _cache_env = EnvVarGuard::set("TACHIKAZE_CACHE_DIR", &cache_root);
 
         let input_dir = make_scratch_dir("cache-override-input");
         let input_path = input_dir.join("IN.mp4");
         fs::write(&input_path, b"dummy mp4 content").expect("write input");
 
-        let dir = cache_dir_for_input(&input_path).expect("compute cache dir");
+        let dir = cache_dir_for_input(Some(&cache_root), &input_path).expect("compute cache dir");
         assert!(
             dir.starts_with(&cache_root),
-            "TACHIKAZE_CACHE_DIR 配下になるはず: {}",
+            "--cache-dir 配下になるはず: {}",
             dir.display()
         );
 
         fs::remove_dir_all(&input_dir).ok();
         fs::remove_dir_all(&cache_root).ok();
+    }
+
+    /// 完了条件（レビュー指摘）: 相対パスの `--cache-dir` は呼び出し元の
+    /// カレントディレクトリを基準に絶対化される。`absolutize_cache_dir` の
+    /// doc comment参照（絶対化しないと `prepare` が二重にネストしたパスを
+    /// 探しに行って `No such file or directory` になる実機バグがあった）。
+    #[test]
+    fn absolutize_cache_dir_joins_relative_path_onto_current_dir() {
+        let cwd = std::env::current_dir().expect("カレントディレクトリを取得できるはず");
+        let resolved = absolutize_cache_dir(Path::new("relcache")).expect("絶対化に失敗しないはず");
+        assert_eq!(resolved, cwd.join("relcache"));
+        assert!(resolved.is_absolute());
+    }
+
+    #[test]
+    fn absolutize_cache_dir_leaves_absolute_path_unchanged() {
+        let absolute = Path::new("/tmp/some-absolute-cache-dir");
+        let resolved = absolutize_cache_dir(absolute).expect("絶対化に失敗しないはず");
+        assert_eq!(resolved, absolute);
+    }
+
+    /// `--cache-dir` に相対パスを渡しても、そこから導出する入力ごとの
+    /// キャッシュディレクトリが絶対パスになることを確認する（`cache_root` が
+    /// `absolutize_cache_dir` を経由することの統合的な確認）。
+    #[test]
+    fn cache_dir_for_input_is_absolute_even_with_relative_explicit_cache_dir() {
+        let cwd = std::env::current_dir().expect("カレントディレクトリを取得できるはず");
+        let input_dir = make_scratch_dir("relative-cache-dir-input");
+        let input_path = input_dir.join("IN.mp4");
+        fs::write(&input_path, b"dummy mp4 content").expect("write input");
+
+        let relative_cache_dir = Path::new("tachikaze-test-relative-cache-dir-unused");
+        let dir =
+            cache_dir_for_input(Some(relative_cache_dir), &input_path).expect("compute cache dir");
+        assert!(dir.is_absolute(), "絶対パスになるはず: {}", dir.display());
+        assert!(dir.starts_with(cwd.join(relative_cache_dir)));
+
+        fs::remove_dir_all(&input_dir).ok();
+    }
+
+    /// `--cache-dir` 未指定時は `$HOME/.cache/tachikaze` になる。実際にホーム
+    /// ディレクトリを汚さないよう、ディレクトリを作らず計算結果だけ確認する。
+    #[test]
+    fn cache_root_defaults_to_home_cache_tachikaze_when_no_explicit_dir() {
+        let home = std::env::home_dir().expect("このテスト環境には HOME があるはず");
+        let root = cache_root(None).expect("既定のキャッシュルートを計算できるはず");
+        assert_eq!(root, home.join(".cache").join("tachikaze"));
+    }
+
+    /// `default_cache_root` はホームを引数で受け取る純粋関数なので、実際に
+    /// `$HOME` や passwd を触らずに「ホームディレクトリが特定できない」経路
+    /// （`cache_root` が `std::env::home_dir()` から `None` を受け取る場合）を
+    /// 検証できる（`default_cache_root` の doc comment参照）。
+    #[test]
+    fn default_cache_root_errors_with_cache_dir_hint_when_home_is_none() {
+        let err = default_cache_root(None).expect_err("home が無ければエラーのはず");
+        let message = err.to_string();
+        assert!(
+            message.contains("--cache-dir"),
+            "--cache-dir を促すメッセージのはず: {message}"
+        );
+    }
+
+    #[test]
+    fn default_cache_root_joins_cache_tachikaze_onto_given_home() {
+        let home = Path::new("/home/example-user");
+        let root = default_cache_root(Some(home)).expect("home があれば成功するはず");
+        assert_eq!(root, home.join(".cache").join("tachikaze"));
     }
 
     #[test]
@@ -776,17 +739,16 @@ mod tests {
 
     #[test]
     fn cached_segment_map_path_uses_expected_file_name_and_cache_dir() {
-        let _env_guard = ENV_LOCK.lock().unwrap();
         let cache_root = make_scratch_dir("cache-root-segmap");
-        let _cache_env = EnvVarGuard::set("TACHIKAZE_CACHE_DIR", &cache_root);
 
         let input_dir = make_scratch_dir("segmap-input");
         let input_path = input_dir.join("IN.mp4");
         fs::write(&input_path, b"dummy mp4 content").expect("write input");
 
-        let segmap_path =
-            cached_segment_map_path(&input_path).expect("compute cached segment map path");
-        let dtvi_path = cached_dtvi_path(&input_path).expect("compute cached dtvi path");
+        let segmap_path = cached_segment_map_path(Some(&cache_root), &input_path)
+            .expect("compute cached segment map path");
+        let dtvi_path =
+            cached_dtvi_path(Some(&cache_root), &input_path).expect("compute cached dtvi path");
 
         assert_eq!(
             segmap_path.file_name().unwrap(),

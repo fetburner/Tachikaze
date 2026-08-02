@@ -42,12 +42,9 @@ pub struct AnalyzeConfig {
     pub input: PathBuf,
     /// 最終的な `trim.avs` の出力先。
     pub output: PathBuf,
-    /// `--work-dir`（中間ファイルの置き場所）。未指定なら入力ごとのキャッシュ
-    /// ディレクトリ（`--no-keep-work` 指定時は一時ディレクトリ）。
-    pub work_dir: Option<PathBuf>,
-    /// `--no-keep-work`。未指定時の既定（キャッシュディレクトリを残す）をやめ、
-    /// 従来どおり一時ディレクトリを使い成功時に削除する。
-    pub no_keep_work: bool,
+    /// `--cache-dir`（キャッシュの根）。未指定なら既定値
+    /// （`workdir::cache_root` の doc comment参照）。
+    pub cache_dir: Option<PathBuf>,
     /// `--jls-set` で上書き・追加された `(KEY, VALUE)`。
     pub jls_set: Vec<(String, String)>,
     /// `--jl-file`。未指定なら `tools::default_jl_command_file` の既定値を使う。
@@ -57,8 +54,8 @@ pub struct AnalyzeConfig {
 /// analyze パイプライン全体の成果物。
 ///
 /// `--report`（境界とキーフレームの距離、見逃し候補の警告）の組み立てに
-/// `.dtvi` と `detail.jls` の内容が必要なため、`work_dir` が片付けられる前に
-/// ここで読み込んでおく。
+/// `.dtvi` と `detail.jls` の内容が必要なため、キャッシュディレクトリ
+/// （[`WorkDir`]）が片付けられる前にここで読み込んでおく。
 #[derive(Debug, Clone)]
 pub struct AnalyzeOutput {
     /// 生成された `trim.avs` のパース結果。
@@ -87,30 +84,30 @@ pub fn run(config: &AnalyzeConfig) -> Result<AnalyzeOutput> {
     let chapter_exe_path = tools::resolve_tool(CHAPTER_EXE)?;
     let join_logo_scp_path = tools::resolve_tool(JOIN_LOGO_SCP)?;
 
-    let work_dir = WorkDir::new(config.work_dir.clone(), &config.input, config.no_keep_work)?;
+    let work = WorkDir::new(config.cache_dir.as_deref(), &config.input)?;
     let result = run_pipeline(
         config,
-        &work_dir,
+        &work,
         &dtvindex_path,
         &chapter_exe_path,
         &join_logo_scp_path,
     );
-    work_dir.finish(result.is_ok());
+    work.finish(result.is_ok());
     result
 }
 
 fn run_pipeline(
     config: &AnalyzeConfig,
-    work_dir: &WorkDir,
+    work: &WorkDir,
     dtvindex_path: &Path,
     chapter_exe_path: &Path,
     join_logo_scp_path: &Path,
 ) -> Result<AnalyzeOutput> {
-    let work_mp4 = work_dir.link_input(&config.input)?;
-    let dtvi_path = work_dir.dtvi_path();
-    let scp_path = work_dir.scp_path();
-    let trim_avs_path = work_dir.trim_path();
-    let detail_jls_path = work_dir.detail_jls_path();
+    let work_mp4 = work.link_input(&config.input)?;
+    let dtvi_path = work.dtvi_path();
+    let scp_path = work.scp_path();
+    let trim_avs_path = work.trim_path();
+    let detail_jls_path = work.detail_jls_path();
 
     // `external::run` のエラーには既にコマンドライン全体と stderr の末尾が
     // 含まれているため、追加の `.context()` で包まずそのまま伝播する
@@ -124,7 +121,7 @@ fn run_pipeline(
             "-o",
             require_utf8(&dtvi_path)?,
         ],
-        work_dir.path(),
+        work.path(),
     )?;
 
     let chapter_exe_output = external::run(
@@ -135,7 +132,7 @@ fn run_pipeline(
             "-o",
             require_utf8(&scp_path)?,
         ],
-        work_dir.path(),
+        work.path(),
     )?;
     // macOS には AviSynth が無いため、dtvindex 入力経路が有効なビルドである必要がある
     // （docs/toolchain-macos.md）。無効なビルドを渡されると入力経路が無く静かに
@@ -176,10 +173,10 @@ fn run_pipeline(
     external::run(
         require_utf8(join_logo_scp_path)?,
         &join_logo_scp_args,
-        work_dir.path(),
+        work.path(),
     )?;
 
-    // work_dir 内の trim.avs を先に読む。`-o` が work_dir の trim.avs と同じ
+    // work 内の trim.avs を先に読む。`-o` が work の trim.avs と同じ
     // パスだと `fs::copy(src, src)` が空ファイルを生む（macOS で実測。前回の
     // 手動実行で hit した）。同一パスならコピーを省略する。
     let output_content = fs::read_to_string(&trim_avs_path).with_context(|| {
@@ -300,20 +297,15 @@ pub fn parse_jls_set_arg(raw: &str) -> Result<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    // `TACHIKAZE_CACHE_DIR` を書き換えるロックは `workdir::tests` /
-    // `commands::tests` と共有する（`crate::workdir::test_support` の doc
-    // comment 参照）。このモジュールは環境変数を書き換えないが、`WorkDir` 経由で
-    // **読む**テストがあるため、同じロックを取る必要がある（下記参照）。
-    //
     // `PATH` を書き換えるロックは `tools::tests` と共有する（`resolve_tool` が
-    // `PATH` しか見なくなったため、ツール解決の成功/失敗を作り分けるには
-    // `PATH` の書き換えが唯一の手段になった。`crate::tools::test_support` の
-    // doc comment参照）。2つの環境変数は別物なので別ロックのままでよいが、
-    // 同じ環境変数を書き換えるテストどうしは必ず同じロックを共有する。
+    // `PATH` しか見ないため、ツール解決の成功/失敗を作り分けるには `PATH` の
+    // 書き換えが唯一の手段になった。`crate::tools::test_support` の doc
+    // comment参照）。E12-2 でキャッシュの根は `--cache-dir`（引数）に一本化した
+    // ため、このモジュールはキャッシュ関連の環境変数を一切読み書きしない
+    // （`workdir::test_support` は削除済み）。
     use crate::tools::test_support::{
         EnvVarGuard as ToolPathEnvGuard, ENV_LOCK as TOOL_PATH_ENV_LOCK,
     };
-    use crate::workdir::test_support::{EnvVarGuard as CacheEnvGuard, ENV_LOCK as CACHE_ENV_LOCK};
     use std::process;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -472,8 +464,7 @@ mod tests {
             // ツール解決が入力の存在確認より前に走るため、実在しないパスでよい。
             input: PathBuf::from("/nonexistent/input-for-analyze-test.mp4"),
             output,
-            work_dir: None,
-            no_keep_work: false,
+            cache_dir: None,
             jls_set: vec![],
             jl_file: None,
         };
@@ -500,18 +491,10 @@ mod tests {
         // chapter_exe の stderr が含まれること、(2) 後段の join_logo_scp が
         // 一度も起動されないこと（マーカーファイルが作られない）を確認する。
         //
-        // このテストは入力が実在し `work_dir: None` / `no_keep_work: false` の
-        // ため `WorkDir::new` が `TACHIKAZE_CACHE_DIR` を**読む**。環境変数は
-        // プロセス全体で共有されるので、読むだけでも `CACHE_ENV_LOCK` を取らないと、
-        // 並行して書き換える側（`commands::tests` / `workdir::tests`）の値が
-        // 漏れ込む。実際に、このテストが `commands::tests` のキャッシュ
-        // ディレクトリを掴んで失敗した。自分のキャッシュ位置も明示して隔離する。
-        // 加えて、偽ツールを `PATH` 経由で注入するため `TOOL_PATH_ENV_LOCK` も要る
-        // （`TACHIKAZE_CACHE_DIR` と `PATH` は別の環境変数なので別ロックのまま
-        // でよいが、両方を書き換えるこのテストは両方のロックを取る）。
-        let _cache_env_guard = CACHE_ENV_LOCK.lock().unwrap();
+        // キャッシュの根は `--cache-dir` 相当の `cache_dir` フィールドへ直接
+        // 渡すため（環境変数は経由しない）、キャッシュ側の隔離用ロックは不要。
+        // 偽ツールを `PATH` 経由で注入するため `TOOL_PATH_ENV_LOCK` だけ要る。
         let cache_root = unique_scratch_dir("stop-on-failure-cache");
-        let _cache_env = CacheEnvGuard::set("TACHIKAZE_CACHE_DIR", &cache_root);
 
         let _path_env_guard = TOOL_PATH_ENV_LOCK.lock().unwrap();
         let fake_tools_dir = unique_scratch_dir("stop-on-failure-tools");
@@ -547,8 +530,7 @@ mod tests {
         let config = AnalyzeConfig {
             input: input_path,
             output: output_dir.join("trim.avs"),
-            work_dir: None,
-            no_keep_work: false,
+            cache_dir: Some(cache_root.clone()),
             jls_set: vec![],
             jl_file: None,
         };
@@ -587,13 +569,9 @@ mod tests {
     #[test]
     #[ignore = "dtvindex/chapter_exe/join_logo_scp の実バイナリと実サンプルmp4が必要（docs/toolchain-macos.md）"]
     fn analyze_run_produces_trim_list_with_real_tools() {
-        // 上の `run_stops_pipeline_and_surfaces_stderr_on_first_failure` と同じ
-        // 理由で `CACHE_ENV_LOCK` を取る（実在する入力 + `work_dir: None` なので
-        // `WorkDir::new` が `TACHIKAZE_CACHE_DIR` を読む）。あわせて利用者の
-        // 実際のキャッシュ（`~/.cache/tachikaze`）を汚さないようにする。
-        let _env_guard = CACHE_ENV_LOCK.lock().unwrap();
+        // キャッシュの根を明示して、利用者の実際のキャッシュ（`~/.cache/tachikaze`）
+        // を汚さないようにする（`cache_dir: None` にすると既定値が使われてしまう）。
         let cache_root = unique_scratch_dir("integration-cache");
-        let _cache_env = CacheEnvGuard::set("TACHIKAZE_CACHE_DIR", &cache_root);
 
         let output_dir = unique_scratch_dir("integration-output");
         let config = AnalyzeConfig {
@@ -603,8 +581,7 @@ mod tests {
                 "/tests/fixtures/sample.mp4"
             )),
             output: output_dir.join("trim.avs"),
-            work_dir: None,
-            no_keep_work: false,
+            cache_dir: Some(cache_root.clone()),
             jls_set: vec![],
             jl_file: None,
         };

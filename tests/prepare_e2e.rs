@@ -16,9 +16,18 @@ mod common;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Mutex;
 
 use tachikaze::mp4io::read::read_moov;
 use tachikaze::prepare;
+
+/// カレントディレクトリを書き換えるテストを直列化するためのロック
+/// （`prepare_strips_edit_list_with_relative_input_and_relative_cache_dir`
+/// 専用。このファイルの他のテストはすべて絶対パス
+/// （`make_scratch_dir` / `common::fixture_path()`）だけを使うため cwd に
+/// 依存しないが、新しくこのファイルに cwd 依存のテストを足す場合は必ず
+/// このロックを取ること。`src/external.rs::tests::CWD_LOCK` と同じ理由）。
+static CWD_LOCK: Mutex<()> = Mutex::new(());
 
 fn skip_if_missing(bin: &str) -> bool {
     match Command::new(bin).arg("-version").output() {
@@ -50,15 +59,12 @@ fn make_scratch_dir(label: &str) -> PathBuf {
     panic!("scratch dir の作成に失敗しました");
 }
 
-/// `prepare::run` が使ったキャッシュディレクトリを片付ける(テスト後の掃除。
-/// 実運用では消さない方針だが、テストが `~/.cache/tachikaze` を汚し続けない
-/// ようにする)。
-fn cleanup_cache_for(input: &Path) {
-    if let Ok(dir) = tachikaze::workdir::prepared_input_path(input) {
-        if let Some(parent) = dir.parent() {
-            let _ = fs::remove_dir_all(parent);
-        }
-    }
+/// `prepare::run` に渡すキャッシュの根を、テストごとの一意なスクラッチ
+/// ディレクトリにする(`None` を渡すと実ユーザーの `~/.cache/tachikaze` を
+/// 使ってしまう。`--cache-dir` を引数で渡せるようになった以上、テストが
+/// 実ホームを汚す理由は無い)。
+fn make_cache_dir(label: &str) -> PathBuf {
+    make_scratch_dir(&format!("cache-{label}"))
 }
 
 /// `sample_aac.mp4` を `-c copy` で remux すると、ffmpeg が AAC の priming
@@ -148,6 +154,7 @@ fn prepare_strips_edit_list_and_result_is_accepted_by_check_supported() {
 
     let dir = make_scratch_dir("elst");
     let input = make_elst_fixture(&dir);
+    let cache_dir = make_cache_dir("elst");
 
     // 元ファイルには実際に elst が付いていることを確認しておく(前提が崩れて
     // いないか)。
@@ -157,7 +164,7 @@ fn prepare_strips_edit_list_and_result_is_accepted_by_check_supported() {
         "テストの前提: 元ファイルに elst が付いているはず"
     );
 
-    let outcome = prepare::run(&input, None).expect("prepare が成功するはず");
+    let outcome = prepare::run(&input, Some(&cache_dir), None).expect("prepare が成功するはず");
     assert!(outcome.ran_ffmpeg, "elst 除去のため ffmpeg を実行するはず");
     assert!(outcome.had_edit_list);
     assert_ne!(
@@ -183,8 +190,8 @@ fn prepare_strips_edit_list_and_result_is_accepted_by_check_supported() {
         err.reason
     );
 
-    cleanup_cache_for(&input);
     fs::remove_dir_all(&dir).ok();
+    fs::remove_dir_all(&cache_dir).ok();
 }
 
 /// 完了条件: 字幕トラック付き mp4 から字幕サイドカーが抽出され、mp4 側からは
@@ -198,6 +205,7 @@ fn prepare_extracts_subtitle_and_drops_track_from_media() {
 
     let dir = make_scratch_dir("subs");
     let input = make_subtitle_fixture(&dir);
+    let cache_dir = make_cache_dir("subs");
 
     let original_moov = read_moov(&input).expect("元ファイルの moov を読めること");
     let original_inspection = prepare::inspect_moov(&original_moov);
@@ -207,7 +215,7 @@ fn prepare_extracts_subtitle_and_drops_track_from_media() {
         "テストの前提: 元ファイルは Tx3g(mov_text) 字幕トラックを持つはず"
     );
 
-    let outcome = prepare::run(&input, None).expect("prepare が成功するはず");
+    let outcome = prepare::run(&input, Some(&cache_dir), None).expect("prepare が成功するはず");
     assert!(outcome.ran_ffmpeg);
     assert!(!outcome.had_edit_list);
 
@@ -233,8 +241,8 @@ fn prepare_extracts_subtitle_and_drops_track_from_media() {
         "前処理済みファイルは映像+音声の2トラックのみのはず"
     );
 
-    cleanup_cache_for(&input);
     fs::remove_dir_all(&dir).ok();
+    fs::remove_dir_all(&cache_dir).ok();
 }
 
 /// 完了条件: elst も字幕も無い入力では新しいファイルを作らない。
@@ -251,7 +259,7 @@ fn prepare_is_noop_for_plain_fixture_and_creates_nothing_next_to_input() {
         .expect("フィクスチャに親ディレクトリがあるはず");
     let before = dir_entries(fixture_dir);
 
-    let outcome = prepare::run(&fixture, None).expect("prepare が成功するはず");
+    let outcome = prepare::run(&fixture, None, None).expect("prepare が成功するはず");
     assert!(
         !outcome.ran_ffmpeg,
         "前処理不要なら ffmpeg を実行しないはず"
@@ -280,10 +288,12 @@ fn prepare_prefers_external_subs_over_embedded_track() {
 
     let dir = make_scratch_dir("external-subs");
     let input = make_subtitle_fixture(&dir);
+    let cache_dir = make_cache_dir("external-subs");
     let external = dir.join("external.ass");
     fs::write(&external, "external ass placeholder\n").expect("外部字幕の書き込みに失敗しました");
 
-    let outcome = prepare::run(&input, Some(&external)).expect("prepare が成功するはず");
+    let outcome =
+        prepare::run(&input, Some(&cache_dir), Some(&external)).expect("prepare が成功するはず");
     assert_eq!(
         outcome.subtitle_path.as_deref(),
         Some(external.as_path()),
@@ -297,6 +307,72 @@ fn prepare_prefers_external_subs_over_embedded_track() {
         "--subs 指定時も mp4 内蔵の字幕トラックは除去されるはず"
     );
 
-    cleanup_cache_for(&input);
+    fs::remove_dir_all(&dir).ok();
+    fs::remove_dir_all(&cache_dir).ok();
+}
+
+/// 完了条件（レビュー指摘の再現・回帰防止）: `input` と `cache_dir` の両方が
+/// 呼び出し元のカレントディレクトリからの相対パスでも `prepare` は成功する。
+///
+/// `elst` 除去が必要な入力では `prepare::run` が ffmpeg を
+/// `<cache_dir>/<入力ハッシュ>-<stem>/` を作業ディレクトリ（`current_dir`）にして
+/// 起動する（`src/prepare.rs`）。この作業ディレクトリの絶対化は `external::run`
+/// が内部で行うが、`-i` に渡す入力パスまで絶対化していないと、ffmpeg は相対
+/// パスを新しい作業ディレクトリからの相対として解釈してしまい、呼び出し元の
+/// カレントディレクトリにある入力を見失う（実機で `tachikaze --cache-dir
+/// relcache prepare IN.mp4` を再現し、`src/prepare.rs::run` の
+/// `absolute_input` で修正した）。
+#[test]
+#[ignore = "tests/fixtures/sample_aac.mp4 と ffmpeg が必要。tests/fixtures/gen.sh を先に実行すること"]
+fn prepare_strips_edit_list_with_relative_input_and_relative_cache_dir() {
+    if common::skip_if_fixture_missing_at(&common::aac_fixture_path()) || skip_if_missing("ffmpeg")
+    {
+        return;
+    }
+
+    let _cwd_guard = CWD_LOCK.lock().unwrap();
+
+    let dir = make_scratch_dir("relative-cwd");
+    let input = make_elst_fixture(&dir);
+    let relative_input = input
+        .file_name()
+        .expect("入力にファイル名があるはず")
+        .to_owned();
+    let relative_cache_dir = Path::new("relcache-e2e");
+
+    let original_cwd = std::env::current_dir().expect("カレントディレクトリを取得できること");
+    std::env::set_current_dir(&dir).expect("スクラッチディレクトリへ移動できること");
+    // `dir` 自体（`std::env::temp_dir()` 由来）ではなく、実際に chdir した後の
+    // `current_dir()` を基準にする。macOS では `/var` が `/private/var` への
+    // symlink であることがあり、`dir` の文字列表現と `current_dir()` の
+    // 戻り値が食い違う（`Path::starts_with` は symlink を解決しない）ため。
+    let cwd_after_chdir =
+        std::env::current_dir().expect("chdir 後のカレントディレクトリを取得できること");
+
+    let result = prepare::run(Path::new(&relative_input), Some(relative_cache_dir), None);
+
+    std::env::set_current_dir(&original_cwd).expect("元のカレントディレクトリへ戻せること");
+
+    let outcome = result.expect("相対パスの input / cache_dir でも prepare が成功するはず");
+    assert!(outcome.ran_ffmpeg, "elst 除去のため ffmpeg を実行するはず");
+    assert!(
+        outcome.media_path.is_absolute(),
+        "キャッシュ内の出力パスは絶対パスのはず: {}",
+        outcome.media_path.display()
+    );
+    assert!(
+        outcome
+            .media_path
+            .starts_with(cwd_after_chdir.join("relcache-e2e")),
+        "相対 cache_dir はカレントディレクトリ（スクラッチディレクトリ）基準で\
+         解決されるはず: {}",
+        outcome.media_path.display()
+    );
+    assert!(
+        outcome.media_path.is_file(),
+        "前処理済みファイルが実在するはず: {}",
+        outcome.media_path.display()
+    );
+
     fs::remove_dir_all(&dir).ok();
 }
