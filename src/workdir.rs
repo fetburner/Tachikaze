@@ -188,8 +188,54 @@ impl WorkDir {
 
 /// キャッシュディレクトリの根を決める。
 ///
-/// - `explicit`（`--cache-dir`）があれば、それをそのまま使う。
-/// - 無ければ `std::env::home_dir() + ".cache/tachikaze"` を既定値にする。
+/// - `explicit`（`--cache-dir`）があれば、絶対化して使う（[`absolutize_cache_dir`]）。
+/// - 無ければ `std::env::home_dir()` から既定値を組み立てる
+///   （[`default_cache_root`]）。
+///
+/// `std::env::home_dir()` の呼び出しをここに1か所だけ持つ理由は
+/// [`default_cache_root`] の doc comment参照（テストが `env` を触らずに
+/// エラー文言を検証できるよう、ホームを引数で受け取る純粋関数に分離した）。
+fn cache_root(explicit: Option<&Path>) -> Result<PathBuf> {
+    if let Some(dir) = explicit {
+        return absolutize_cache_dir(dir);
+    }
+    default_cache_root(std::env::home_dir().as_deref())
+}
+
+/// `--cache-dir` の値を絶対パスにする。
+///
+/// 相対パスのまま `cache_dir_for_input` の戻り値（`<cache_dir>/<入力ハッシュ>-<stem>/`）
+/// を使うと、二重解決の罠を踏む: `src/prepare.rs` は `cache_dir_for_input` の
+/// 戻り値の親ディレクトリを `external::run` の作業ディレクトリ（`current_dir`）
+/// として渡す一方、同じ戻り値を ffmpeg の出力先パスの**引数**としても渡す。
+/// `external::run` は自分の cwd 引数だけを絶対化するため、cwd 引数は絶対化
+/// されても ffmpeg への出力先引数が相対のままだと、ffmpeg はそれを新しい cwd
+/// （既に `<cache_dir>/...` を含む）からの相対として解釈し、`<cache_dir>/...`
+/// が二重にネストしたパスを探しに行って `No such file or directory` になる
+/// （実機で `tachikaze --cache-dir relcache prepare IN.mp4` で再現した）。
+/// ここで根を1か所で絶対化しておけば、そこから導出するあらゆるパス
+/// （`cache_dir_for_input` の戻り値を含む）が常に絶対パスになり、この罠を
+/// 踏まなくなる。
+///
+/// 存在しないディレクトリ（まだ作られていないキャッシュの根）も想定されるため、
+/// `fs::canonicalize` は使わない（symlink 解決が要らない用途なので、
+/// `env::current_dir()` との `join` で十分。`src/external.rs::absolutize_path`
+/// の「存在しないパスは cwd を join するだけに留める」と同じ考え方）。
+fn absolutize_cache_dir(dir: &Path) -> Result<PathBuf> {
+    if dir.is_absolute() {
+        return Ok(dir.to_path_buf());
+    }
+    let cwd = std::env::current_dir().context("カレントディレクトリの取得に失敗しました")?;
+    Ok(cwd.join(dir))
+}
+
+/// `home` から既定のキャッシュルート（`<home>/.cache/tachikaze`）を組み立てる。
+///
+/// [`cache_root`] から `std::env::home_dir()` の呼び出しを分離した純粋関数。
+/// こうすることで、「ホームディレクトリが特定できない」経路（`home: None`）を
+/// 実際に `$HOME` や passwd を触らずに `None` を渡すだけでテストできる
+/// （通常の実行環境では passwd にユーザーエントリが無いような状況を作らないと
+/// 到達できないため、実環境でのテストが書けない）。
 ///
 /// ## ディレクトリ名は XDG から借りるが、環境変数は読まない
 ///
@@ -203,25 +249,29 @@ impl WorkDir {
 ///
 /// ## `$TMPDIR` へフォールバックしない理由
 ///
-/// `$HOME` が取れない環境（コンテナ等）でも、`env::temp_dir()`（`$TMPDIR` 相当）
+/// `home` が取れない環境（コンテナ等）でも、`env::temp_dir()`（`$TMPDIR` 相当）
 /// へ黙ってフォールバックすることはしない。フォールバックしても「キャッシュが
 /// 知らない場所に増える」だけで何も嬉しくなく、むしろ危険: 次に別のプロセスが
 /// 別の `$TMPDIR` を引けば同じ入力に対して別のキャッシュディレクトリを掴んでしまい、
 /// `analyze` → `cut`（`--dtvi` 省略）の暗黙の受け渡しが**エラーを出さずに**外れる。
 /// 「置き場所が決まらない」ことを `--cache-dir` を促すエラーで明示させる方が、
-/// 黙って別の場所に作るより安全（Go の `os.UserCacheDir` も `$HOME` が
-/// 無ければエラーを返す。同じ判断）。
+/// 黙って別の場所に作るより安全。
 ///
-/// `std::env::home_dir()` は Windows での挙動の問題から非推奨扱いだった時期が
-/// あるが、rustc 1.97.1 時点では非推奨警告が出ず、Unix では `$HOME` が unset でも
-/// `getpwuid` 経由でホームディレクトリを引ける（実測済み）。本ツールは macOS
-/// 専用（CLAUDE.md「前提」）なので Windows の問題は関係しない。
-fn cache_root(explicit: Option<&Path>) -> Result<PathBuf> {
-    if let Some(dir) = explicit {
-        return Ok(dir.to_path_buf());
-    }
-
-    let home = std::env::home_dir().ok_or_else(|| {
+/// ## `HOME` が未設定でも、たいていエラーにはならない
+///
+/// `home` は呼び出し元（[`cache_root`]）が `std::env::home_dir()` の戻り値を
+/// そのまま渡す。`std::env::home_dir()` は Windows での挙動の問題から非推奨
+/// 扱いだった時期があるが、rustc 1.97.1 時点では非推奨警告が出ず、Unix では
+/// `$HOME` 環境変数が unset でも `getpwuid` 経由でホームディレクトリを引ける
+/// （実測済み）。つまりこの関数が実際に `None` を受け取る（＝エラーになる）のは
+/// 「`$HOME` が無い」だけでは足りず、「呼び出しユーザーの passwd エントリすら
+/// 無い」ような環境（コンテナで存在しない UID として動かす等）に限られる。
+/// Go の `os.UserCacheDir` は `$HOME` 環境変数の有無だけを見てエラーにするため
+/// 挙動が異なる点に注意（あちらは `$HOME` が無ければ即エラー、こちらは
+/// passwd 由来のホームまで見るぶん範囲が狭い）。本ツールは macOS 専用
+/// （CLAUDE.md「前提」）なので Windows の問題は関係しない。
+fn default_cache_root(home: Option<&Path>) -> Result<PathBuf> {
+    let home = home.ok_or_else(|| {
         anyhow::anyhow!(
             "ホームディレクトリを特定できませんでした。--cache-dir でキャッシュの\
              置き場所を明示してください（使い捨てにしたい場合は\
@@ -603,12 +653,71 @@ mod tests {
         fs::remove_dir_all(&cache_root).ok();
     }
 
+    /// 完了条件（レビュー指摘）: 相対パスの `--cache-dir` は呼び出し元の
+    /// カレントディレクトリを基準に絶対化される。`absolutize_cache_dir` の
+    /// doc comment参照（絶対化しないと `prepare` が二重にネストしたパスを
+    /// 探しに行って `No such file or directory` になる実機バグがあった）。
+    #[test]
+    fn absolutize_cache_dir_joins_relative_path_onto_current_dir() {
+        let cwd = std::env::current_dir().expect("カレントディレクトリを取得できるはず");
+        let resolved = absolutize_cache_dir(Path::new("relcache")).expect("絶対化に失敗しないはず");
+        assert_eq!(resolved, cwd.join("relcache"));
+        assert!(resolved.is_absolute());
+    }
+
+    #[test]
+    fn absolutize_cache_dir_leaves_absolute_path_unchanged() {
+        let absolute = Path::new("/tmp/some-absolute-cache-dir");
+        let resolved = absolutize_cache_dir(absolute).expect("絶対化に失敗しないはず");
+        assert_eq!(resolved, absolute);
+    }
+
+    /// `--cache-dir` に相対パスを渡しても、そこから導出する入力ごとの
+    /// キャッシュディレクトリが絶対パスになることを確認する（`cache_root` が
+    /// `absolutize_cache_dir` を経由することの統合的な確認）。
+    #[test]
+    fn cache_dir_for_input_is_absolute_even_with_relative_explicit_cache_dir() {
+        let cwd = std::env::current_dir().expect("カレントディレクトリを取得できるはず");
+        let input_dir = make_scratch_dir("relative-cache-dir-input");
+        let input_path = input_dir.join("IN.mp4");
+        fs::write(&input_path, b"dummy mp4 content").expect("write input");
+
+        let relative_cache_dir = Path::new("tachikaze-test-relative-cache-dir-unused");
+        let dir =
+            cache_dir_for_input(Some(relative_cache_dir), &input_path).expect("compute cache dir");
+        assert!(dir.is_absolute(), "絶対パスになるはず: {}", dir.display());
+        assert!(dir.starts_with(cwd.join(relative_cache_dir)));
+
+        fs::remove_dir_all(&input_dir).ok();
+    }
+
     /// `--cache-dir` 未指定時は `$HOME/.cache/tachikaze` になる。実際にホーム
     /// ディレクトリを汚さないよう、ディレクトリを作らず計算結果だけ確認する。
     #[test]
     fn cache_root_defaults_to_home_cache_tachikaze_when_no_explicit_dir() {
         let home = std::env::home_dir().expect("このテスト環境には HOME があるはず");
         let root = cache_root(None).expect("既定のキャッシュルートを計算できるはず");
+        assert_eq!(root, home.join(".cache").join("tachikaze"));
+    }
+
+    /// `default_cache_root` はホームを引数で受け取る純粋関数なので、実際に
+    /// `$HOME` や passwd を触らずに「ホームディレクトリが特定できない」経路
+    /// （`cache_root` が `std::env::home_dir()` から `None` を受け取る場合）を
+    /// 検証できる（`default_cache_root` の doc comment参照）。
+    #[test]
+    fn default_cache_root_errors_with_cache_dir_hint_when_home_is_none() {
+        let err = default_cache_root(None).expect_err("home が無ければエラーのはず");
+        let message = err.to_string();
+        assert!(
+            message.contains("--cache-dir"),
+            "--cache-dir を促すメッセージのはず: {message}"
+        );
+    }
+
+    #[test]
+    fn default_cache_root_joins_cache_tachikaze_onto_given_home() {
+        let home = Path::new("/home/example-user");
+        let root = default_cache_root(Some(home)).expect("home があれば成功するはず");
         assert_eq!(root, home.join(".cache").join("tachikaze"));
     }
 

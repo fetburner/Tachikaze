@@ -360,13 +360,27 @@ pub fn run(
         );
     }
 
+    // `external::run` は `ffmpeg_cwd` を作業ディレクトリとして `Command::current_dir`
+    // に渡す（`external::run` 自身が絶対化する）。`input` が相対パスのままだと、
+    // ffmpeg 側はそれを新しい cwd（`ffmpeg_cwd`）からの相対として解釈してしまい、
+    // 呼び出し元のカレントディレクトリにある入力を見失う（`-i` に渡す直前に
+    // 絶対化しないと踏む罠。`workdir::cache_root` の `--cache-dir` 絶対化と同種の
+    // 問題で、実機で `cwd` を `ffmpeg_cwd` に変えた状態で相対 `input` を渡すと
+    // 再現した）。
+    let absolute_input = fs::canonicalize(input).with_context(|| {
+        format!(
+            "入力ファイルの絶対パス解決に失敗しました: {}",
+            input.display()
+        )
+    })?;
+
     let mut args: Vec<String> = vec![
         "-hide_banner".into(),
         "-loglevel".into(),
         "error".into(),
         "-y".into(),
         "-i".into(),
-        require_utf8(input)?.into(),
+        require_utf8(&absolute_input)?.into(),
         "-map".into(),
         "0:v:0".into(),
         "-map".into(),
@@ -658,8 +672,7 @@ mod tests {
         let input = dir.join("IN.mp4");
         fs::write(&input, b"not a real mp4").unwrap();
 
-        let err =
-            run(&input, None, None).expect_err("mp4 として読めない入力はエラーになるはず");
+        let err = run(&input, None, None).expect_err("mp4 として読めない入力はエラーになるはず");
         assert!(err
             .to_string()
             .contains("入力 mp4 の読み込みに失敗しました"));
