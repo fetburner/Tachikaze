@@ -4,7 +4,7 @@
 
 外部3ツール（chapter_exe / join_logo_scp / dtvindex）と ffmpeg を自分でビルド・配置したくない人向けに、`Dockerfile` を用意してある。**変えないもの**: 出力は入力の隣に書く。`analyze` はキャッシュに入力への symlink（`work.mp4`）を張って `chapter_exe` を走らせる。この2つはコンテナ内でも同じ（[architecture.md](architecture.md)「パス解決」節）。
 
-Linux (arm64) で**実際に `docker build` / `docker run` を実行して確認済み**（2026 年 8 月時点。Apple Silicon 上の Colima、`docker` サーバは `linux/arm64`）。この文書自体はキャッシュの置き場所を `--cache-dir` 1本に統合した後（`src/workdir.rs` の E12-2）の CLI を前提に書いてある。本 issue のブランチは `src/` を変更しないため、`--cache-dir` 版の動作確認はこの `Dockerfile` と `--cache-dir` 統合後の `src/` を組み合わせてビルドしたイメージで行った（マージ後は本リポジトリの `Dockerfile` をそのままビルドすれば同じ組み合わせになる）。
+Linux (arm64) で**実際に `docker build` / `docker run` を実行して確認済み**（2026 年 8 月時点。Apple Silicon 上の Colima、`docker` サーバは `linux/arm64`）。この文書はキャッシュの置き場所を `--cache-dir` 1本に統合した後（`src/workdir.rs` の E12-2）の CLI を前提に書いてある。
 
 ## 結果まとめ（実測）
 
@@ -108,7 +108,7 @@ $ docker run --rm \
     tachikaze auto "$MEDIA_DIR/IN.mp4" --cache-dir "$CACHE_DIR" --verify
 ```
 
-`analyze` / `cut` を個別に叩く場合も同様に、`-v "$MEDIA_DIR":"$MEDIA_DIR"` **と** `-v "$CACHE_DIR":"$CACHE_DIR"` の両方をマウントする。`--cache-dir "$CACHE_DIR"` はコンテナ内のパスなので、そのディレクトリをホストにもマウントしていないと `--rm` 付き `docker run` の終了と同時に `.dtvi` などの中間ファイルがコンテナの書き込み可能レイヤーごと消え、次の `cut` が `.dtvi` を読めずに失敗する（`analyze` 単体は `$CACHE_DIR` をマウントし忘れてもコンテナ内に自動でディレクトリを作ってしまうため、その場では一見成功して見える点に注意。実機でこの失敗を再現済み: `Error: .dtvi の読み込みに失敗しました` で `cut` が停止する）。
+`analyze` / `cut` を個別に叩く場合も同様に、`-v "$MEDIA_DIR":"$MEDIA_DIR"` **と** `-v "$CACHE_DIR":"$CACHE_DIR"` の両方をマウントする。`--cache-dir "$CACHE_DIR"` はコンテナ内のパスなので、そのディレクトリをホストにもマウントしていないと `--rm` 付き `docker run` の終了と同時に `.dtvi` などの中間ファイルがコンテナの書き込み可能レイヤーごと消え、次の `cut` が `.dtvi` を読めずに失敗する（`analyze` 単体は `$CACHE_DIR` をマウントし忘れてもコンテナ内に自動でディレクトリを作ってしまうため、その場では一見成功して見える点に注意。実機でこの失敗を再現済み: `--dtvi` を省略した `cut` が「`--dtvi` が指定されておらず、キャッシュにも `.dtvi` が見つかりませんでした」（`先に次を実行してください: tachikaze analyze <input> -o trim.avs` を続けて表示）で停止する）。
 
 `cut` は `--dtvi` を省略すると、直前に同じ入力へ `analyze` を実行していれば `--cache-dir` から `.dtvi` を自動的に見つける（`cut --help` の `--dtvi` の説明どおり）ので、下記の例では `--dtvi` を指定していない。
 
