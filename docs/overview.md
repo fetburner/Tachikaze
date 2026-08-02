@@ -23,6 +23,7 @@ Amatsukaze は MPEG2-TS を入力して CM カットとエンコードを行い 
 | 現在の構成・自己検証・未対応の入力・未解決事項を知る | [architecture.md](architecture.md) |
 | 手元の mp4 を一連で CM カットする | `tachikaze auto`（`prepare`→`analyze`→gate→`cut`→`remap-subs` を対話なしで合成、説明は [architecture.md](architecture.md)「コマンド構成」） |
 | リポジトリを参照できない場所へインストールして使う | [architecture.md](architecture.md)「パス解決」節、[toolchain-macos.md](toolchain-macos.md)「ビルド後の配置とインストール」 |
+| 外部3ツールを自分でビルドせず Docker で使う | [docker.md](docker.md) |
 
 ## スコープ
 

@@ -1,0 +1,10 @@
+# ビルドコンテキストを小さくするため、ビルドに不要なものを除く。
+target/
+tests/data/
+tests/fixtures/*.mp4
+
+.git/
+.github/
+.claude/
+docs/
+*.md
