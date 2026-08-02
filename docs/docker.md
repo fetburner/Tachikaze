@@ -4,7 +4,7 @@
 
 外部3ツール（chapter_exe / join_logo_scp / dtvindex）と ffmpeg を自分でビルド・配置したくない人向けに、`Dockerfile` を用意してある。**変えないもの**: 出力は入力の隣に書く。`analyze` はキャッシュに入力への symlink（`work.mp4`）を張って `chapter_exe` を走らせる。この2つはコンテナ内でも同じ（[architecture.md](architecture.md)「パス解決」節）。
 
-Linux (arm64) で**実際に `docker build` / `docker run` を実行して確認済み**（2026 年 8 月時点。Apple Silicon 上の Colima、`docker` サーバは `linux/arm64`）。
+Linux (arm64) で**実際に `docker build` / `docker run` を実行して確認済み**（2026 年 8 月時点。Apple Silicon 上の Colima、`docker` サーバは `linux/arm64`）。この文書自体はキャッシュの置き場所を `--cache-dir` 1本に統合した後（`src/workdir.rs` の E12-2）の CLI を前提に書いてある。本 issue のブランチは `src/` を変更しないため、`--cache-dir` 版の動作確認はこの `Dockerfile` と `--cache-dir` 統合後の `src/` を組み合わせてビルドしたイメージで行った（マージ後は本リポジトリの `Dockerfile` をそのままビルドすれば同じ組み合わせになる）。
 
 ## 結果まとめ（実測）
 
@@ -15,8 +15,11 @@ Linux (arm64) で**実際に `docker build` / `docker run` を実行して確認
 | `chapter_exe` の Linux ビルド | ✓ **無修正**（[toolchain-macos.md](toolchain-macos.md) の3点パッチはいずれも不要。下記「macOS の3点パッチが不要だった理由」） |
 | `chapter_exe -v` の起動ログ | `AviSynth=enabled, dtvindex=enabled`、`Motion SIMD: NEON`（SSE2 用パッチなしで NEON が自動選択される） |
 | `cargo build --release --locked`（tachikaze 本体） | ✓（`rustup` で入れた stable、Ubuntu 24.04 上） |
-| `docker build -t tachikaze .` | ✓ arm64 で通る（初回ビルド約1分45秒、レイヤーキャッシュ後は数秒） |
-| `docker run` での `auto` 一連動作（`tests/fixtures/sample.mp4`、`--work-dir` 使用） | ✓（`prepare`→`analyze`→gate→`cut`→自己検証→`--verify` の CRC32 検証まで完走） |
+| `docker build -t tachikaze .` | ✓ arm64 で通る（`--no-cache` で初回ビルド約1分27秒、レイヤーキャッシュ後は数秒） |
+| `docker run` での `auto` 一連動作（`tests/fixtures/sample.mp4`、`--cache-dir` 使用） | ✓（`prepare`→`analyze`→gate→`cut`→自己検証→`--verify` の CRC32 検証まで完走） |
+| `cut --cache-dir` のみ（`--dtvi` 省略）での `.dtvi` 自動解決 | ✓（`analyze` が作ったキャッシュから `cut` が自動的に見つける） |
+| CM 側出力（`--cm-output`）・字幕サイドカー（`remap-subs`／`auto`） | ✓（下記「実行例で確認したこと」） |
+| 2回目の `docker run` でのキャッシュ再利用 | ✗（**再利用されない**。下記「実行例で確認したこと」） |
 | runtime の distroless 化 | **見送り**（`chapter_exe` / `dtvindex` / `ffmpeg` の共有ライブラリ依存が多すぎるため。下記「distroless の検討」） |
 
 ## macOS の3点パッチが不要だった理由
@@ -93,51 +96,63 @@ $ make docker-build          # docker build -t tachikaze . と同じ
 
 ## 実行
 
-**メディアディレクトリとキャッシュディレクトリの両方を rw でマウントする**（出力は入力の隣に書く方針のため、かつ `--work-dir` で指定した先はコンテナ内のパスなので、マウントしていないと `--rm` で消える）。`--cache-dir` はまだ実装されていない（別 issue #67 の予定インターフェース）。現時点では `--work-dir` を使う。
+**メディアディレクトリとキャッシュディレクトリの両方を rw でマウントする**（出力は入力の隣に書く方針のため、かつ `--cache-dir` で指定した先はコンテナ内のパスなので、マウントしていないと `--rm` でコンテナが消えると同時に中身も消える）。`--cache-dir` はグローバルオプションで、サブコマンドの前後どちらに置いても効く。
 
 ```console
 $ MEDIA_DIR=/path/to/recordings   # ホスト上の絶対パス
-$ CACHE_DIR=/path/to/cache        # 同上。#67 で --cache-dir に変わる予定
+$ CACHE_DIR=/path/to/cache        # 同上
 
 $ docker run --rm \
     -v "$MEDIA_DIR":"$MEDIA_DIR" \
     -v "$CACHE_DIR":"$CACHE_DIR" \
-    tachikaze auto "$MEDIA_DIR/IN.mp4" --work-dir "$CACHE_DIR" --verify
+    tachikaze auto "$MEDIA_DIR/IN.mp4" --cache-dir "$CACHE_DIR" --verify
 ```
 
-`analyze` / `cut` を個別に叩く場合も同様に、`-v "$MEDIA_DIR":"$MEDIA_DIR"` **と** `-v "$CACHE_DIR":"$CACHE_DIR"` の両方をマウントする。`--work-dir "$CACHE_DIR"` はコンテナ内のパスなので、そのディレクトリをホストにもマウントしていないと `--rm` 付き `docker run` の終了と同時に `.dtvi` などの中間ファイルがコンテナの書き込み可能レイヤーごと消え、次の `cut` が `.dtvi` を読めずに失敗する（`analyze` 単体は `$CACHE_DIR` をマウントし忘れてもコンテナ内に自動でディレクトリを作ってしまうため、その場では一見成功して見える点に注意）。
+`analyze` / `cut` を個別に叩く場合も同様に、`-v "$MEDIA_DIR":"$MEDIA_DIR"` **と** `-v "$CACHE_DIR":"$CACHE_DIR"` の両方をマウントする。`--cache-dir "$CACHE_DIR"` はコンテナ内のパスなので、そのディレクトリをホストにもマウントしていないと `--rm` 付き `docker run` の終了と同時に `.dtvi` などの中間ファイルがコンテナの書き込み可能レイヤーごと消え、次の `cut` が `.dtvi` を読めずに失敗する（`analyze` 単体は `$CACHE_DIR` をマウントし忘れてもコンテナ内に自動でディレクトリを作ってしまうため、その場では一見成功して見える点に注意。実機でこの失敗を再現済み: `Error: .dtvi の読み込みに失敗しました` で `cut` が停止する）。
+
+`cut` は `--dtvi` を省略すると、直前に同じ入力へ `analyze` を実行していれば `--cache-dir` から `.dtvi` を自動的に見つける（`cut --help` の `--dtvi` の説明どおり）ので、下記の例では `--dtvi` を指定していない。
 
 ```console
 $ docker run --rm -v "$MEDIA_DIR":"$MEDIA_DIR" -v "$CACHE_DIR":"$CACHE_DIR" tachikaze \
-    analyze "$MEDIA_DIR/IN.mp4" -o "$MEDIA_DIR/trim.avs" --report --work-dir "$CACHE_DIR"
+    analyze "$MEDIA_DIR/IN.mp4" -o "$MEDIA_DIR/trim.avs" --report --cache-dir "$CACHE_DIR"
 $ docker run --rm -v "$MEDIA_DIR":"$MEDIA_DIR" -v "$CACHE_DIR":"$CACHE_DIR" tachikaze \
     cut "$MEDIA_DIR/IN.mp4" --trim "$MEDIA_DIR/trim.avs" -o "$MEDIA_DIR/OUT.mp4" \
-    --dtvi "$CACHE_DIR/work.mp4.dtvi"
+    --cache-dir "$CACHE_DIR" --verify
 ```
 
 ## キャッシュがホストと共有できない条件
 
-キャッシュディレクトリ名（既定 `${XDG_CACHE_HOME:-~/.cache}/tachikaze/<入力ごと>/`）は**入力ファイルの絶対パスのハッシュ**から決まる（`src/workdir.rs::cache_dir_for_input`、[architecture.md](architecture.md)「パス解決」節）。**コンテナ内のマウント先パスがホストと違うと、同じ入力ファイルでも別のディレクトリ名になり、ネイティブ実行（macOS で直接 `tachikaze` を動かす場合）とキャッシュを共有できない。**
+キャッシュディレクトリの実体は `<cache_root>/<入力ファイルの絶対パスのハッシュ>-<stem>/`（`src/workdir.rs::cache_dir_for_input`）。`cache_root` は `--cache-dir` を明示すればその値（絶対パス化されるだけで、入力ごとのサブディレクトリ規則自体は変わらない）、未指定なら `<ホームディレクトリ>/.cache/tachikaze`（`std::env::home_dir()` から決まる。`XDG_CACHE_HOME` / `TACHIKAZE_CACHE_DIR` のような環境変数は一切読まない。ホームディレクトリ自体が特定できない場合は `--cache-dir` を促すエラーで停止する仕様）。**入力ファイルの絶対パス自体（マウント先のパス）が変わると、同じ内容のファイルでも別のディレクトリ名になり、ネイティブ実行（macOS で直接 `tachikaze` を動かす場合）とキャッシュを共有できない。**
 
-- 共有したい場合: 上記の例のように、**ホストと同じ絶対パスにマウントする**（`-v "$MEDIA_DIR":"$MEDIA_DIR"`）。既定の XDG キャッシュディレクトリを使うなら、コンテナ内の `$HOME`（既定 `/root`）もホストの `$HOME` に合わせて `-v` するか、`TACHIKAZE_CACHE_DIR` / `--work-dir` で明示的に固定する
-- 共有しない場合: パスが違っていても動作自体は壊れない（コンテナ内で毎回 `analyze` が作り直すだけ）。ただし `auto` を何度も叩くたびに `dtvindex` / `chapter_exe` / `join_logo_scp` を再実行することになり、ネイティブ実行時に作ったキャッシュは再利用されない
+- 共有したい場合: 上記の例のように、**ホストと同じ絶対パスにメディアディレクトリをマウントする**（`-v "$MEDIA_DIR":"$MEDIA_DIR"`）ことに加えて、**`--cache-dir` を明示的に指定し、ホストと同じ絶対パスにキャッシュディレクトリもマウントする**。`--cache-dir` を省略してコンテナの既定（`root` の `$HOME`、通常 `/root/.cache/tachikaze`）に任せると、ホスト側のネイティブ実行（`$HOME/.cache/tachikaze`）とは別のパスになるため共有できない。コンテナ内の `$HOME` をホストに合わせて無理に揃えるより、`--cache-dir` を明示するほうが確実
+- 共有しない場合: パスが違っていても動作自体は壊れない（コンテナ内で毎回 `analyze` が作り直すだけ）。ただし下記「実行例で確認したこと」のとおり、`--cache-dir` を揃えて**共有できていても** `analyze` 自体は毎回再実行される（キャッシュは再実行を省略する仕組みではない）ため、この観点では共有の有無による差は無い
 
 ## 実行例で確認したこと（実測）
 
-`tests/fixtures/gen.sh` で作った `sample.mp4`（H.264 + Opus, 20秒, GOP 120 固定）を `$MEDIA_DIR` に置き、`auto --work-dir $CACHE_DIR --verify --force --no-cm` を実行して確認した:
+`tests/fixtures/gen.sh` で作った `sample.mp4`（H.264 + Opus, 20秒, GOP 120 固定）を `$MEDIA_DIR` に置き、`auto --cache-dir $CACHE_DIR --verify --force --no-cm` を実行して確認した:
 
 - `dtvindex build` → `chapter_exe -v` → `join_logo_scp` が3つとも正常終了する
-- `chapter_exe` がメディアファイルの隣ではなく `--work-dir`（キャッシュディレクトリ）内の `work.mp4`（symlink）の隣に `.dtvi` を作る（コンテナ内でもホスト同様、`analyze` の symlink 回避が効いている）
+- `chapter_exe` がメディアファイルの隣ではなく `--cache-dir` 配下（`<hash>-sample/`）の `work.mp4`（symlink）の隣に `.dtvi` を作る（コンテナ内でもホスト同様、`analyze` の symlink 回避が効いている）。ディレクトリ名は実測で `c567f3179fe4d702-sample`（`<入力絶対パスのハッシュ>-<stem>`）
 - `cut` の自己検証（パケット数・表示順・同期サンプル・音声同期）が通り、`--verify` の ffprobe CRC32 検証も通る
+- `cut --dtvi` を省略しても、直前に `analyze` した同じ入力なら `--cache-dir` から `.dtvi` を自動解決できる（実測: `cut` を `--dtvi` 無しで実行して成功）
 - 出力（`sample_CMcut.mp4`）がホスト側のメディアディレクトリに書き戻される（rw マウントが機能している）
 
 **`--no-cm` を付けた理由**: `sample.mp4` は CM 検出テスト用ではなく単体テスト用の合成素材で、実際の CM ブロックを含まない。`join_logo_scp` はこの入力全体を保持区間と判定するため、`auto` が既定で付ける CM 側出力（`--no-cm` 未指定時の `*_CM.mp4`）の保持区間が空になり、`cut` が「出力に含まれるトラックが1本もありません」で失敗する。これは**この合成フィクスチャの内容に起因する既知の挙動**で、Docker 環境固有の問題ではない（ネイティブ実行でも同じ入力・同じオプションなら同じ結果になる）。実際の録画ファイル（CM を含む）であれば `--no-cm` は不要。
 
 `--force` を付けた理由: 同じ理由（検出対象の CM がそもそも無い合成素材）で gate が「除去フレーム数 0 → 疑わしいので止める」と判定するため、smoke test として最後まで通す目的で判定を無視した。実際の運用では gate の停止判定を無視せず、`trim.avs` を確認してから `--force` するか `cut` を直接叩くこと。
 
+### キャッシュは再実行を省略しない（実測）
+
+同じ入力・同じ `--cache-dir`（ホストにマウント済み、内容も共有できる状態）で `auto --overwrite` を2回連続実行し、両回のログを比較した。**2回目も `dtvindex build` / `chapter_exe -v` / `join_logo_scp` が3つとも全く同じコマンドラインで再実行される。** これは Docker 固有の問題ではなく tachikaze 共通の挙動で、`analyze` に「既存の成果物があれば再実行をスキップする」判定が無いため（キャッシュは「`cut` が `.dtvi` を自動解決できるようにするための受け渡し場所」であって、再実行を省略する仕組みではない）。したがって「キャッシュを共有すれば2回目以降が速くなる」という期待は**外れる**。速くなるとしたら OS のページキャッシュ（同じファイルの再読み込みが速くなる）程度で、`dtvindex`/`chapter_exe`/`join_logo_scp` の実行自体は毎回フルで走る。
+
+### CM 側出力・字幕サイドカーの確認（実測）
+
+- **CM 側出力（`--cm-output`）**: `sample.mp4` は前述の理由で `auto` の既定 CM 側出力が空になり検証できないため、`trim.avs` を手動で `Trim(0,300)`（保持区間を意図的に一部だけにする）へ書き換え、`cut --cm-output` を直接叩いて確認した。保持側（`PARTIAL.mp4`、映像パケット数360）・CM 側（`PARTIAL_CM.mp4`、映像パケット数239）の両方が生成され、両方で自己検証と `--verify` の CRC32 検証が通った
+- **字幕サイドカー**: `sample.mp4` に `mov_text` 字幕トラック（`tests/prepare_e2e.rs::make_subtitle_fixture` と同じ手順）を1本追加した `sample_subs.mp4` を作り、コンテナ内で `auto --cache-dir $CACHE_DIR --verify --force --no-cm` を実行した。`prepare` が字幕を抽出してキャッシュへ前処理済み入力を作り、`cut` 後に `remap-subs` が自動で走って `sample_subs_CMcut.srt`（シフト2件 / 破棄0件 / クリップ0件）をホスト側のメディアディレクトリに書き出すことを確認した
+
 ## 既知の制約
 
 - **イメージサイズ**: `--no-install-recommends` を builder・runtime 両方の `apt-get install` に付けた状態で実測 **753MB**（付ける前は 1.14GB、-34%）。X11・フォント関連ライブラリなど推奨パッケージの分が減る。`--no-install-recommends` を付けた状態でも `auto --verify` のフルパイプラインが通ることを確認済み。`ffmpeg` パッケージ自体が持ち込む必須の共有ライブラリ（`libavformat` 系一式）は削れないため、これ以上詰めるなら ffmpeg を静的ビルドする、または `apt` の代わりに BtbN の静的ビルド済みバイナリを使う方法があるが、本 issue の範囲では対応しない
 - 3ツールはバージョン固定していない（上記「Dockerfile の構成」参照）。ビルドのたびに upstream の最新 HEAD を取るため、upstream 側の変更で本書の実測（パッチ不要）が将来変わる可能性がある
-- `--cache-dir` はまだ無い（#67 で実装予定）。実装されたら、上記「実行」の例と「キャッシュがホストと共有できない条件」の節を `--work-dir` から `--cache-dir` に書き換えること
+- **キャッシュは再実行を省略しない**（上記「実行例で確認したこと」）。`--cache-dir` を共有しても2回目以降の `analyze` が速くなるわけではない
 - **arm64 イメージが必須**。Apple Silicon（`darwin/arm64` ホスト、Colima も `linux/arm64` サーバ）で使う前提のため、`docker build` は arm64 ネイティブで行う。x86_64 のみのイメージを arm64 ホストで動かすと QEMU エミュレーションが挟まり極端に遅くなる（本書の実測はすべて `linux/arm64` ネイティブで行っており、QEMU 経由の速度は未検証）
