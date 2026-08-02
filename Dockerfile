@@ -10,9 +10,9 @@
 FROM ubuntu:24.04 AS builder
 
 # libavformat-dev 等は dtvindex と chapter_exe の pkg-config 依存（両方とも
-# libavformat/libavcodec/libavutil/libswscale/libswresample を要求する。
-# chapter_exe はさらに libswresample も使う）。
-RUN apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+# libavformat/libavcodec/libavutil/libswscale/libswresample を要求する）。
+# --no-install-recommends: ビルド時点で推奨パッケージ（ドキュメント類等）は不要。
+RUN apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
     build-essential \
     pkg-config \
     git \
@@ -64,11 +64,14 @@ RUN cargo build --release --locked
 
 FROM ubuntu:24.04 AS runtime
 
-# ffmpeg パッケージが ffmpeg/ffprepare 用 CLI 本体と、chapter_exe/dtvindex が
-# 実行時に要求する libavformat.so.60 等の共有ライブラリを両方提供する
-# （builder の *-dev パッケージと同じ apt リポジトリ・同じ Ubuntu 24.04 なので
-# バージョンが揃う）。
-RUN apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+# ffmpeg パッケージが `prepare`/`--verify` 用の ffmpeg/ffprobe CLI 本体と、
+# chapter_exe/dtvindex が実行時に要求する libavformat.so.60 等の共有ライブラリを
+# 両方提供する（builder の *-dev パッケージと同じ apt リポジトリ・同じ
+# Ubuntu 24.04 なのでバージョンが揃う）。
+# --no-install-recommends: 実測で 1.14GB → 753MB（-34%）。X11/フォント関連の
+# 推奨パッケージを削っても auto --verify のフルパイプラインは通ることを確認済み
+# （docs/docker.md「既知の制約」）。
+RUN apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
     ffmpeg \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*

@@ -68,7 +68,7 @@ runtime ステージを `gcr.io/distroless/cc-debian12` に変えられないか
 
 - distroless には `apt` / `dpkg` が無いため、`ldd` の出力から**手作業でファイルリストを組み、バージョンが変わるたびに追随する**運用になる（アップストリームの `chapter_exe` / `dtvindex` / `ffmpeg` はバージョン固定していないため、依存ライブラリの集合が変わりうる。上記「結果まとめ」参照）
 - 共有ライブラリ本体だけでなく、`libfontconfig` の設定ファイル・`ca-certificates` のバンドル・`iconv` の `gconv` モジュールなど、**ファイル以外の実行時データも一致させる必要がある**（今回は未検証だが、`ffmpeg` が TLS 系ライブラリ（`libgnutls` / `libssl`）を含んでいることから、証明書バンドルが必要になる場面はありうる）
-- 手作業でのライブラリ一覧管理は、抜け漏れが「実行時にしか判明しない」失敗モードを生む。これは本ツールの方針（[architecture.md](architecture.md)「静かに壊れる」を避ける設計）と相性が悪い
+- 手作業でのライブラリ一覧管理は、抜け漏れが「ビルドは通るが実行時にしか判明しない」失敗モードを生む。CLAUDE.md「静かに壊れる4つの罠」と同じ種類の問題（エラーを出さずに間違った・不完全な結果になる）を Dockerfile 自体に持ち込むことになるため避けた
 
 一方 `tachikaze` / `join_logo_scp` の2本だけを distroless にしても、**同じイメージ内に `chapter_exe` / `dtvindex` / `ffmpeg` 用の Debian ベースレイヤーを残す必要がある**ため、イメージサイズも攻撃面（シェル・パッケージマネージャの有無）も変わらない。得られる利益がない。
 
@@ -78,7 +78,7 @@ runtime ステージを `gcr.io/distroless/cc-debian12` に変えられないか
 
 マルチステージ（`Dockerfile`）:
 
-1. **builder**: `ubuntu:24.04` + `build-essential` / `pkg-config` / ffmpeg の `-dev` パッケージ群 + `rustup`（Ubuntu 24.04 の apt 版 `cargo` は edition 2021 の依存クレートに対して古すぎるため使わない）。`join_logo_scp` / `dtvindex` / `chapter_exe` を `git clone --depth 1` してビルドし、`tachikaze` 本体も `cargo build --release --locked` する。`chapter_exe` のビルド直後に `chapter_exe -v` の出力へ `dtvindex=enabled` が含まれるかを `RUN` の中で検証し、含まれなければビルドを失敗させる（`dtvindex=disabled` のまま静かに動かなくなることを防ぐ。issue の「罠」参照）
+1. **builder**: `ubuntu:24.04` + `build-essential` / `pkg-config` / ffmpeg の `-dev` パッケージ群 + `rustup`（Ubuntu 24.04 の apt 版 `cargo` は edition 2021 の依存クレートに対して古すぎるため使わない）。`join_logo_scp` / `dtvindex` / `chapter_exe` を `git clone --depth 1` してビルドし、`tachikaze` 本体も `cargo build --release --locked` する。`chapter_exe` のビルド直後に `chapter_exe -v` の出力へ `dtvindex=enabled` が含まれるかを `RUN` の中で検証し、含まれなければビルドを失敗させる（`dtvindex=disabled` でビルドされた `chapter_exe` は入力経路が無く、エラーを出さずに動かなくなる。ビルドの時点でこれを検出して止める）
 2. **runtime**: `ubuntu:24.04` + `ffmpeg` パッケージ（`prepare` と `--verify` が使う `ffmpeg` / `ffprobe` 本体と、`chapter_exe` / `dtvindex` が実行時に要求する `libavformat.so.60` 等の共有ライブラリを兼ねる。builder の `-dev` パッケージと同じ Ubuntu 24.04 の apt リポジトリなのでバージョンが揃う）。4つのバイナリを `/usr/local/bin/` に、`JL/` を `/usr/local/share/join_logo_scp/JL/` に置く
 
 `ENTRYPOINT ["tachikaze"]` なので `docker run tachikaze <サブコマンド> ...` がそのまま `tachikaze <サブコマンド> ...` になる。
@@ -93,7 +93,7 @@ $ make docker-build          # docker build -t tachikaze . と同じ
 
 ## 実行
 
-**メディアディレクトリは rw でマウントする**（出力は入力の隣に書く方針のため）。`--cache-dir` はまだ実装されていない（別 issue #67 の予定インターフェース）。現時点では `--work-dir` を使う。
+**メディアディレクトリとキャッシュディレクトリの両方を rw でマウントする**（出力は入力の隣に書く方針のため、かつ `--work-dir` で指定した先はコンテナ内のパスなので、マウントしていないと `--rm` で消える）。`--cache-dir` はまだ実装されていない（別 issue #67 の予定インターフェース）。現時点では `--work-dir` を使う。
 
 ```console
 $ MEDIA_DIR=/path/to/recordings   # ホスト上の絶対パス
@@ -105,12 +105,12 @@ $ docker run --rm \
     tachikaze auto "$MEDIA_DIR/IN.mp4" --work-dir "$CACHE_DIR" --verify
 ```
 
-`analyze` / `cut` を個別に叩く場合も同様に、`-v "$MEDIA_DIR":"$MEDIA_DIR"` でホストと同じ絶対パスにマウントする。
+`analyze` / `cut` を個別に叩く場合も同様に、`-v "$MEDIA_DIR":"$MEDIA_DIR"` **と** `-v "$CACHE_DIR":"$CACHE_DIR"` の両方をマウントする。`--work-dir "$CACHE_DIR"` はコンテナ内のパスなので、そのディレクトリをホストにもマウントしていないと `--rm` 付き `docker run` の終了と同時に `.dtvi` などの中間ファイルがコンテナの書き込み可能レイヤーごと消え、次の `cut` が `.dtvi` を読めずに失敗する（`analyze` 単体は `$CACHE_DIR` をマウントし忘れてもコンテナ内に自動でディレクトリを作ってしまうため、その場では一見成功して見える点に注意）。
 
 ```console
-$ docker run --rm -v "$MEDIA_DIR":"$MEDIA_DIR" tachikaze \
+$ docker run --rm -v "$MEDIA_DIR":"$MEDIA_DIR" -v "$CACHE_DIR":"$CACHE_DIR" tachikaze \
     analyze "$MEDIA_DIR/IN.mp4" -o "$MEDIA_DIR/trim.avs" --report --work-dir "$CACHE_DIR"
-$ docker run --rm -v "$MEDIA_DIR":"$MEDIA_DIR" tachikaze \
+$ docker run --rm -v "$MEDIA_DIR":"$MEDIA_DIR" -v "$CACHE_DIR":"$CACHE_DIR" tachikaze \
     cut "$MEDIA_DIR/IN.mp4" --trim "$MEDIA_DIR/trim.avs" -o "$MEDIA_DIR/OUT.mp4" \
     --dtvi "$CACHE_DIR/work.mp4.dtvi"
 ```
@@ -137,6 +137,7 @@ $ docker run --rm -v "$MEDIA_DIR":"$MEDIA_DIR" tachikaze \
 
 ## 既知の制約
 
-- **イメージサイズが大きい**（実測 1.14GB）。ランタイムの `ffmpeg` パッケージが X11・フォント関連ライブラリなど大量の推移的依存を持ち込むため。`--no-install-recommends` は既に付けているが、`ffmpeg` パッケージ自体の依存が大きい。サイズを詰めるなら ffmpeg を静的ビルドする、または `apt` の代わりに BtbN の静的ビルド済みバイナリを使う方法があるが、本 issue の範囲では対応しない
+- **イメージサイズ**: `--no-install-recommends` を builder・runtime 両方の `apt-get install` に付けた状態で実測 **753MB**（付ける前は 1.14GB、-34%）。X11・フォント関連ライブラリなど推奨パッケージの分が減る。`--no-install-recommends` を付けた状態でも `auto --verify` のフルパイプラインが通ることを確認済み。`ffmpeg` パッケージ自体が持ち込む必須の共有ライブラリ（`libavformat` 系一式）は削れないため、これ以上詰めるなら ffmpeg を静的ビルドする、または `apt` の代わりに BtbN の静的ビルド済みバイナリを使う方法があるが、本 issue の範囲では対応しない
 - 3ツールはバージョン固定していない（上記「Dockerfile の構成」参照）。ビルドのたびに upstream の最新 HEAD を取るため、upstream 側の変更で本書の実測（パッチ不要）が将来変わる可能性がある
 - `--cache-dir` はまだ無い（#67 で実装予定）。実装されたら、上記「実行」の例と「キャッシュがホストと共有できない条件」の節を `--work-dir` から `--cache-dir` に書き換えること
+- **arm64 イメージが必須**。Apple Silicon（`darwin/arm64` ホスト、Colima も `linux/arm64` サーバ）で使う前提のため、`docker build` は arm64 ネイティブで行う。x86_64 のみのイメージを arm64 ホストで動かすと QEMU エミュレーションが挟まり極端に遅くなる（本書の実測はすべて `linux/arm64` ネイティブで行っており、QEMU 経由の速度は未検証）

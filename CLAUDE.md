@@ -32,6 +32,7 @@ docs/mp4-atom.md            mp4 読み書きの検証済みコードと落とし
 docs/toolchain-macos.md     外部ツールのビルド手順
 docs/measurements.md        実測データ
 docs/architecture.md        現在の構成・自己検証・未対応の入力・未解決事項
+docs/docker.md              インストールせず Docker で使う方法
 ```
 
 ## テスト
