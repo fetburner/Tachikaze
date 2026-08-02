@@ -17,6 +17,7 @@ Linux (arm64) で**実際に `docker build` / `docker run` を実行して確認
 | `cargo build --release --locked`（tachikaze 本体） | ✓（`rustup` で入れた stable、Ubuntu 24.04 上） |
 | `docker build -t tachikaze .` | ✓ arm64 で通る（初回ビルド約1分45秒、レイヤーキャッシュ後は数秒） |
 | `docker run` での `auto` 一連動作（`tests/fixtures/sample.mp4`、`--work-dir` 使用） | ✓（`prepare`→`analyze`→gate→`cut`→自己検証→`--verify` の CRC32 検証まで完走） |
+| runtime の distroless 化 | **見送り**（`chapter_exe` / `dtvindex` / `ffmpeg` の共有ライブラリ依存が多すぎるため。下記「distroless の検討」） |
 
 ## macOS の3点パッチが不要だった理由
 
@@ -27,6 +28,51 @@ Linux (arm64) で**実際に `docker build` / `docker run` を実行して確認
 - upstream の `Makefile` が `SIMD_BACKEND=auto` で NEON / SSE2 / スカラーを自動判定するように既に書き換わっており、`uname -m` 分岐の問題自体が発生しない
 
 そのため Linux ビルドでは **`git clone` してきたソースに一切パッチを当てず** `make` するだけで、`dtvindex=enabled` かつ NEON SIMD の `chapter_exe` が得られる。
+
+## distroless の検討（実測・見送り）
+
+runtime ステージを `gcr.io/distroless/cc-debian12` に変えられないか検討した。**結論: 見送り。** 理由を実測で示す。
+
+### 1. `ldd` で共有ライブラリの依存数を数えた
+
+現行の `ubuntu:24.04` ベースの runtime イメージ上で、6バイナリすべてに `ldd` を実行した:
+
+| バイナリ | 動的リンクしている共有ライブラリの数（`ldd` の実行結果、重複除去後） |
+|---|---|
+| `tachikaze` | 3（`libgcc_s.so.1` / `libm.so.6` / `libc.so.6`） |
+| `join_logo_scp` | 4（上記 + `libstdc++.so.6`） |
+| `chapter_exe` | 133 |
+| `dtvindex` | 133（`chapter_exe` と完全に同じ集合。`libswresample.so.4` / `libsoxr.so.0` / `libgomp.so.1` の並びが違うだけ） |
+| `ffmpeg` | 212 |
+| `ffprobe` | 212（`ffmpeg` と同じ） |
+
+`tachikaze` と `join_logo_scp` は `libc` / `libm` / `libgcc_s` / `libstdc++` の4種類だけで、これは `distroless/cc-debian12`（「cc」= C/C++ ランタイム込みの variant）がそのまま提供する集合と一致する。一方 `chapter_exe` / `dtvindex` / `ffmpeg` / `ffprobe` は `libavformat` 経由で `libx264` / `libx265` / `libaom` / `libvpx` / `libssl` / `libgnutls` / `libfontconfig` / `libX11` 系まで含む**130〜210本超**の共有ライブラリを要求する。
+
+### 2. glibc バージョン不一致を実機で確認した
+
+`distroless/cc-debian12` は Debian 12 (bookworm) 相当で glibc 2.36。現行の builder（`ubuntu:24.04`）は glibc 2.39。ビルド済みの `tachikaze` / `join_logo_scp` バイナリを `gcr.io/distroless/cc-debian12:latest` の上に `COPY` して実行すると、実際に次のエラーで起動できないことを確認した:
+
+```
+/usr/local/bin/tachikaze: /lib/aarch64-linux-gnu/libc.so.6: version `GLIBC_2.39' not found (required by /usr/local/bin/tachikaze)
+/usr/local/bin/join_logo_scp: /lib/aarch64-linux-gnu/libc.so.6: version `GLIBC_2.38' not found (required by /usr/local/bin/join_logo_scp)
+/usr/local/bin/join_logo_scp: /usr/lib/aarch64-linux-gnu/libstdc++.so.6: version `GLIBCXX_3.4.32' not found (required by /usr/local/bin/join_logo_scp)
+```
+
+これは builder のベースイメージを `debian:bookworm`（distroless と同じ Debian 12 系）に変えれば解消できる問題で、**`tachikaze` / `join_logo_scp` の2本だけなら distroless 化は技術的に可能**だとわかった。
+
+### 3. それでも見送った理由: コンテナは1つで、4ツール全部が同じファイルシステムに要る
+
+`tachikaze` は `chapter_exe` / `dtvindex` / `join_logo_scp` / `ffmpeg` / `ffprobe` を `PATH` 経由の子プロセスとして起動する（`src/tools.rs::resolve_tool`）。**これらは同じコンテナ・同じファイルシステムに揃っていないと動かない。** つまり最終イメージは「`tachikaze` と `join_logo_scp` だけ distroless、残りは通常の Debian/Ubuntu」という形にはできず、**イメージ全体を distroless にするか、しないか**の二択になる。
+
+イメージ全体を distroless にするには、`chapter_exe` / `dtvindex` / `ffmpeg` / `ffprobe` が要求する 130〜212 本の共有ライブラリを `COPY --from=builder` で個別に持ってくる必要がある。これは技術的に不可能ではないが:
+
+- distroless には `apt` / `dpkg` が無いため、`ldd` の出力から**手作業でファイルリストを組み、バージョンが変わるたびに追随する**運用になる（アップストリームの `chapter_exe` / `dtvindex` / `ffmpeg` はバージョン固定していないため、依存ライブラリの集合が変わりうる。上記「結果まとめ」参照）
+- 共有ライブラリ本体だけでなく、`libfontconfig` の設定ファイル・`ca-certificates` のバンドル・`iconv` の `gconv` モジュールなど、**ファイル以外の実行時データも一致させる必要がある**（今回は未検証だが、`ffmpeg` が TLS 系ライブラリ（`libgnutls` / `libssl`）を含んでいることから、証明書バンドルが必要になる場面はありうる）
+- 手作業でのライブラリ一覧管理は、抜け漏れが「実行時にしか判明しない」失敗モードを生む。これは本ツールの方針（[architecture.md](architecture.md)「静かに壊れる」を避ける設計）と相性が悪い
+
+一方 `tachikaze` / `join_logo_scp` の2本だけを distroless にしても、**同じイメージ内に `chapter_exe` / `dtvindex` / `ffmpeg` 用の Debian ベースレイヤーを残す必要がある**ため、イメージサイズも攻撃面（シェル・パッケージマネージャの有無）も変わらない。得られる利益がない。
+
+**将来 distroless 化の余地が生まれる条件**: `chapter_exe` / `dtvindex` が `libavformat` 等を静的リンク（`.a`）した上でビルドされ、`ffmpeg` / `ffprobe` も静的ビルド（BtbN の static build 相当）に切り替われば、実行時に必要な共有ライブラリは `libc` / `libm` / `libgcc_s` / `libstdc++` だけになり、4ツールすべてを distroless に載せられる可能性がある。ただしこれは FFmpeg を静的リンク向けにソースから構成し直す作業で、本 issue の範囲を大きく超えるため今回は実施しない。
 
 ## Dockerfile の構成
 
