@@ -156,4 +156,4 @@ cd <tachikaze リポジトリ>
 make install PREFIX=/usr/local
 ```
 
-この構成であれば、`tachikaze` は `--tool-dir` も `--jl-file` も指定せずに動く。`$HOME/.local` など非 root なプレフィックスでも同様（`make install PREFIX=$HOME/.local` と `$PREFIX/bin` を `PATH` に追加すればよい）。
+この構成であれば、`tachikaze` は `--jl-file` を指定せずに動く（外部ツール自体は `PATH` 経由でしか解決しないため、`$PREFIX/bin` を `PATH` に通しておくことが前提）。JL の配置先は `$PREFIX/share/join_logo_scp/JL/` だけが有効で、`tachikaze` はここ以外（旧 `tachikaze/JL/` のような専用データディレクトリなど）を探さない。`$HOME/.local` など非 root なプレフィックスでも同様（`make install PREFIX=$HOME/.local` と `$PREFIX/bin` を `PATH` に追加すればよい）。
