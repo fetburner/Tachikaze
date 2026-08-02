@@ -53,9 +53,9 @@ fn tail_lines(text: &str, max_lines: usize) -> String {
 ///
 /// `program` と `work_dir` が相対パスのとき、呼び出し元のカレントディレクトリを
 /// 基準に絶対パスへ直してから起動する。`Command::current_dir` は相対の実行
-/// ファイルパスも新しい cwd 基準で解決するため、`--tool-dir tools` のような
-/// 相対指定のままだと `work_dir` 配下の `tools/...` を探しにいって
-/// `No such file or directory` になる。
+/// ファイルパスも新しい cwd 基準で解決するため、`PATH` に `tools` のような
+/// 相対エントリが含まれる場合、そのまま起動すると `work_dir` 配下の
+/// `tools/...` を探しにいって `No such file or directory` になる。
 pub fn run(program: &str, args: &[&str], work_dir: &Path) -> anyhow::Result<ExternalOutput> {
     let absolute_program = absolutize_program(program)?;
     let absolute_work_dir = absolutize_path(work_dir).with_context(|| {
@@ -201,21 +201,21 @@ mod tests {
 
     #[test]
     fn run_resolves_relative_program_against_caller_cwd_not_work_dir() {
-        // `--tool-dir tools` のような相対パスを、`current_dir(work)` の後でも
+        // `tools/dummy_tool` のような相対パスを、`current_dir(work)` の後でも
         // 呼び出し元 cwd 基準で解決できることを確認する。
         let _guard = CWD_LOCK.lock().unwrap();
 
         let root =
             std::env::temp_dir().join(format!("tachikaze-external-rel-{}", std::process::id()));
-        let tool_dir = root.join("tools");
+        let relative_bin_dir = root.join("tools");
         let work_dir = root.join("work");
-        fs::create_dir_all(&tool_dir).unwrap();
+        fs::create_dir_all(&relative_bin_dir).unwrap();
         fs::create_dir_all(&work_dir).unwrap();
 
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let script = tool_dir.join("dummy_tool");
+            let script = relative_bin_dir.join("dummy_tool");
             fs::write(&script, "#!/bin/sh\necho ok-from-relative-tool\n").unwrap();
             let mut perms = fs::metadata(&script).unwrap().permissions();
             perms.set_mode(0o755);

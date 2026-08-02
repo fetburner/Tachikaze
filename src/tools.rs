@@ -60,6 +60,10 @@ fn is_regular_file(path: &Path) -> bool {
 #[derive(Debug, Default)]
 struct SearchTrace {
     tried: Vec<PathBuf>,
+    /// `PATH` 環境変数自体が未設定だったか（空文字列で設定されている場合とは
+    /// 区別する。`PATH` が唯一の探索手段になった今、この2つを区別しないと
+    /// 「探した場所」が空欄のまま出力され、原因がわからないエラーになる）。
+    path_env_unset: bool,
 }
 
 impl SearchTrace {
@@ -69,7 +73,10 @@ impl SearchTrace {
 
     /// `PATH` に列挙された各ディレクトリを順に調べる。
     fn try_path_env(&mut self, name: &str) -> Option<PathBuf> {
-        let path_var = env::var_os("PATH")?;
+        let Some(path_var) = env::var_os("PATH") else {
+            self.path_env_unset = true;
+            return None;
+        };
         for dir in env::split_paths(&path_var) {
             let candidate = dir.join(name);
             self.tried.push(candidate.clone());
@@ -81,18 +88,28 @@ impl SearchTrace {
     }
 
     /// 見つからなかった場合のエラーを、調べた場所を全て列挙して組み立てる。
+    ///
+    /// `PATH` が未設定、または（環境変数自体はあっても）空だった場合は候補が
+    /// 1件も無いため、その旨を明示する（`tried` が空のまま出力すると空行だけ
+    /// が残り、原因が分からないエラーになる。実機で `env -u PATH` を使って
+    /// 再現した）。
     fn not_found_error(&self, name: &str) -> anyhow::Error {
-        let tried_list = self
-            .tried
-            .iter()
-            .map(|p| format!("  - {}", p.display()))
-            .collect::<Vec<_>>()
-            .join("\n");
+        let tried_list = if self.path_env_unset {
+            "  (`PATH` 環境変数自体が設定されていません)".to_string()
+        } else if self.tried.is_empty() {
+            "  (`PATH` が空です)".to_string()
+        } else {
+            self.tried
+                .iter()
+                .map(|p| format!("  - {}", p.display()))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
         anyhow!(
             "外部ツール `{name}` が見つかりませんでした。以下の場所を探しました:\n{tried_list}\n\
              `PATH` の通った場所に `{name}` を置いてください（配置は\
-             docs/toolchain-macos.md「ビルド後の配置とインストール」節）。インストールしたく\
-             ない場合は Docker イメージを使ってください。"
+             docs/toolchain-macos.md を参照）。インストールしたくない場合は、\
+             コンテナ化した実行環境を用意する方法も検討してください。"
         )
     }
 }
@@ -322,20 +339,8 @@ mod tests {
             resolve_tool("no-such-tool-xyz").expect_err("PATH のどこにも無いので失敗するはず");
         let message = err.to_string();
         assert!(message.contains("no-such-tool-xyz"));
-        assert!(message.contains(
-            &dir1
-                .path()
-                .join("no-such-tool-xyz")
-                .display()
-                .to_string()
-        ));
-        assert!(message.contains(
-            &dir2
-                .path()
-                .join("no-such-tool-xyz")
-                .display()
-                .to_string()
-        ));
+        assert!(message.contains(&dir1.path().join("no-such-tool-xyz").display().to_string()));
+        assert!(message.contains(&dir2.path().join("no-such-tool-xyz").display().to_string()));
     }
 
     /// `<bin_dir>/join_logo_scp` ダミーを作り、そのパスを返す。

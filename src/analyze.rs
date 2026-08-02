@@ -310,7 +310,9 @@ mod tests {
     // `PATH` の書き換えが唯一の手段になった。`crate::tools::test_support` の
     // doc comment参照）。2つの環境変数は別物なので別ロックのままでよいが、
     // 同じ環境変数を書き換えるテストどうしは必ず同じロックを共有する。
-    use crate::tools::test_support::{EnvVarGuard as ToolPathEnvGuard, ENV_LOCK as TOOL_PATH_ENV_LOCK};
+    use crate::tools::test_support::{
+        EnvVarGuard as ToolPathEnvGuard, ENV_LOCK as TOOL_PATH_ENV_LOCK,
+    };
     use crate::workdir::test_support::{EnvVarGuard as CacheEnvGuard, ENV_LOCK as CACHE_ENV_LOCK};
     use std::process;
     use std::time::{SystemTime, UNIX_EPOCH};
