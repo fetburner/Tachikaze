@@ -13,7 +13,7 @@ tachikaze prepare IN.mp4 [--subs PATH]
     0. elst(edit list) 除去・字幕トラック除去・字幕抽出を1回の ffmpeg 呼び出しに
        まとめる（#58）。`cut` が elst 付き / 字幕トラック付き入力を明示エラーで
        拒否するため（下記「未対応の入力」）、その回避策をここに集約する。
-       出力は入力ごとの XDG キャッシュディレクトリへ（下記「パス解決」節）
+       出力は入力ごとのキャッシュディレクトリへ（下記「パス解決」節）
        elst も字幕も無ければ ffmpeg を呼ばず入力をそのまま返す
        映像2本以上・音声2本以上は明示エラーで停止する（`-map 0:v:0 -map 0:a:0`
        固定のため、黙って1本目だけ残すと cut が本来拒否すべき構成を素通しさせて
@@ -134,7 +134,7 @@ tachikaze auto IN.mp4 [IN2 ...] [-o OUT | --cm-output PATH | --no-cm] [--force]
 | `auto.rs` | `auto` コマンドの組み立て（`prepare`→`analyze`→gate→`cut`→`remap-subs`、アルゴリズムは持たない） | 上記「コマンド構成」手順16〜19 |
 | `tools.rs` | 外部ツールと JL ファイルの探索 | 上記「パス解決」節、[toolchain-macos.md](toolchain-macos.md) |
 | `external.rs` | 外部プロセスの起動と出力の回収 | [pipeline.md](pipeline.md) |
-| `workdir.rs` | 作業ディレクトリ（既定は入力ごとの XDG キャッシュ）と symlink | 上記「パス解決」節 |
+| `workdir.rs` | 作業ディレクトリ（既定は入力ごとのキャッシュ）と symlink | 上記「パス解決」節 |
 | `order.rs` | `DisplayIdx` / `DecodeIdx` | 下記「型設計の要点」 |
 | `trim.rs` | `Trim(a,b)++…` のパース / 生成（半開区間 `[s, e+1)` に正規化） | — |
 | `dtvi.rs` | `.dtvi` のパース（タブ区切りテキスト） | [pipeline.md](pipeline.md) |
