@@ -21,7 +21,7 @@ tachikaze prepare IN.mp4 [--subs PATH]
        「複数トラックの扱い」参照）。字幕トラックが2本以上ある場合はエラーに
        せず警告のうえ先頭の1本のみ抽出する
 
-tachikaze analyze IN.mp4 -o trim.avs [--report] [--work-dir DIR] [--no-keep-work]
+tachikaze analyze IN.mp4 -o trim.avs [--report] [--cache-dir DIR]
                                      [--jls-set KEY=VALUE]... [--jl-file FILE]
     1. dtvindex build              （外部プロセス）
     2. chapter_exe                 （外部プロセス）
@@ -37,7 +37,7 @@ tachikaze analyze IN.mp4 -o trim.avs [--report] [--work-dir DIR] [--no-keep-work
 
 （必要なら trim.avs を人手で編集）
 
-tachikaze cut IN.mp4 --trim trim.avs -o OUT.mp4 [--dtvi work.mp4.dtvi]
+tachikaze cut IN.mp4 --trim trim.avs -o OUT.mp4 [--dtvi work.mp4.dtvi] [--cache-dir DIR]
                                      [--snap outward|inward] [--cm-output CM.mp4]
                                      [--video-only] [--verify] [--segment-map PATH]
     5. mp4-atom でサンプル表を読み、表示順↔デコード順を導出
@@ -71,7 +71,7 @@ tachikaze remap-subs IN.mp4 [--segment-map PATH] [--subs PATH] [-o OUT.ass|OUT.s
 
 tachikaze auto IN.mp4 [IN2 ...] [-o OUT | --cm-output PATH | --no-cm] [--force]
                                 [--overwrite] [--analyze-only] [--no-subtitles]
-                                [--snap] [--verify] [--jl-file] [--jls-set] [--work-dir]
+                                [--snap] [--verify] [--jl-file] [--jls-set] [--cache-dir]
    16. prepare(0) → analyze(1〜4) → gate 判定 → cut(5〜12) → remap-subs(13〜15) を
        対話なしで合成する（`src/auto.rs`、#62）。アルゴリズムは持たない: 各ステップは
        上記の関数・処理をそのまま呼ぶ（`commands::execute_cut` を `cut` サブコマンドと
@@ -104,19 +104,24 @@ tachikaze auto IN.mp4 [IN2 ...] [-o OUT | --cm-output PATH | --no-cm] [--force]
 
 | 種類 | 中身 | 探索順・既定 |
 |---|---|---|
-| 実行ファイル | `tachikaze` / `chapter_exe` / `join_logo_scp` / `dtvindex` / `ffmpeg` / `ffprobe` | `--tool-dir` → `TACHIKAZE_TOOL_DIR` → 自分の実行ファイルの隣 → `PATH`（`src/tools.rs::resolve_tool`） |
-| 読み取り専用データ | JL コマンドファイル（既定 `JL_標準.txt`） | `TACHIKAZE_JL_DIR` → `${XDG_DATA_HOME:-~/.local/share}/tachikaze/JL/` → `$XDG_DATA_DIRS`（既定 `/usr/local/share:/usr/share`）各要素 + `join_logo_scp/JL/` → `<join_logo_scp の実体パス>/../share/join_logo_scp/JL/` → `<join_logo_scp と同じディレクトリ>/JL/`（`src/tools.rs::default_jl_command_file`） |
-| キャッシュ（再生成可能な中間物） | `work.mp4.dtvi` / `trim.avs` / `detail.jls` / `work.mp4`（入力への symlink） / `work.mp4.segmap.json`（`cut` が書く区間マップ、`src/segmap.rs`、#57） / `input_prepared.mp4`（`prepare` が elst 除去・字幕除去後に書く前処理済み入力、`src/prepare.rs`、#58） / `subs.ass`・`subs.srt`（`prepare` が mp4 内蔵字幕トラックから抽出した字幕サイドカー。`remap-subs` の入力） | `TACHIKAZE_CACHE_DIR` → `${XDG_CACHE_HOME:-~/.cache}/tachikaze/<入力ごと>/`（既定。削除せず、同じ入力を再実行すると再利用する。`src/workdir.rs`）。`cut --dtvi` 省略時もこの規則から `work.mp4.dtvi` を自動的に探す。`work.mp4.segmap.json` / `input_prepared.mp4` / `subs.*` も同じ規則（`workdir::cached_segment_map_path` / `workdir::prepared_input_path` / `workdir::subs_path`）で、`cut --segment-map PATH` で区間マップだけは任意の場所にも書ける |
+| 実行ファイル | `tachikaze` / `chapter_exe` / `join_logo_scp` / `dtvindex` / `ffmpeg` / `ffprobe` | `PATH` のみ（`src/tools.rs::resolve_tool`）。別の場所に置いているものを使いたければ `PATH=/opt/jls/bin:$PATH tachikaze ...` のように前置する |
+| 読み取り専用データ | JL コマンドファイル（既定 `JL_標準.txt`） | `--jl-file` → `<join_logo_scp の実体パス>/../../share/join_logo_scp/JL/`（`make install` 配置前提の1段のみ、`src/tools.rs::default_jl_command_file`） |
+| キャッシュ（再生成可能な中間物） | `work.mp4.dtvi` / `trim.avs` / `detail.jls` / `work.mp4`（入力への symlink） / `work.mp4.segmap.json`（`cut` が書く区間マップ、`src/segmap.rs`、#57） / `input_prepared.mp4`（`prepare` が elst 除去・字幕除去後に書く前処理済み入力、`src/prepare.rs`、#58） / `subs.ass`・`subs.srt`（`prepare` が mp4 内蔵字幕トラックから抽出した字幕サイドカー。`remap-subs` の入力） | `--cache-dir`（グローバルオプション、キャッシュの根） → 既定 `<ホームディレクトリ>/.cache/tachikaze/`（`std::env::home_dir()` から決まる。ホームが特定できない場合は `--cache-dir` を促すエラーで停止する）。いずれの根からも入力ごとに `<根>/<入力絶対パスのハッシュ>-<stem>/` を使い、削除せず、同じ入力を再実行すると再利用する（`src/workdir.rs`）。`cut --dtvi` 省略時もこの規則から `work.mp4.dtvi` を自動的に探す。`work.mp4.segmap.json` / `input_prepared.mp4` / `subs.*` も同じ規則（`workdir::cached_segment_map_path` / `workdir::prepared_input_path` / `workdir::subs_path`）で、`cut --segment-map PATH` で区間マップだけは任意の場所にも書ける |
 | 出力 | `*_CMcut.mp4` / `*_CM.mp4` / `*_CMcut.ass`・`*_CMcut.srt`（`remap-subs` の既定出力、`src/commands.rs::default_remap_subs_output_path`、#59） | 入力の隣（変更しない）。本編出力と同じ stem にすることでプレイヤーが自動で字幕を読み込める |
 
-`--tool-dir` / `--jl-file` / `--work-dir` / `--dtvi` を明示指定した場合は、いずれも上記の探索より最優先でそのまま使う。`analyze --no-keep-work` を指定すると、既定のキャッシュディレクトリではなく従来どおりの使い捨て一時ディレクトリ（成功時に削除）になる。
+`--jl-file` / `--cache-dir` / `--dtvi` を明示指定した場合は、いずれも上記の探索より最優先でそのまま使う。
 
 **なぜこの形にしたか**:
 
-- **中間物を XDG キャッシュに置いた理由**: `.dtvi` / `trim.avs` / `detail.jls` はいずれも `analyze` を再実行すれば作り直せる。`dtvindex` / `chapter_exe` / `join_logo_scp` はいずれも既存の出力先を実害なく上書きすることを実バイナリで確認済みなので、消えても実害なく復旧できるデータとして XDG の定義どおりキャッシュ扱いにし、既定で残すことで `analyze` → `cut` を `--work-dir` / `--dtvi` の手打ちなしで繋げられるようにした
-- **bindir の `JL/` を最後の候補として残した理由**: `join_logo_scp` と `JL/` を同じディレクトリに置く1ディレクトリ配布の既存運用と後方互換を保つため。新規に配置するなら `$PREFIX/share/join_logo_scp/JL/` を使う
+- **中間物をキャッシュに置いた理由**: `.dtvi` / `trim.avs` / `detail.jls` はいずれも `analyze` を再実行すれば作り直せる。`dtvindex` / `chapter_exe` / `join_logo_scp` はいずれも既存の出力先を実害なく上書きすることを実バイナリで確認済みなので、消えても実害なく復旧できるデータとしてキャッシュ扱いにし、既定で残すことで `analyze` → `cut` を `--cache-dir` / `--dtvi` の手打ちなしで繋げられるようにした。ディレクトリ名（`~/.cache/tachikaze`）自体は XDG Base Directory 仕様の既定と同じものを借りている
+- **XDG 由来の環境変数を読まないと決めた理由（E12-2）**: 置き場所を決める口を `--cache-dir`（キャッシュ）・`--jl-file`（JL）のように引数に一本化し、環境変数の値によって挙動が変わらないようにした。ディレクトリ名だけ XDG の既定（`~/.cache`）を借りているが、環境変数側は一切読まない（`src/workdir.rs::default_cache_root` の doc comment）
+- **ホームディレクトリを `std::env::home_dir()` で取る理由**: `$HOME` 環境変数の読み取りではなく OS への問い合わせなので、`$HOME` が unset な環境でも既定値を作れる場合がある。実測（`src/workdir.rs::default_cache_root` の doc comment）: rustc 1.97.1 時点で非推奨警告は出ず、Unix では `$HOME` が unset でも `getpwuid` 経由でホームディレクトリを引ける。実際にホームが取れない（＝エラーになる）のは「呼び出しユーザーの passwd エントリすら無い」環境（コンテナで存在しない UID として動かす等）に限られる
+- **ホームディレクトリが特定できないときにエラーで止める理由**: 黙って一時ディレクトリ等の別の場所へフォールバックすると、キャッシュが知らない場所に増えるだけでなく、別プロセスが別の一時領域を引けば同じ入力に対して別のキャッシュディレクトリを掴み、`analyze` → `cut`（`--dtvi` 省略）の受け渡しが**エラーを出さずに**外れる。`--cache-dir` を促すエラーで明示的に止める方が安全と判断した
+- **外部ツール専用の配置ディレクトリを指定するオプションと「自分の実行ファイルの隣」を削った理由（E12-1）**: `PATH=/opt/jls/bin:$PATH tachikaze ...` のように `PATH` を前置すれば同じことができ、インストールしたくない場合は Docker イメージ（[docker.md](docker.md)）がある。口を1つに絞ることで、複数の口が同時に設定されたときどちらが効くか読まないと分からない状態を無くした
+- **作業ディレクトリを明示するオプションと使い捨て一時ディレクトリに戻すオプションを `--cache-dir` に統合した理由（E12-2）**: どちらも「キャッシュの置き場所」という同じ軸の粒度違いにすぎない。使い捨てにしたい場合は `--cache-dir "$(mktemp -d)"` で足りるため、専用オプションを別に持つ必要がない
+- **JL ファイルの探索を1段だけにした理由（E12-1）**: かつては環境変数によるディレクトリ指定・XDG のデータディレクトリ群・prefix 相対の `share/`・`join_logo_scp` と同じディレクトリの `JL/`（1ディレクトリ配布との後方互換）まで5段あった。`make install` 配置（[toolchain-macos.md](toolchain-macos.md)「ビルド後の配置とインストール」）に一本化したことで、1ディレクトリ配布の後方互換段は不要になった。個別配置にしたい場合は `--jl-file` で直接指定する
 - **出力だけ入力の隣のままにした理由**: 出力は録画ファイルと同じ場所で管理したいという運用上の要求があり、消えても再生成できるキャッシュとは性質が違う（ユーザーの成果物）ため対象外にした
-- **`$XDG_CONFIG_HOME` を用意しなかった理由**: 現時点で設定ファイルに載せる項目がない。必要になるまで空けておく方針
+- **設定ファイル用の置き場所を用意しなかった理由**: 現時点で設定ファイルに載せる項目がなく、XDG の config ディレクトリ相当は使っていない。必要になるまで空けておく方針
 
 ## モジュール構成
 
@@ -201,7 +206,7 @@ struct DecodeIdx(u32);    // デコード順（mp4 のサンプル番号 / .dtvi
 | 継ぎ目の MDCT 過渡（クリックノイズ） | **許容する方針で決定済み。** 継ぎ目は残存 CM マージンの内側に来る（[lossless-cut.md](lossless-cut.md)） |
 | `prepare` の elst 除去による AAC の残存ずれ | **許容する方針で決定済み（#60 実測）。** elst 除去により、保持した最初の区間がソースの先頭フレームから始まる場合に限り、音声の priming 分（実測 21.333ms、他エンコーダでは見積もりで最大43ms程度）がそのまま音声として残る。ファイルにつき高々1回・1フレーム未満・非累積のずれで、`prepare`/`auto` は elst を自動除去してよいと判断している（[measurements.md](measurements.md)「elst 除去と A/V 相対時刻」）。Opus は `dOps` がコーデックレベルで pre-skip を伝えるため影響なし |
 | `--snap inward` と `--cm-output` の併用 | **拒否する。** inward では保持区間が退化（`end < start`）しうるため補集合の順序も壊れる |
-| キャッシュ鍵の弱さ | `${XDG_CACHE_HOME}/tachikaze/<入力ごと>/` のディレクトリ名は入力の**絶対パスのハッシュのみ**から決まる（`workdir::cache_dir_for_input`、FNV-1a）。同じパスに別内容のファイルが後から置かれても（録画ファイルの上書き・再利用）区別できず、古い `.dtvi` / `trim.avs` / `input_prepared.mp4` を新しい入力に対して誤って再利用しうる。`auto` は `analyze`/`prepare` を毎回作り直すことでこの穴を避けているが（`src/auto.rs` の doc comment）、`cut --dtvi` を省略してキャッシュから自動解決する経路には対策が無い。size + mtime の突き合わせなどの対策は、要求されていない現時点では追加しないと判断している（理由は `src/auto.rs` の doc comment参照） |
+| キャッシュ鍵の弱さ | `<キャッシュの根>/<入力ごと>/`（既定 `~/.cache/tachikaze`、`--cache-dir` で変更可）のディレクトリ名は入力の**絶対パスのハッシュのみ**から決まる（`workdir::cache_dir_for_input`、FNV-1a）。同じパスに別内容のファイルが後から置かれても（録画ファイルの上書き・再利用）区別できず、古い `.dtvi` / `trim.avs` / `input_prepared.mp4` を新しい入力に対して誤って再利用しうる。`auto` は `analyze`/`prepare` を毎回作り直すことでこの穴を避けているが（`src/auto.rs` の doc comment）、`cut --dtvi` を省略してキャッシュから自動解決する経路には対策が無い。size + mtime の突き合わせなどの対策は、要求されていない現時点では追加しないと判断している（理由は `src/auto.rs` の doc comment参照） |
 
 ## 方針として作らないもの
 
