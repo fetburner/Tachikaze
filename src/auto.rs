@@ -80,7 +80,6 @@ use crate::{analyze, cli, commands, gate, mp4io, prepare, report, segmap, subtit
 /// `auto` サブコマンドの設定（`src/cli.rs::Commands::Auto` の CLI 引数と1対1）。
 #[derive(Debug, Clone)]
 pub struct AutoConfig {
-    pub tool_dir: Option<PathBuf>,
     /// 単一入力時のみ有効。複数入力時は `run` が事前に拒否する。
     pub output: Option<PathBuf>,
     /// 単一入力時のみ有効。`no_cm` とは併用できない。
@@ -278,7 +277,7 @@ fn process_one(
     // 1. prepare（elst 除去・字幕抽出。#58）。`auto` は外部字幕（--subs 相当）を
     // 受け付けない（issue #62 の CLI 一覧に無い）ため常に `None`。
     println!("[auto] prepare: {}", input.display());
-    let prepare_outcome = prepare::run(input, config.tool_dir.as_deref(), None)
+    let prepare_outcome = prepare::run(input, None)
         .with_context(|| format!("prepare に失敗しました: {}", input.display()))?;
     let media_path = prepare_outcome.media_path.clone();
     if prepare_outcome.ran_ffmpeg {
@@ -312,7 +311,6 @@ fn process_one(
     let analyze_config = analyze::AnalyzeConfig {
         input: media_path.clone(),
         output: trim_path.clone(),
-        tool_dir: config.tool_dir.clone(),
         work_dir: config.work_dir.clone(),
         no_keep_work: false,
         jls_set: jls_set.to_vec(),
@@ -392,7 +390,6 @@ fn process_one(
         out_path.display()
     );
     let cut_outcome = commands::execute_cut(commands::CutParams {
-        tool_dir: config.tool_dir.clone(),
         input: media_path.clone(),
         trim_path: trim_path.clone(),
         output: out_path.clone(),
@@ -628,7 +625,6 @@ mod tests {
     #[test]
     fn run_rejects_empty_inputs() {
         let config = AutoConfig {
-            tool_dir: None,
             output: None,
             cm_output: None,
             no_cm: false,
@@ -649,7 +645,6 @@ mod tests {
     #[test]
     fn run_rejects_multiple_inputs_with_explicit_output() {
         let config = AutoConfig {
-            tool_dir: None,
             output: Some(PathBuf::from("/tmp/out.mp4")),
             cm_output: None,
             no_cm: false,
@@ -671,7 +666,6 @@ mod tests {
     #[test]
     fn run_rejects_multiple_inputs_with_explicit_work_dir() {
         let config = AutoConfig {
-            tool_dir: None,
             output: None,
             cm_output: None,
             no_cm: false,
@@ -693,7 +687,6 @@ mod tests {
     #[test]
     fn run_rejects_no_cm_and_cm_output_together() {
         let config = AutoConfig {
-            tool_dir: None,
             output: None,
             cm_output: Some(PathBuf::from("/tmp/cm.mp4")),
             no_cm: true,
@@ -715,7 +708,6 @@ mod tests {
     #[test]
     fn run_rejects_snap_inward_with_default_cm_output() {
         let config = AutoConfig {
-            tool_dir: None,
             output: None,
             cm_output: None,
             no_cm: false,
@@ -741,7 +733,6 @@ mod tests {
         // 入力ファイルが実在しないため別のエラー（"入力がありません"）にはなるが、
         // 「--snap inward」を理由にした事前拒否はされないことを確認する。
         let config = AutoConfig {
-            tool_dir: None,
             output: None,
             cm_output: None,
             no_cm: true,
@@ -763,7 +754,6 @@ mod tests {
     #[test]
     fn run_rejects_invalid_jls_set_before_processing_any_input() {
         let config = AutoConfig {
-            tool_dir: None,
             output: None,
             cm_output: None,
             no_cm: false,

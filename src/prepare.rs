@@ -278,18 +278,13 @@ fn require_utf8(path: &Path) -> Result<&str> {
 /// `prepare` 本体。
 ///
 /// - `input`: 入力 mp4。
-/// - `tool_dir`: `--tool-dir`(ffmpeg の探索に使う)。
 /// - `external_subs`: `--subs PATH`。指定時は mp4 内蔵の字幕トラックを
 ///   抽出せず、このパスをそのまま [`PrepareOutcome::subtitle_path`] にする。
 ///
 /// 前処理(elst 除去・字幕トラック除去・字幕抽出)が何も要らない場合は ffmpeg を
 /// 一切呼ばず、`input` をそのまま `media_path` として返す(無駄な800MB級の
 /// コピーを作らない)。
-pub fn run(
-    input: &Path,
-    tool_dir: Option<&Path>,
-    external_subs: Option<&Path>,
-) -> Result<PrepareOutcome> {
+pub fn run(input: &Path, external_subs: Option<&Path>) -> Result<PrepareOutcome> {
     let moov = crate::mp4io::read::read_moov(input)
         .with_context(|| format!("入力 mp4 の読み込みに失敗しました: {}", input.display()))?;
 
@@ -328,7 +323,7 @@ pub fn run(
     // ffmpeg はここまで来て初めて必要になる(elst 除去または字幕トラック除去が
     // 要るとわかった時点)。見つからない場合は、何のために必要かと手動で行う
     // 場合のコマンド例を添えて停止する。
-    let ffmpeg_path = tools::resolve_tool(tool_dir, tools::FFMPEG).with_context(|| {
+    let ffmpeg_path = tools::resolve_tool(tools::FFMPEG).with_context(|| {
         format!(
             "prepare: 入力に edit list または字幕トラックがあり、除去に ffmpeg が必要です。\n\
              手動で行う場合の例(字幕が無い場合):\n  \
@@ -654,7 +649,7 @@ mod tests {
         let input = dir.join("IN.mp4");
         fs::write(&input, b"not a real mp4").unwrap();
 
-        let err = run(&input, None, None).expect_err("mp4 として読めない入力はエラーになるはず");
+        let err = run(&input, None).expect_err("mp4 として読めない入力はエラーになるはず");
         assert!(err
             .to_string()
             .contains("入力 mp4 の読み込みに失敗しました"));
