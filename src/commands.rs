@@ -41,12 +41,14 @@ pub enum ExitOutcome {
 
 /// パース済みの CLI 引数を受け取り、対応するサブコマンドを実行する。
 pub fn run(cli: Cli) -> anyhow::Result<ExitOutcome> {
+    let cache_dir = cli.cache_dir.clone();
+
     match cli.command {
-        Commands::Analyze(args) => run_analyze(args).map(|()| ExitOutcome::Success),
-        Commands::Cut(args) => run_cut(args).map(|()| ExitOutcome::Success),
-        Commands::Prepare(args) => run_prepare(args).map(|()| ExitOutcome::Success),
-        Commands::RemapSubs(args) => run_remap_subs(args).map(|()| ExitOutcome::Success),
-        Commands::Auto(args) => run_auto(args),
+        Commands::Analyze(args) => run_analyze(cache_dir, args).map(|()| ExitOutcome::Success),
+        Commands::Cut(args) => run_cut(cache_dir, args).map(|()| ExitOutcome::Success),
+        Commands::Prepare(args) => run_prepare(cache_dir, args).map(|()| ExitOutcome::Success),
+        Commands::RemapSubs(args) => run_remap_subs(cache_dir, args).map(|()| ExitOutcome::Success),
+        Commands::Auto(args) => run_auto(cache_dir, args),
     }
 }
 
@@ -61,7 +63,7 @@ pub fn run(cli: Cli) -> anyhow::Result<ExitOutcome> {
 /// （exit code 2）。すべて完了 / スキップなら [`ExitOutcome::Success`]（exit code 0）。
 /// 失敗を最優先するのは、「止まった」（人手を待っているだけ）より「壊れた」方が
 /// 深刻度が高く、バッチ運用で見逃してはいけないため。
-fn run_auto(args: AutoArgs) -> anyhow::Result<ExitOutcome> {
+fn run_auto(cache_dir: Option<PathBuf>, args: AutoArgs) -> anyhow::Result<ExitOutcome> {
     let AutoArgs {
         inputs,
         output,
@@ -75,10 +77,10 @@ fn run_auto(args: AutoArgs) -> anyhow::Result<ExitOutcome> {
         verify,
         jl_file,
         jls_set,
-        work_dir,
     } = args;
 
     let config = auto::AutoConfig {
+        cache_dir,
         output,
         cm_output,
         no_cm,
@@ -90,7 +92,6 @@ fn run_auto(args: AutoArgs) -> anyhow::Result<ExitOutcome> {
         verify,
         jl_file,
         jls_set,
-        work_dir,
     };
 
     let tally = auto::run(&config, &inputs)?;
@@ -125,9 +126,9 @@ fn exit_outcome_for_tally(tally: &auto::BatchTally) -> anyhow::Result<ExitOutcom
 
 /// `prepare` サブコマンドの実行。処理本体は [`prepare::run`] に集約してあり、
 /// ここでは結果を人間向けに表示するだけ。
-fn run_prepare(args: PrepareArgs) -> anyhow::Result<()> {
+fn run_prepare(cache_dir: Option<PathBuf>, args: PrepareArgs) -> anyhow::Result<()> {
     let PrepareArgs { input, subs } = args;
-    let outcome = prepare::run(&input, subs.as_deref())?;
+    let outcome = prepare::run(&input, cache_dir.as_deref(), subs.as_deref())?;
 
     if outcome.ran_ffmpeg {
         println!("prepare 完了: {}", outcome.media_path.display());
@@ -152,14 +153,15 @@ fn run_prepare(args: PrepareArgs) -> anyhow::Result<()> {
 /// 件数を報告する。処理そのもの（分類・時刻変換）は `subtitle` モジュールに集約して
 /// あり、ここでは配線とログ出力だけを行う（`commands.rs` はアルゴリズムを持たない
 /// 方針、本ファイル冒頭の doc comment参照）。
-fn run_remap_subs(args: RemapSubsArgs) -> anyhow::Result<()> {
+fn run_remap_subs(cache_dir: Option<PathBuf>, args: RemapSubsArgs) -> anyhow::Result<()> {
     let RemapSubsArgs {
         input,
         segment_map: segment_map_path,
         subs: subs_path_arg,
         output,
     } = args;
-    let segment_map_path = resolve_segment_map_path(segment_map_path, &input)?;
+    let segment_map_path =
+        resolve_segment_map_path(segment_map_path, cache_dir.as_deref(), &input)?;
     let segment_map_json = fs::read_to_string(&segment_map_path).with_context(|| {
         format!(
             "区間マップの読み込みに失敗しました: {}",
@@ -169,7 +171,7 @@ fn run_remap_subs(args: RemapSubsArgs) -> anyhow::Result<()> {
     let segment_map = segmap::SegmentMap::from_json(&segment_map_json)
         .map_err(|err| anyhow!("区間マップのパースに失敗しました: {err}"))?;
 
-    let (subs_input_path, format) = resolve_subs_path(subs_path_arg, &input)?;
+    let (subs_input_path, format) = resolve_subs_path(subs_path_arg, cache_dir.as_deref(), &input)?;
     let subs_content = fs::read_to_string(&subs_input_path).with_context(|| {
         format!(
             "字幕サイドカーの読み込みに失敗しました: {}",
@@ -220,12 +222,16 @@ fn run_remap_subs(args: RemapSubsArgs) -> anyhow::Result<()> {
 
 /// `--segment-map` を解決する。[`resolve_dtvi_path`] と同じ方針（明示優先、
 /// 未指定ならキャッシュ、どちらにも無ければ生成コマンド例を添えて停止）。
-fn resolve_segment_map_path(explicit: Option<PathBuf>, input: &Path) -> anyhow::Result<PathBuf> {
+fn resolve_segment_map_path(
+    explicit: Option<PathBuf>,
+    cache_dir: Option<&Path>,
+    input: &Path,
+) -> anyhow::Result<PathBuf> {
     if let Some(path) = explicit {
         return Ok(path);
     }
 
-    let cached = workdir::cached_segment_map_path(input)
+    let cached = workdir::cached_segment_map_path(cache_dir, input)
         .with_context(|| format!("区間マップの自動解決に失敗しました: {}", input.display()))?;
     if cached.is_file() {
         return Ok(cached);
@@ -245,6 +251,7 @@ fn resolve_segment_map_path(explicit: Option<PathBuf>, input: &Path) -> anyhow::
 /// （issue #59 「やること」1）。
 fn resolve_subs_path(
     explicit: Option<PathBuf>,
+    cache_dir: Option<&Path>,
     input: &Path,
 ) -> anyhow::Result<(PathBuf, subtitle::SubsFormat)> {
     if let Some(path) = explicit {
@@ -258,12 +265,13 @@ fn resolve_subs_path(
     }
 
     for format in [subtitle::SubsFormat::Ass, subtitle::SubsFormat::Srt] {
-        let candidate = workdir::subs_path(input, format.extension()).with_context(|| {
-            format!(
-                "字幕サイドカーのキャッシュパスの解決に失敗しました: {}",
-                input.display()
-            )
-        })?;
+        let candidate =
+            workdir::subs_path(cache_dir, input, format.extension()).with_context(|| {
+                format!(
+                    "字幕サイドカーのキャッシュパスの解決に失敗しました: {}",
+                    input.display()
+                )
+            })?;
         if candidate.is_file() {
             return Ok((candidate, format));
         }
@@ -295,13 +303,11 @@ pub(crate) fn default_remap_subs_output_path(input: &Path, extension: &str) -> P
     dir.join(format!("{stem}_CMcut.{extension}"))
 }
 
-fn run_analyze(args: AnalyzeArgs) -> anyhow::Result<()> {
+fn run_analyze(cache_dir: Option<PathBuf>, args: AnalyzeArgs) -> anyhow::Result<()> {
     let AnalyzeArgs {
         input,
         output,
         report: show_report,
-        work_dir,
-        no_keep_work,
         jls_set,
         jl_file,
     } = args;
@@ -314,8 +320,7 @@ fn run_analyze(args: AnalyzeArgs) -> anyhow::Result<()> {
     let config = analyze::AnalyzeConfig {
         input,
         output: output.clone(),
-        work_dir,
-        no_keep_work,
+        cache_dir,
         jls_set,
         jl_file,
     };
@@ -378,7 +383,7 @@ pub(crate) fn fps_from_dtvi(dtvi: &dtvi::Dtvi) -> f64 {
 /// 同一クレート内の `auto` から呼べるようにした。この変更で `cut` サブコマンド自体の
 /// 標準出力・exit code は変わらない（`tests/segmap_e2e.rs` 等の既存 E2E がそのまま通る
 /// ことで確認済み）。
-fn run_cut(args: CutArgs) -> anyhow::Result<()> {
+fn run_cut(cache_dir: Option<PathBuf>, args: CutArgs) -> anyhow::Result<()> {
     let CutArgs {
         input,
         trim: trim_path,
@@ -392,6 +397,7 @@ fn run_cut(args: CutArgs) -> anyhow::Result<()> {
     } = args;
 
     let outcome = execute_cut(CutParams {
+        cache_dir,
         input,
         trim_path,
         output,
@@ -416,6 +422,8 @@ fn run_cut(args: CutArgs) -> anyhow::Result<()> {
 /// [`execute_cut`] にまとめて渡す引数。フィールドの意味は `cut` の CLI オプション
 /// （`src/cli.rs::Commands::Cut`）と1対1に対応する。
 pub(crate) struct CutParams {
+    /// `--cache-dir`（キャッシュの根）。未指定なら既定値。
+    pub cache_dir: Option<PathBuf>,
     pub input: PathBuf,
     pub trim_path: PathBuf,
     pub output: PathBuf,
@@ -442,6 +450,7 @@ pub(crate) struct CutOutcome {
 /// 参照）。標準出力への `println!` は一切行わない（結果表示は呼び出し側の責務）。
 pub(crate) fn execute_cut(params: CutParams) -> anyhow::Result<CutOutcome> {
     let CutParams {
+        cache_dir,
         input,
         trim_path,
         output,
@@ -460,7 +469,7 @@ pub(crate) fn execute_cut(params: CutParams) -> anyhow::Result<CutOutcome> {
     // 残ったままになり、`remap-subs` が鮮度チェックなしにそれを使ってしまう
     // （古い trim.avs に基づく境界で字幕を張り替えてしまうが、エラーも警告も出ない）。
     // `--segment-map` で明示されたパスは呼び出し側が管理するファイルなので触らない。
-    clear_stale_cached_segment_map(&input);
+    clear_stale_cached_segment_map(cache_dir.as_deref(), &input);
 
     // `--snap inward` は保持区間を退化させうる（終端が開始より前になる）。その場合
     // 「保持区間の補集合をそのまま区間リストとして使える」という complement_ranges の
@@ -482,7 +491,7 @@ pub(crate) fn execute_cut(params: CutParams) -> anyhow::Result<CutOutcome> {
     let moov = mp4io::read::read_moov(&input)
         .with_context(|| format!("入力 mp4 の読み込みに失敗しました: {}", input.display()))?;
 
-    let dtvi_path = resolve_dtvi_path(dtvi_path, &input)?;
+    let dtvi_path = resolve_dtvi_path(dtvi_path, cache_dir.as_deref(), &input)?;
     let dtvi_data = match &dtvi_path {
         Some(path) => {
             let content = fs::read_to_string(path)
@@ -553,6 +562,7 @@ pub(crate) fn execute_cut(params: CutParams) -> anyhow::Result<CutOutcome> {
             let run_output = pipeline.run(&snapped, &video_keep, &output)?;
             if let Some(dtvi) = dtvi_data.as_ref() {
                 write_segment_map(
+                    cache_dir.as_deref(),
                     &input,
                     &snapped,
                     &run_output.video_segment_durations,
@@ -624,6 +634,7 @@ pub(crate) fn execute_cut(params: CutParams) -> anyhow::Result<CutOutcome> {
             // 最終出力へ rename できた後）にだけ書く。
             if let Some(dtvi) = dtvi_data.as_ref() {
                 write_segment_map(
+                    cache_dir.as_deref(),
                     &input,
                     &snapped,
                     &run_output.video_segment_durations,
@@ -648,20 +659,23 @@ pub(crate) fn execute_cut(params: CutParams) -> anyhow::Result<CutOutcome> {
 /// `--dtvi` を解決する。
 ///
 /// - 明示されていればそれを最優先でそのまま使う。
-/// - 未指定なら、`analyze` の既定（`--work-dir` 未指定時）が使うのと同じ
-///   キャッシュパス規則（[`workdir::cached_dtvi_path`]）から
-///   `work.mp4.dtvi` を探す。直前に同じ入力で `analyze` を実行していれば
-///   そのまま見つかる。
+/// - 未指定なら、`analyze` が使うのと同じキャッシュパス規則
+///   （[`workdir::cached_dtvi_path`]）から `work.mp4.dtvi` を探す。直前に
+///   同じ入力・同じ `--cache-dir` で `analyze` を実行していればそのまま見つかる。
 /// - どちらの経路でも見つからない場合は、検証を省略せず停止する（罠3:
 ///   オープン GOP 判定と自己検証4に `.dtvi` が必須なため。`.dtvi` が無い
 ///   まま処理を続けると間違った位置で切っても例外が飛ばない）。`analyze`
 ///   を実行するコマンド例を添えたエラーにする。
-fn resolve_dtvi_path(dtvi_path: Option<PathBuf>, input: &Path) -> anyhow::Result<Option<PathBuf>> {
+fn resolve_dtvi_path(
+    dtvi_path: Option<PathBuf>,
+    cache_dir: Option<&Path>,
+    input: &Path,
+) -> anyhow::Result<Option<PathBuf>> {
     if dtvi_path.is_some() {
         return Ok(dtvi_path);
     }
 
-    let cached = workdir::cached_dtvi_path(input)
+    let cached = workdir::cached_dtvi_path(cache_dir, input)
         .with_context(|| format!("`.dtvi` の自動解決に失敗しました: {}", input.display()))?;
     if cached.is_file() {
         return Ok(Some(cached));
@@ -883,8 +897,8 @@ pub(crate) fn print_cut_report(
 /// 元々存在しない場合（`NotFound`）は警告すら出さない（毎回の `cut` 実行で
 /// ノイズになるため）。`--segment-map` の明示パスはここでは一切触らない
 /// （呼び出し側が管理するファイルであり、キャッシュではない）。
-fn clear_stale_cached_segment_map(input: &Path) {
-    let path = match workdir::cached_segment_map_path(input) {
+fn clear_stale_cached_segment_map(cache_dir: Option<&Path>, input: &Path) {
+    let path = match workdir::cached_segment_map_path(cache_dir, input) {
         Ok(path) => path,
         Err(err) => {
             eprintln!(
@@ -924,6 +938,7 @@ fn clear_stale_cached_segment_map(input: &Path) {
 /// 人へ: `.ok()` で握りつぶさず、警告だけは必ず出すこと）。
 #[allow(clippy::too_many_arguments)]
 fn write_segment_map(
+    cache_dir: Option<&Path>,
     input: &Path,
     snapped: &[plan::SnappedRange],
     video_segment_durations: &[u64],
@@ -947,7 +962,7 @@ fn write_segment_map(
         total_frames,
     );
 
-    match workdir::cached_segment_map_path(input) {
+    match workdir::cached_segment_map_path(cache_dir, input) {
         Ok(path) => {
             if let Err(err) = map.write_to_file(&path) {
                 eprintln!(
@@ -1102,10 +1117,6 @@ fn segment_video_durations(
 #[cfg(test)]
 mod tests {
     use super::*;
-    // `TACHIKAZE_CACHE_DIR` を書き換えるロックは `workdir::tests` と共有する
-    // （モジュールごとに別ロックを持つと、同じ環境変数を互いに直列化できず
-    // レースする。`crate::workdir` の doc comment 参照）。
-    use crate::workdir::test_support::{EnvVarGuard, ENV_LOCK};
     use std::env;
     use std::process;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1199,27 +1210,29 @@ mod tests {
         // キャッシュに何も無くても、明示された `--dtvi` をそのまま最優先で使う
         // （キャッシュを探索すらしない）。
         let explicit = PathBuf::from("/explicit/path/to/some.dtvi");
-        let resolved = resolve_dtvi_path(Some(explicit.clone()), Path::new("/nonexistent.mp4"))
-            .expect("明示指定は解決に失敗しないはず");
+        let resolved =
+            resolve_dtvi_path(Some(explicit.clone()), None, Path::new("/nonexistent.mp4"))
+                .expect("明示指定は解決に失敗しないはず");
         assert_eq!(resolved, Some(explicit));
     }
 
     #[test]
     fn resolve_dtvi_path_finds_cached_dtvi_left_by_analyze() {
-        let _env_guard = ENV_LOCK.lock().unwrap();
+        // キャッシュの根を引数で直接渡すため、環境変数もロックも不要（E12-2）。
         let cache_root = make_scratch_dir("resolve-dtvi-found-cache");
-        let _cache_env = EnvVarGuard::set("TACHIKAZE_CACHE_DIR", &cache_root);
 
         let input_dir = make_scratch_dir("resolve-dtvi-found-input");
         let input_path = input_dir.join("IN.mp4");
         fs::write(&input_path, b"dummy mp4 content").expect("write input");
 
         // analyze が残すのと同じ規則でキャッシュに .dtvi を用意する。
-        let expected = workdir::cached_dtvi_path(&input_path).expect("compute cached dtvi path");
+        let expected = workdir::cached_dtvi_path(Some(&cache_root), &input_path)
+            .expect("compute cached dtvi path");
         fs::create_dir_all(expected.parent().unwrap()).expect("create cache dir");
         fs::write(&expected, "dummy dtvi content").expect("write cached dtvi");
 
-        let resolved = resolve_dtvi_path(None, &input_path).expect("キャッシュから解決できるはず");
+        let resolved = resolve_dtvi_path(None, Some(&cache_root), &input_path)
+            .expect("キャッシュから解決できるはず");
         assert_eq!(resolved, Some(expected));
 
         fs::remove_dir_all(&input_dir).ok();
@@ -1228,15 +1241,13 @@ mod tests {
 
     #[test]
     fn resolve_dtvi_path_missing_suggests_analyze_command() {
-        let _env_guard = ENV_LOCK.lock().unwrap();
         let cache_root = make_scratch_dir("resolve-dtvi-missing-cache");
-        let _cache_env = EnvVarGuard::set("TACHIKAZE_CACHE_DIR", &cache_root);
 
         let input_dir = make_scratch_dir("resolve-dtvi-missing-input");
         let input_path = input_dir.join("IN.mp4");
         fs::write(&input_path, b"dummy mp4 content").expect("write input");
 
-        let err = resolve_dtvi_path(None, &input_path)
+        let err = resolve_dtvi_path(None, Some(&cache_root), &input_path)
             .expect_err("キャッシュに無ければ解決に失敗するはず");
         let message = err.to_string();
         assert!(

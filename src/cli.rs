@@ -5,6 +5,15 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 #[derive(Debug, Parser)]
 #[command(name = "tachikaze")]
 pub struct Cli {
+    /// キャッシュ（`.dtvi` / `trim.avs` / `detail.jls` / 前処理済み入力 / 字幕
+    /// サイドカーなど、再生成できる中間物）の置き場所の根。未指定なら
+    /// `~/.cache/tachikaze`（ホームディレクトリが特定できない場合は
+    /// このオプションを促すエラーで停止する）。入力ごとのサブディレクトリ規則
+    /// （`<入力絶対パスのハッシュ>-<stem>/`）自体は変わらない。使い捨てにしたい
+    /// 場合は `--cache-dir "$(mktemp -d)"` を使う。
+    #[arg(long, global = true)]
+    pub cache_dir: Option<PathBuf>,
+
     #[command(subcommand)]
     pub command: Commands,
 }
@@ -26,8 +35,8 @@ pub enum Commands {
     ///
     /// 区間マップ・字幕はどちらもキャッシュから自動解決できる（`cut --dtvi` と
     /// 同じ規則）。区間マップは `workdir::cached_segment_map_path`、字幕は
-    /// `workdir::subs_path(input, "ass")` / `subs_path(input, "srt")` の順に探す。
-    /// `--segment-map` / `--subs` を指定すればそちらを最優先で使う。
+    /// `workdir::subs_path(cache_dir, input, "ass")` / `subs_path(cache_dir, input, "srt")`
+    /// の順に探す。`--segment-map` / `--subs` を指定すればそちらを最優先で使う。
     RemapSubs(RemapSubsArgs),
     /// `prepare` → `analyze` → gate 判定 → `cut`(区間マップ込み) → `remap-subs`
     /// を対話なしで合成する。
@@ -49,18 +58,6 @@ pub struct AnalyzeArgs {
 
     #[arg(long)]
     pub report: bool,
-
-    /// 中間ファイル（`.dtvi` / `trim.avs` / `detail.jls`）の置き場所。未指定
-    /// なら入力ごとに決まる `${XDG_CACHE_HOME:-~/.cache}/tachikaze/` 配下の
-    /// ディレクトリを使い、削除しない（`cut --dtvi` は同じ規則で自動的に
-    /// `work.mp4.dtvi` を見つけられる）。
-    #[arg(long)]
-    pub work_dir: Option<PathBuf>,
-
-    /// 既定のキャッシュディレクトリを使わず、従来どおり一時ディレクトリに
-    /// 中間ファイルを作り、成功時に削除する（`--work-dir` とは併用しない）。
-    #[arg(long)]
-    pub no_keep_work: bool,
 
     /// join_logo_scp の `-set KEY VALUE` を上書き・追加する（`KEY=VALUE` 形式、繰り返し可）。
     /// 同じキーを指定すると既定値を置き換える。
@@ -93,8 +90,9 @@ pub struct CutArgs {
 
     /// `dtvindex build` が生成した `.dtvi`（オープン GOP 判定と自己検証に必須）。
     /// 未指定なら、直前に同じ入力へ `analyze` を実行していればキャッシュ
-    /// （`${XDG_CACHE_HOME:-~/.cache}/tachikaze/`）から自動的に見つかる。
-    /// 見つからない場合は `analyze` を実行するコマンド例を添えて停止する。
+    /// （既定 `~/.cache/tachikaze/`、`--cache-dir` で根を変えられる）から
+    /// 自動的に見つかる。見つからない場合は `analyze` を実行するコマンド例を
+    /// 添えて停止する。
     #[arg(long)]
     pub dtvi: Option<PathBuf>,
 
@@ -155,8 +153,9 @@ pub struct RemapSubsArgs {
 #[derive(Debug, Args)]
 pub struct AutoArgs {
     /// 処理する入力 mp4。複数指定するとバッチ処理になり、その場合
-    /// `-o` / `--cm-output` / `--work-dir` は指定できない（各入力の隣に既定の
-    /// 名前で出力し、各入力ごとの既定キャッシュディレクトリを使う）。
+    /// `-o` / `--cm-output` は指定できない（各入力の隣に既定の名前で出力する。
+    /// `--cache-dir` はキャッシュの根なので複数入力でも共通のまま使える。
+    /// 入力ごとのサブディレクトリは常にハッシュから決まる）。
     pub inputs: Vec<PathBuf>,
 
     /// 本編の出力先。既定は入力の隣の `<stem>_CMcut.mp4`。複数入力時は指定できない。
@@ -209,13 +208,6 @@ pub struct AutoArgs {
     /// （`analyze --jls-set` と同じ、`KEY=VALUE` 形式、繰り返し可）。
     #[arg(long = "jls-set")]
     pub jls_set: Vec<String>,
-
-    /// 中間ファイル（`.dtvi` / `trim.avs` / `detail.jls`）の置き場所。区間マップ
-    /// （`work.mp4.segmap.json`）は対象外で、常に入力ごとの既定キャッシュ
-    /// ディレクトリに書かれる。複数入力時は指定できない（各入力ごとの既定の
-    /// キャッシュディレクトリを使う）。
-    #[arg(long)]
-    pub work_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]

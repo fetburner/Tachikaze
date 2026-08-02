@@ -142,18 +142,19 @@ fn run_cut(
     std::fs::write(&trim_path, trim_content).expect("trim.avs を書けること");
 
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_tachikaze"));
-    cmd.arg("cut")
+    cmd
+        // `--cache-dir` を明示して、実行者の実際の `~/.cache/tachikaze` を
+        // 汚さないようにする。
+        .arg("--cache-dir")
+        .arg(cache_root)
+        .arg("cut")
         .arg(&fixture)
         .arg("--trim")
         .arg(&trim_path)
         .arg("-o")
         .arg(&out_path)
         .arg("--dtvi")
-        .arg(dtvi)
-        // 既定のキャッシュ書き込みが実行者の実際の `~/.cache/tachikaze` を汚さない
-        // ようにする（`Command::env` は子プロセスの環境だけに効く。テストプロセス側の
-        // 環境変数は書き換えないので、他のテストと競合しない）。
-        .env("TACHIKAZE_CACHE_DIR", cache_root);
+        .arg(dtvi);
 
     let segment_map_path = if with_segment_map {
         let path = tmp_dir.join("seg.json");
@@ -494,6 +495,8 @@ fn segment_map_with_cm_output_only_covers_kept_side() {
     let cache_root = make_tmp_dir("cm-output-cache");
 
     let output = Command::new(env!("CARGO_BIN_EXE_tachikaze"))
+        .arg("--cache-dir")
+        .arg(&cache_root)
         .arg("cut")
         .arg(&fixture)
         .arg("--trim")
@@ -506,7 +509,6 @@ fn segment_map_with_cm_output_only_covers_kept_side() {
         .arg(&cm_path)
         .arg("--segment-map")
         .arg(&segmap_path)
-        .env("TACHIKAZE_CACHE_DIR", &cache_root)
         .output()
         .expect("tachikaze cut の起動に失敗した");
 

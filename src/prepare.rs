@@ -73,7 +73,7 @@
 //! `prepare` を同じ入力に対して再実行すると、前処理が必要な限り
 //! **毎回 ffmpeg を再実行して上書きする**(既存の `input_prepared.mp4` の
 //! 有無やタイムスタンプを見て「作り直すかどうか」を判断することはしない)。
-//! 理由: `analyze` の中間ファイル(`work_dir` のdoc comment)も同じ方針で、
+//! 理由: `analyze` の中間ファイル(`workdir::WorkDir` のdoc comment)も同じ方針で、
 //! `dtvindex` / `chapter_exe` / `join_logo_scp` の出力を毎回上書きしている。
 //! 入力ファイルが同じパスのまま更新されている可能性を否定できない以上、
 //! 「キャッシュが最新かどうか」を判定するより「常に作り直す」ほうが安全
@@ -278,13 +278,19 @@ fn require_utf8(path: &Path) -> Result<&str> {
 /// `prepare` 本体。
 ///
 /// - `input`: 入力 mp4。
+/// - `cache_dir`: `--cache-dir`(キャッシュの根)。未指定なら既定値
+///   (`workdir::cache_root` の doc comment参照)。
 /// - `external_subs`: `--subs PATH`。指定時は mp4 内蔵の字幕トラックを
 ///   抽出せず、このパスをそのまま [`PrepareOutcome::subtitle_path`] にする。
 ///
 /// 前処理(elst 除去・字幕トラック除去・字幕抽出)が何も要らない場合は ffmpeg を
 /// 一切呼ばず、`input` をそのまま `media_path` として返す(無駄な800MB級の
 /// コピーを作らない)。
-pub fn run(input: &Path, external_subs: Option<&Path>) -> Result<PrepareOutcome> {
+pub fn run(
+    input: &Path,
+    cache_dir: Option<&Path>,
+    external_subs: Option<&Path>,
+) -> Result<PrepareOutcome> {
     let moov = crate::mp4io::read::read_moov(input)
         .with_context(|| format!("入力 mp4 の読み込みに失敗しました: {}", input.display()))?;
 
@@ -332,16 +338,18 @@ pub fn run(input: &Path, external_subs: Option<&Path>) -> Result<PrepareOutcome>
         )
     })?;
 
-    let prepared_path = workdir::prepared_input_path(input)
+    let prepared_path = workdir::prepared_input_path(cache_dir, input)
         .with_context(|| format!("キャッシュパスの解決に失敗しました: {}", input.display()))?;
-    let cache_dir = prepared_path
+    // 入力ごとのキャッシュディレクトリ（`--cache-dir` の値そのものではなく、
+    // その配下の `<入力ハッシュ>-<stem>/`）。ffmpeg の作業ディレクトリとして使う。
+    let ffmpeg_cwd = prepared_path
         .parent()
         .ok_or_else(|| anyhow::anyhow!("キャッシュパスに親ディレクトリがありません"))?
         .to_path_buf();
-    fs::create_dir_all(&cache_dir).with_context(|| {
+    fs::create_dir_all(&ffmpeg_cwd).with_context(|| {
         format!(
             "キャッシュディレクトリの作成に失敗しました: {}",
-            cache_dir.display()
+            ffmpeg_cwd.display()
         )
     })?;
 
@@ -383,12 +391,13 @@ pub fn run(input: &Path, external_subs: Option<&Path>) -> Result<PrepareOutcome>
             Some(external.to_path_buf())
         }
         (Some(format), None) => {
-            let subs_out = workdir::subs_path(input, format.extension()).with_context(|| {
-                format!(
-                    "字幕サイドカーのキャッシュパスの解決に失敗しました: {}",
-                    input.display()
-                )
-            })?;
+            let subs_out =
+                workdir::subs_path(cache_dir, input, format.extension()).with_context(|| {
+                    format!(
+                        "字幕サイドカーのキャッシュパスの解決に失敗しました: {}",
+                        input.display()
+                    )
+                })?;
             eprintln!(
                 "[prepare] 字幕トラック({})を検出しました。抽出します: {}",
                 format.label(),
@@ -414,7 +423,7 @@ pub fn run(input: &Path, external_subs: Option<&Path>) -> Result<PrepareOutcome>
     };
 
     let args_ref: Vec<&str> = args.iter().map(String::as_str).collect();
-    external::run(require_utf8(&ffmpeg_path)?, &args_ref, &cache_dir)?;
+    external::run(require_utf8(&ffmpeg_path)?, &args_ref, &ffmpeg_cwd)?;
 
     eprintln!(
         "[prepare] 前処理済みファイルはキャッシュに残ります(自動削除しません): {}",
@@ -649,7 +658,8 @@ mod tests {
         let input = dir.join("IN.mp4");
         fs::write(&input, b"not a real mp4").unwrap();
 
-        let err = run(&input, None).expect_err("mp4 として読めない入力はエラーになるはず");
+        let err =
+            run(&input, None, None).expect_err("mp4 として読めない入力はエラーになるはず");
         assert!(err
             .to_string()
             .contains("入力 mp4 の読み込みに失敗しました"));

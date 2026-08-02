@@ -225,9 +225,10 @@ fn auto_completes_full_pipeline_with_fake_tools() {
     let cache_root = tmp_dir.join("cache");
 
     let output = Command::new(env!("CARGO_BIN_EXE_tachikaze"))
+        .arg("--cache-dir")
+        .arg(&cache_root)
         .arg("auto")
         .arg(&input)
-        .env("TACHIKAZE_CACHE_DIR", &cache_root)
         .env("PATH", prepend_path(&bin_dir))
         .output()
         .expect("tachikaze auto の起動に失敗した");
@@ -328,9 +329,10 @@ fn auto_force_overrides_gate_stop_but_gate_alone_stops_without_it() {
 
         let cache_root = tmp_dir.join("cache");
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_tachikaze"));
-        cmd.arg("auto")
+        cmd.arg("--cache-dir")
+            .arg(&cache_root)
+            .arg("auto")
             .arg(&input)
-            .env("TACHIKAZE_CACHE_DIR", &cache_root)
             .env("PATH", prepend_path(&bin_dir));
         if use_force {
             cmd.arg("--force");
@@ -381,9 +383,10 @@ fn auto_force_overrides_gate_stop_but_gate_alone_stops_without_it() {
 
 fn run_auto(args: &[&str], cache_root: &Path) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_tachikaze"))
+        .arg("--cache-dir")
+        .arg(cache_root)
         .arg("auto")
         .args(args)
-        .env("TACHIKAZE_CACHE_DIR", cache_root)
         .output()
         .expect("tachikaze auto の起動に失敗した")
 }
@@ -403,17 +406,19 @@ fn run_auto(args: &[&str], cache_root: &Path) -> std::process::Output {
 /// プロセスを起動しない。
 fn run_auto_without_tools(args: &[&str], cache_root: &Path) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_tachikaze"))
+        .arg("--cache-dir")
+        .arg(cache_root)
         .arg("auto")
         .args(args)
-        .env("TACHIKAZE_CACHE_DIR", cache_root)
         .env("PATH", "")
         .output()
         .expect("tachikaze auto の起動に失敗した")
 }
 
-/// 完了条件: 複数入力時に `-o` を受け付けない（`--cm-output` / `--work-dir` も
-/// 同じ検証ロジックを通るので代表して1つだけ個別のテストにする。3つとも
-/// `src/auto.rs` の単体テストで網羅済み）。
+/// 完了条件: 複数入力時に `-o` を受け付けない（`--cm-output` も同じ検証ロジックを
+/// 通るので代表して1つだけ個別のテストにする。`src/auto.rs` の単体テストで
+/// 網羅済み。`--cache-dir` はキャッシュの根だけを指すため複数入力でも拒否しない
+/// ことも同じテストで確認している）。
 #[test]
 fn auto_rejects_multiple_inputs_with_explicit_output() {
     let tmp_dir = make_tmp_dir("reject-multi-output");

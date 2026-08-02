@@ -80,6 +80,11 @@ use crate::{analyze, cli, commands, gate, mp4io, prepare, report, segmap, subtit
 /// `auto` サブコマンドの設定（`src/cli.rs::Commands::Auto` の CLI 引数と1対1）。
 #[derive(Debug, Clone)]
 pub struct AutoConfig {
+    /// `--cache-dir`（キャッシュの根）。複数入力でも共通のまま使える
+    /// （根だけを差し替えるオプションで、入力ごとのサブディレクトリは
+    /// 常にハッシュから決まるため、複数入力時に個別指定できない
+    /// `output` / `cm_output` とは事情が異なる）。
+    pub cache_dir: Option<PathBuf>,
     /// 単一入力時のみ有効。複数入力時は `run` が事前に拒否する。
     pub output: Option<PathBuf>,
     /// 単一入力時のみ有効。`no_cm` とは併用できない。
@@ -93,8 +98,6 @@ pub struct AutoConfig {
     pub verify: bool,
     pub jl_file: Option<PathBuf>,
     pub jls_set: Vec<String>,
-    /// 単一入力時のみ有効。
-    pub work_dir: Option<PathBuf>,
 }
 
 /// 入力1本の処理結果（失敗は `anyhow::Result::Err` で表す。`run` 側で集計する）。
@@ -145,10 +148,10 @@ pub fn run(config: &AutoConfig, inputs: &[PathBuf]) -> anyhow::Result<BatchTally
             config.cm_output.is_none(),
             "複数入力時は --cm-output を指定できません（各入力の隣に既定名 *_CM.mp4 で出力します）"
         );
-        anyhow::ensure!(
-            config.work_dir.is_none(),
-            "複数入力時は --work-dir を指定できません（各入力ごとの既定キャッシュディレクトリを使います）"
-        );
+        // `--cache-dir` はキャッシュの根だけを指すオプションで、入力ごとの
+        // サブディレクトリは常に絶対パスのハッシュから決まる（`workdir.rs` の
+        // doc comment参照）。そのため `-o` / `--cm-output` と違い、複数入力でも
+        // 共通のまま使えるので拒否しない。
     }
 
     anyhow::ensure!(
@@ -277,7 +280,7 @@ fn process_one(
     // 1. prepare（elst 除去・字幕抽出。#58）。`auto` は外部字幕（--subs 相当）を
     // 受け付けない（issue #62 の CLI 一覧に無い）ため常に `None`。
     println!("[auto] prepare: {}", input.display());
-    let prepare_outcome = prepare::run(input, None)
+    let prepare_outcome = prepare::run(input, config.cache_dir.as_deref(), None)
         .with_context(|| format!("prepare に失敗しました: {}", input.display()))?;
     let media_path = prepare_outcome.media_path.clone();
     if prepare_outcome.ran_ffmpeg {
@@ -291,14 +294,13 @@ fn process_one(
     }
 
     // 中間ファイル（.dtvi / trim.avs）の置き場所を、analyze を呼ぶ前に確定させる。
-    // `analyze::run` 自身も同じ入力（media_path）・同じ work_dir 指定から同一の
+    // `analyze::run` 自身も同じ入力（media_path）・同じ `--cache-dir` から同一の
     // ディレクトリを導出するため（`workdir::WorkDir::new` は同じ引数に対して
     // 同じキャッシュディレクトリを返す。冪等）、ここで一度作っても競合しない。
-    // `--work-dir` 明示時は cut がキャッシュから `.dtvi` を自動解決できない
-    // （`commands::resolve_dtvi_path` はキャッシュの既定パスしか見ない）ため、
+    // `commands::resolve_dtvi_path` はキャッシュの既定パスしか見ないため、
     // ここで確定させたパスを cut にも明示的に渡す。
-    let work_probe = workdir::WorkDir::new(config.work_dir.clone(), &media_path, false)
-        .with_context(|| {
+    let work_probe =
+        workdir::WorkDir::new(config.cache_dir.as_deref(), &media_path).with_context(|| {
             format!(
                 "作業ディレクトリの解決に失敗しました: {}",
                 media_path.display()
@@ -311,8 +313,7 @@ fn process_one(
     let analyze_config = analyze::AnalyzeConfig {
         input: media_path.clone(),
         output: trim_path.clone(),
-        work_dir: config.work_dir.clone(),
-        no_keep_work: false,
+        cache_dir: config.cache_dir.clone(),
         jls_set: jls_set.to_vec(),
         jl_file: config.jl_file.clone(),
     };
@@ -390,6 +391,7 @@ fn process_one(
         out_path.display()
     );
     let cut_outcome = commands::execute_cut(commands::CutParams {
+        cache_dir: config.cache_dir.clone(),
         input: media_path.clone(),
         trim_path: trim_path.clone(),
         output: out_path.clone(),
@@ -418,7 +420,9 @@ fn process_one(
     if config.no_subtitles {
         println!("[auto] --no-subtitles のため字幕の張り替えは行いません。");
     } else if let Some(subs_input) = &prepare_outcome.subtitle_path {
-        if let Err(err) = remap_subtitles(&media_path, subs_input, input) {
+        if let Err(err) =
+            remap_subtitles(config.cache_dir.as_deref(), &media_path, subs_input, input)
+        {
             // 本編/CM側は既に最終パスへ rename 済み（失敗しても削除しない、
             // モジュール冒頭 doc comment参照）。この入力は従来どおり失敗扱いに
             // するが（issue #62「やること」7: 本編だけ出して字幕を黙って落とさない）、
@@ -464,11 +468,12 @@ fn process_one(
 /// `resolve_segment_map_path` / `resolve_subs_path` のキャッシュ自動探索
 /// （他人が置いた古いキャッシュを拾う可能性がある）を経由する必要が無い。
 fn remap_subtitles(
+    cache_dir: Option<&Path>,
     media_path: &Path,
     subs_input: &Path,
     original_input: &Path,
 ) -> anyhow::Result<()> {
-    let segment_map_path = workdir::cached_segment_map_path(media_path)
+    let segment_map_path = workdir::cached_segment_map_path(cache_dir, media_path)
         .context("区間マップのキャッシュパス解決に失敗しました")?;
     let segment_map_json = fs::read_to_string(&segment_map_path).with_context(|| {
         format!(
@@ -636,7 +641,7 @@ mod tests {
             verify: false,
             jl_file: None,
             jls_set: vec![],
-            work_dir: None,
+            cache_dir: None,
         };
         let err = run(&config, &[]).expect_err("空の入力リストは拒否するはず");
         assert!(err.to_string().contains("入力"));
@@ -656,16 +661,20 @@ mod tests {
             verify: false,
             jl_file: None,
             jls_set: vec![],
-            work_dir: None,
+            cache_dir: None,
         };
         let inputs = vec![PathBuf::from("/a.mp4"), PathBuf::from("/b.mp4")];
         let err = run(&config, &inputs).expect_err("複数入力 + -o は拒否するはず");
         assert!(err.to_string().contains("-o"));
     }
 
+    /// 完了条件: `--cache-dir` はキャッシュの根だけを指すオプションなので、
+    /// `-o` / `--cm-output`（削除済みの `--work-dir` はこちらの仲間だった）とは
+    /// 違い、複数入力でも拒否されない。
     #[test]
-    fn run_rejects_multiple_inputs_with_explicit_work_dir() {
+    fn run_allows_multiple_inputs_with_explicit_cache_dir() {
         let config = AutoConfig {
+            cache_dir: Some(PathBuf::from("/tmp/cache")),
             output: None,
             cm_output: None,
             no_cm: false,
@@ -677,11 +686,15 @@ mod tests {
             verify: false,
             jl_file: None,
             jls_set: vec![],
-            work_dir: Some(PathBuf::from("/tmp/work")),
         };
-        let inputs = vec![PathBuf::from("/a.mp4"), PathBuf::from("/b.mp4")];
-        let err = run(&config, &inputs).expect_err("複数入力 + --work-dir は拒否するはず");
-        assert!(err.to_string().contains("--work-dir"));
+        let inputs = vec![
+            PathBuf::from("/nonexistent-for-auto-test-a.mp4"),
+            PathBuf::from("/nonexistent-for-auto-test-b.mp4"),
+        ];
+        // `--cache-dir` を理由にした事前拒否はされない（入力自体が無いので
+        // 個々の処理は failed になるが、静的検証は通る）。
+        let tally = run(&config, &inputs).expect("--cache-dir は複数入力でも拒否されないはず");
+        assert_eq!(tally.failed, 2);
     }
 
     #[test]
@@ -698,7 +711,7 @@ mod tests {
             verify: false,
             jl_file: None,
             jls_set: vec![],
-            work_dir: None,
+            cache_dir: None,
         };
         let inputs = vec![PathBuf::from("/a.mp4")];
         let err = run(&config, &inputs).expect_err("--no-cm と --cm-output の併用は拒否するはず");
@@ -719,7 +732,7 @@ mod tests {
             verify: false,
             jl_file: None,
             jls_set: vec![],
-            work_dir: None,
+            cache_dir: None,
         };
         let inputs = vec![PathBuf::from("/a.mp4")];
         let err =
@@ -744,7 +757,7 @@ mod tests {
             verify: false,
             jl_file: None,
             jls_set: vec![],
-            work_dir: None,
+            cache_dir: None,
         };
         let inputs = vec![PathBuf::from("/nonexistent-for-auto-test.mp4")];
         let tally = run(&config, &inputs).expect("事前の静的検証は通るはず（入力自体は無い）");
@@ -765,7 +778,7 @@ mod tests {
             verify: false,
             jl_file: None,
             jls_set: vec!["not-key-value".to_string()],
-            work_dir: None,
+            cache_dir: None,
         };
         let inputs = vec![PathBuf::from("/nonexistent-for-auto-test.mp4")];
         let err = run(&config, &inputs).expect_err("--jls-set の形式不正は事前に拒否するはず");

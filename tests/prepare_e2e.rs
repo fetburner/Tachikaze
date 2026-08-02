@@ -54,7 +54,7 @@ fn make_scratch_dir(label: &str) -> PathBuf {
 /// 実運用では消さない方針だが、テストが `~/.cache/tachikaze` を汚し続けない
 /// ようにする)。
 fn cleanup_cache_for(input: &Path) {
-    if let Ok(dir) = tachikaze::workdir::prepared_input_path(input) {
+    if let Ok(dir) = tachikaze::workdir::prepared_input_path(None, input) {
         if let Some(parent) = dir.parent() {
             let _ = fs::remove_dir_all(parent);
         }
@@ -157,7 +157,7 @@ fn prepare_strips_edit_list_and_result_is_accepted_by_check_supported() {
         "テストの前提: 元ファイルに elst が付いているはず"
     );
 
-    let outcome = prepare::run(&input, None).expect("prepare が成功するはず");
+    let outcome = prepare::run(&input, None, None).expect("prepare が成功するはず");
     assert!(outcome.ran_ffmpeg, "elst 除去のため ffmpeg を実行するはず");
     assert!(outcome.had_edit_list);
     assert_ne!(
@@ -207,7 +207,7 @@ fn prepare_extracts_subtitle_and_drops_track_from_media() {
         "テストの前提: 元ファイルは Tx3g(mov_text) 字幕トラックを持つはず"
     );
 
-    let outcome = prepare::run(&input, None).expect("prepare が成功するはず");
+    let outcome = prepare::run(&input, None, None).expect("prepare が成功するはず");
     assert!(outcome.ran_ffmpeg);
     assert!(!outcome.had_edit_list);
 
@@ -251,7 +251,7 @@ fn prepare_is_noop_for_plain_fixture_and_creates_nothing_next_to_input() {
         .expect("フィクスチャに親ディレクトリがあるはず");
     let before = dir_entries(fixture_dir);
 
-    let outcome = prepare::run(&fixture, None).expect("prepare が成功するはず");
+    let outcome = prepare::run(&fixture, None, None).expect("prepare が成功するはず");
     assert!(
         !outcome.ran_ffmpeg,
         "前処理不要なら ffmpeg を実行しないはず"
@@ -283,7 +283,7 @@ fn prepare_prefers_external_subs_over_embedded_track() {
     let external = dir.join("external.ass");
     fs::write(&external, "external ass placeholder\n").expect("外部字幕の書き込みに失敗しました");
 
-    let outcome = prepare::run(&input, Some(&external)).expect("prepare が成功するはず");
+    let outcome = prepare::run(&input, None, Some(&external)).expect("prepare が成功するはず");
     assert_eq!(
         outcome.subtitle_path.as_deref(),
         Some(external.as_path()),
