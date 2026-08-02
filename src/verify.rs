@@ -1800,7 +1800,7 @@ mod tests {
     /// フィクスチャ/ffmpeg/ffprobe に加え、この一連のテストが必要とする ffprobe を
     /// 解決する。見つからなければ（スキップ理由を出力して）`None` を返す。
     fn skip_if_ffprobe_missing() -> Option<PathBuf> {
-        match crate::tools::resolve_tool(None, crate::tools::FFPROBE) {
+        match crate::tools::resolve_tool(crate::tools::FFPROBE) {
             Ok(path) => Some(path),
             Err(err) => {
                 eprintln!("ffprobe が見つからないためスキップします: {err}");
@@ -1874,7 +1874,6 @@ mod tests {
             .arg("verify::tests::assert_resolve_tool_fails_without_path_child")
             .arg("--ignored")
             .arg("--nocapture")
-            .env_remove("TACHIKAZE_TOOL_DIR")
             .env("PATH", "")
             .env(CHILD_MARKER_ENV, "1")
             .output()
@@ -1925,11 +1924,10 @@ mod tests {
             return;
         }
 
-        let result = crate::tools::resolve_tool(None, crate::tools::FFPROBE);
+        let result = crate::tools::resolve_tool(crate::tools::FFPROBE);
         assert!(
             result.is_err(),
-            "PATH が空(かつ tool_dir/TACHIKAZE_TOOL_DIR も無し)なら ffprobe は \
-             見つからないはず: {result:?}"
+            "PATH が空なら ffprobe は見つからないはず: {result:?}"
         );
         println!("{CHILD_RAN_MARKER}");
     }

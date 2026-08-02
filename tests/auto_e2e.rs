@@ -6,8 +6,8 @@
 //! （`docs/toolchain-macos.md` のビルド手順が必要で、CI 相当の最小構成では
 //! 用意されていない）。そのため2種類のテストに分けている:
 //!
-//! 1. **`--tool-dir` にシェルスクリプトの偽ツールを置いて `analyze` まで含めた
-//!    完走を確認するテスト**（[`auto_completes_full_pipeline_with_fake_tools`]）。
+//! 1. **子プロセスの `PATH` にシェルスクリプトの偽ツールを前置して `analyze` まで
+//!    含めた完走を確認するテスト**（[`auto_completes_full_pipeline_with_fake_tools`]）。
 //!    `dtvindex` の代わりに実物の `tests/data/sample.dtvi` をコピーするだけの
 //!    シェルスクリプトを使うことで、`cut` の自己検証（`.dtvi` とサンプル表の
 //!    突き合わせ、CLAUDE.md 罠3）まで含めて本物のパイプラインを通す
@@ -88,9 +88,11 @@ fn write_executable_script(path: &Path, script: &str) {
     std::fs::set_permissions(path, perms).expect("実行権限を付与できること");
 }
 
-/// `dtvindex` / `chapter_exe` / `join_logo_scp` の偽ツール一式と、
-/// `join_logo_scp` が既定で探す JL コマンドファイルを置いた `TACHIKAZE_JL_DIR`
-/// 用ディレクトリを用意する。戻り値は `(tool_dir, jl_dir)`。
+/// `dtvindex` / `chapter_exe` / `join_logo_scp` の偽ツール一式を、`make install`
+/// と同じ配置（`$PREFIX/bin/join_logo_scp` + `$PREFIX/share/join_logo_scp/JL/`、
+/// `docs/toolchain-macos.md`「ビルド後の配置とインストール」節）で用意する。
+/// 戻り値は `PATH` に前置するビンディレクトリ（呼び出し側が [`prepend_path`] で
+/// 使う）。
 ///
 /// - `dtvindex`: `-o` の次の引数へ、本物のフィクスチャ用に実測済みの
 ///   `tests/data/sample.dtvi` をそのままコピーする。これにより `cut` の
@@ -101,13 +103,18 @@ fn write_executable_script(path: &Path, script: &str) {
 ///   `:CM` ラベルを含まない最小限の `detail.jls` を書く（`:CM` を含めない
 ///   ことで見逃し候補・格子誤差の判定に一切引っかからないようにし、gate が
 ///   確実に「止めない」判定になるようにする）。
-fn setup_fake_analyze_tools(tmp_dir: &Path) -> (PathBuf, PathBuf) {
-    let tool_dir = tmp_dir.join("tools");
-    std::fs::create_dir_all(&tool_dir).expect("tool_dir を作れること");
+///
+/// JL コマンドファイルは `<bin_dir の親>/share/join_logo_scp/JL/JL_標準.txt` に
+/// 置く。`tools::default_jl_command_file` が `join_logo_scp` の実体パス
+/// （`resolve_tool` が canonicalize 済みで返す）から `../../share/...` を1段で
+/// 導出するため（`src/tools.rs` の doc comment参照）、追加の環境変数は不要。
+fn setup_fake_analyze_tools(tmp_dir: &Path) -> PathBuf {
+    let bin_dir = tmp_dir.join("tools").join("bin");
+    std::fs::create_dir_all(&bin_dir).expect("bin_dir を作れること");
 
     let dtvi_src = dtvi_path();
     write_executable_script(
-        &tool_dir.join("dtvindex"),
+        &bin_dir.join("dtvindex"),
         &format!(
             "#!/bin/sh\nprev=\"\"\nfor a in \"$@\"; do\n  if [ \"$prev\" = \"-o\" ]; then\n    cp \"{}\" \"$a\"\n  fi\n  prev=\"$a\"\ndone\nexit 0\n",
             dtvi_src.display()
@@ -115,25 +122,41 @@ fn setup_fake_analyze_tools(tmp_dir: &Path) -> (PathBuf, PathBuf) {
     );
 
     write_executable_script(
-        &tool_dir.join("chapter_exe"),
+        &bin_dir.join("chapter_exe"),
         "#!/bin/sh\nprev=\"\"\nfor a in \"$@\"; do\n  if [ \"$prev\" = \"-o\" ]; then\n    printf 'scp placeholder\\n' > \"$a\"\n  fi\n  prev=\"$a\"\ndone\nexit 0\n",
     );
 
     // ヘッダ行 + 総フレームを覆う単一の `:L` 行（`:CM` 無し）。
     let detail_jls = "開始 終了 秒数 誤差 ロゴ秒 ラベル\n0 598 20 0 0 :L\n";
     write_executable_script(
-        &tool_dir.join("join_logo_scp"),
+        &bin_dir.join("join_logo_scp"),
         &format!(
             "#!/bin/sh\nprev=\"\"\nfor a in \"$@\"; do\n  case \"$prev\" in\n    -o) printf '{}' > \"$a\" ;;\n    -oscp) printf '{}' > \"$a\" ;;\n  esac\n  prev=\"$a\"\ndone\nexit 0\n",
             FULL_SUCCESS_TRIM_AVS_CONTENT, detail_jls
         ),
     );
 
-    let jl_dir = tmp_dir.join("jl");
+    let jl_dir = tmp_dir
+        .join("tools")
+        .join("share")
+        .join("join_logo_scp")
+        .join("JL");
     std::fs::create_dir_all(&jl_dir).expect("jl_dir を作れること");
     std::fs::write(jl_dir.join("JL_標準.txt"), "placeholder\n").expect("JLファイルを書けること");
 
-    (tool_dir, jl_dir)
+    bin_dir
+}
+
+/// `dir` を既存の `PATH` の先頭に前置した文字列を返す（子プロセスの `PATH` に
+/// 偽ツールを注入するためのヘルパ。`--tool-dir` が無くなったため、外部ツール
+/// の解決先を差し替える唯一の手段になった）。
+fn prepend_path(dir: &Path) -> std::ffi::OsString {
+    let mut value = dir.as_os_str().to_os_string();
+    if let Some(existing) = std::env::var_os("PATH") {
+        value.push(":");
+        value.push(existing);
+    }
+    value
 }
 
 /// `path` の映像ストリームのフレーム数を ffprobe で数える。
@@ -198,16 +221,14 @@ fn auto_completes_full_pipeline_with_fake_tools() {
     let input = tmp_dir.join("IN.mp4");
     std::fs::copy(common::fixture_path(), &input).expect("フィクスチャをコピーできること");
 
-    let (tool_dir, jl_dir) = setup_fake_analyze_tools(&tmp_dir);
+    let bin_dir = setup_fake_analyze_tools(&tmp_dir);
     let cache_root = tmp_dir.join("cache");
 
     let output = Command::new(env!("CARGO_BIN_EXE_tachikaze"))
-        .arg("--tool-dir")
-        .arg(&tool_dir)
         .arg("auto")
         .arg(&input)
         .env("TACHIKAZE_CACHE_DIR", &cache_root)
-        .env("TACHIKAZE_JL_DIR", &jl_dir)
+        .env("PATH", prepend_path(&bin_dir))
         .output()
         .expect("tachikaze auto の起動に失敗した");
 
@@ -273,40 +294,44 @@ fn auto_force_overrides_gate_stop_but_gate_alone_stops_without_it() {
         let input = tmp_dir.join("IN.mp4");
         std::fs::copy(common::fixture_path(), &input).expect("フィクスチャをコピーできること");
 
-        let tool_dir = tmp_dir.join("tools");
-        std::fs::create_dir_all(&tool_dir).expect("tool_dir を作れること");
+        let bin_dir = tmp_dir.join("tools").join("bin");
+        std::fs::create_dir_all(&bin_dir).expect("bin_dir を作れること");
         let dtvi_src = dtvi_path();
         write_executable_script(
-            &tool_dir.join("dtvindex"),
+            &bin_dir.join("dtvindex"),
             &format!(
                 "#!/bin/sh\nprev=\"\"\nfor a in \"$@\"; do\n  if [ \"$prev\" = \"-o\" ]; then\n    cp \"{}\" \"$a\"\n  fi\n  prev=\"$a\"\ndone\nexit 0\n",
                 dtvi_src.display()
             ),
         );
         write_executable_script(
-            &tool_dir.join("chapter_exe"),
+            &bin_dir.join("chapter_exe"),
             "#!/bin/sh\nprev=\"\"\nfor a in \"$@\"; do\n  if [ \"$prev\" = \"-o\" ]; then\n    printf 'scp placeholder\\n' > \"$a\"\n  fi\n  prev=\"$a\"\ndone\nexit 0\n",
         );
         write_executable_script(
-            &tool_dir.join("join_logo_scp"),
+            &bin_dir.join("join_logo_scp"),
             &format!(
                 "#!/bin/sh\nprev=\"\"\nfor a in \"$@\"; do\n  case \"$prev\" in\n    -o) printf '{}' > \"$a\" ;;\n    -oscp) printf '{}' > \"$a\" ;;\n  esac\n  prev=\"$a\"\ndone\nexit 0\n",
                 FORCE_TEST_TRIM_AVS_CONTENT, detail_jls
             ),
         );
-        let jl_dir = tmp_dir.join("jl");
+        // JL コマンドファイルは `join_logo_scp` の実体パスから `../../share/...`
+        // を1段で導出する配置（`setup_fake_analyze_tools` の doc comment参照）。
+        let jl_dir = tmp_dir
+            .join("tools")
+            .join("share")
+            .join("join_logo_scp")
+            .join("JL");
         std::fs::create_dir_all(&jl_dir).expect("jl_dir を作れること");
         std::fs::write(jl_dir.join("JL_標準.txt"), "placeholder\n")
             .expect("JLファイルを書けること");
 
         let cache_root = tmp_dir.join("cache");
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_tachikaze"));
-        cmd.arg("--tool-dir")
-            .arg(&tool_dir)
-            .arg("auto")
+        cmd.arg("auto")
             .arg(&input)
             .env("TACHIKAZE_CACHE_DIR", &cache_root)
-            .env("TACHIKAZE_JL_DIR", &jl_dir);
+            .env("PATH", prepend_path(&bin_dir));
         if use_force {
             cmd.arg("--force");
         }
@@ -371,18 +396,17 @@ fn run_auto(args: &[&str], cache_root: &Path) -> std::process::Output {
 /// `docs/toolchain-macos.md` の手順どおりに3ツールを `PATH` へ入れた開発環境
 /// （＝本来の想定環境）では `analyze` が成功してしまい落ちていた。
 ///
-/// `resolve_tool` の探索順序は tool_dir → `TACHIKAZE_TOOL_DIR` → 実行ファイルの
-/// ディレクトリ → `PATH`（`src/tools.rs` の doc comment）。子プロセスの環境
-/// だけを空にすれば、親（テストプロセス）の状態には触れずに全段を空振りさせ
-/// られる。`ffmpeg` も引けなくなるが、これらのテストは elst も字幕も無い
-/// フィクスチャを使うので `prepare` は外部プロセスを起動しない。
+/// `resolve_tool` は `PATH` だけを探す（`src/tools.rs` の doc comment）。
+/// 子プロセスの `PATH` だけを空にすれば、親（テストプロセス）の状態には
+/// 触れずに解決を空振りさせられる。`ffmpeg` も引けなくなるが、これらの
+/// テストは elst も字幕も無いフィクスチャを使うので `prepare` は外部
+/// プロセスを起動しない。
 fn run_auto_without_tools(args: &[&str], cache_root: &Path) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_tachikaze"))
         .arg("auto")
         .args(args)
         .env("TACHIKAZE_CACHE_DIR", cache_root)
         .env("PATH", "")
-        .env_remove("TACHIKAZE_TOOL_DIR")
         .output()
         .expect("tachikaze auto の起動に失敗した")
 }

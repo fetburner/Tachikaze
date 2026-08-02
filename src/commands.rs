@@ -41,14 +41,12 @@ pub enum ExitOutcome {
 
 /// パース済みの CLI 引数を受け取り、対応するサブコマンドを実行する。
 pub fn run(cli: Cli) -> anyhow::Result<ExitOutcome> {
-    let tool_dir = cli.tool_dir.clone();
-
     match cli.command {
-        Commands::Analyze(args) => run_analyze(tool_dir, args).map(|()| ExitOutcome::Success),
-        Commands::Cut(args) => run_cut(tool_dir, args).map(|()| ExitOutcome::Success),
-        Commands::Prepare(args) => run_prepare(tool_dir, args).map(|()| ExitOutcome::Success),
+        Commands::Analyze(args) => run_analyze(args).map(|()| ExitOutcome::Success),
+        Commands::Cut(args) => run_cut(args).map(|()| ExitOutcome::Success),
+        Commands::Prepare(args) => run_prepare(args).map(|()| ExitOutcome::Success),
         Commands::RemapSubs(args) => run_remap_subs(args).map(|()| ExitOutcome::Success),
-        Commands::Auto(args) => run_auto(tool_dir, args),
+        Commands::Auto(args) => run_auto(args),
     }
 }
 
@@ -63,7 +61,7 @@ pub fn run(cli: Cli) -> anyhow::Result<ExitOutcome> {
 /// （exit code 2）。すべて完了 / スキップなら [`ExitOutcome::Success`]（exit code 0）。
 /// 失敗を最優先するのは、「止まった」（人手を待っているだけ）より「壊れた」方が
 /// 深刻度が高く、バッチ運用で見逃してはいけないため。
-fn run_auto(tool_dir: Option<PathBuf>, args: AutoArgs) -> anyhow::Result<ExitOutcome> {
+fn run_auto(args: AutoArgs) -> anyhow::Result<ExitOutcome> {
     let AutoArgs {
         inputs,
         output,
@@ -81,7 +79,6 @@ fn run_auto(tool_dir: Option<PathBuf>, args: AutoArgs) -> anyhow::Result<ExitOut
     } = args;
 
     let config = auto::AutoConfig {
-        tool_dir,
         output,
         cm_output,
         no_cm,
@@ -128,9 +125,9 @@ fn exit_outcome_for_tally(tally: &auto::BatchTally) -> anyhow::Result<ExitOutcom
 
 /// `prepare` サブコマンドの実行。処理本体は [`prepare::run`] に集約してあり、
 /// ここでは結果を人間向けに表示するだけ。
-fn run_prepare(tool_dir: Option<PathBuf>, args: PrepareArgs) -> anyhow::Result<()> {
+fn run_prepare(args: PrepareArgs) -> anyhow::Result<()> {
     let PrepareArgs { input, subs } = args;
-    let outcome = prepare::run(&input, tool_dir.as_deref(), subs.as_deref())?;
+    let outcome = prepare::run(&input, subs.as_deref())?;
 
     if outcome.ran_ffmpeg {
         println!("prepare 完了: {}", outcome.media_path.display());
@@ -298,7 +295,7 @@ pub(crate) fn default_remap_subs_output_path(input: &Path, extension: &str) -> P
     dir.join(format!("{stem}_CMcut.{extension}"))
 }
 
-fn run_analyze(tool_dir: Option<PathBuf>, args: AnalyzeArgs) -> anyhow::Result<()> {
+fn run_analyze(args: AnalyzeArgs) -> anyhow::Result<()> {
     let AnalyzeArgs {
         input,
         output,
@@ -317,7 +314,6 @@ fn run_analyze(tool_dir: Option<PathBuf>, args: AnalyzeArgs) -> anyhow::Result<(
     let config = analyze::AnalyzeConfig {
         input,
         output: output.clone(),
-        tool_dir,
         work_dir,
         no_keep_work,
         jls_set,
@@ -382,7 +378,7 @@ pub(crate) fn fps_from_dtvi(dtvi: &dtvi::Dtvi) -> f64 {
 /// 同一クレート内の `auto` から呼べるようにした。この変更で `cut` サブコマンド自体の
 /// 標準出力・exit code は変わらない（`tests/segmap_e2e.rs` 等の既存 E2E がそのまま通る
 /// ことで確認済み）。
-fn run_cut(tool_dir: Option<PathBuf>, args: CutArgs) -> anyhow::Result<()> {
+fn run_cut(args: CutArgs) -> anyhow::Result<()> {
     let CutArgs {
         input,
         trim: trim_path,
@@ -396,7 +392,6 @@ fn run_cut(tool_dir: Option<PathBuf>, args: CutArgs) -> anyhow::Result<()> {
     } = args;
 
     let outcome = execute_cut(CutParams {
-        tool_dir,
         input,
         trim_path,
         output,
@@ -421,7 +416,6 @@ fn run_cut(tool_dir: Option<PathBuf>, args: CutArgs) -> anyhow::Result<()> {
 /// [`execute_cut`] にまとめて渡す引数。フィールドの意味は `cut` の CLI オプション
 /// （`src/cli.rs::Commands::Cut`）と1対1に対応する。
 pub(crate) struct CutParams {
-    pub tool_dir: Option<PathBuf>,
     pub input: PathBuf,
     pub trim_path: PathBuf,
     pub output: PathBuf,
@@ -448,7 +442,6 @@ pub(crate) struct CutOutcome {
 /// 参照）。標準出力への `println!` は一切行わない（結果表示は呼び出し側の責務）。
 pub(crate) fn execute_cut(params: CutParams) -> anyhow::Result<CutOutcome> {
     let CutParams {
-        tool_dir,
         input,
         trim_path,
         output,
@@ -542,7 +535,6 @@ pub(crate) fn execute_cut(params: CutParams) -> anyhow::Result<CutOutcome> {
     let audio_timescale = audio_track.as_ref().map(|(_, info)| info.timescale);
 
     let pipeline = CutPipeline {
-        tool_dir,
         input: &input,
         moov: &moov,
         video_track_index,
@@ -692,7 +684,6 @@ fn resolve_dtvi_path(dtvi_path: Option<PathBuf>, input: &Path) -> anyhow::Result
 /// この構造体にまとめることで `run_cut` 本体の `#[allow(clippy::too_many_arguments)]` を
 /// 増やさずに済ませる。
 struct CutPipeline<'a> {
-    tool_dir: Option<PathBuf>,
     input: &'a Path,
     moov: &'a Moov,
     video_track_index: usize,
@@ -748,7 +739,7 @@ impl CutPipeline<'_> {
         };
 
         let report = if self.verify_with_ffprobe {
-            let ffprobe_path = tools::resolve_tool(self.tool_dir.as_deref(), tools::FFPROBE)?;
+            let ffprobe_path = tools::resolve_tool(tools::FFPROBE)?;
             verify::cut_verify_and_ffprobe_check(
                 self.input,
                 output,

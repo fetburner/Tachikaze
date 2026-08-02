@@ -42,8 +42,6 @@ pub struct AnalyzeConfig {
     pub input: PathBuf,
     /// 最終的な `trim.avs` の出力先。
     pub output: PathBuf,
-    /// `--tool-dir`（外部ツールの探索ディレクトリ）。
-    pub tool_dir: Option<PathBuf>,
     /// `--work-dir`（中間ファイルの置き場所）。未指定なら入力ごとのキャッシュ
     /// ディレクトリ（`--no-keep-work` 指定時は一時ディレクトリ）。
     pub work_dir: Option<PathBuf>,
@@ -85,9 +83,9 @@ pub struct AnalyzeOutput {
 /// 失敗させるため（`run_propagates_tool_resolution_failure_with_searched_locations`
 /// が実在しない入力パスでこの順序を検証している）。
 pub fn run(config: &AnalyzeConfig) -> Result<AnalyzeOutput> {
-    let dtvindex_path = tools::resolve_tool(config.tool_dir.as_deref(), DTVINDEX)?;
-    let chapter_exe_path = tools::resolve_tool(config.tool_dir.as_deref(), CHAPTER_EXE)?;
-    let join_logo_scp_path = tools::resolve_tool(config.tool_dir.as_deref(), JOIN_LOGO_SCP)?;
+    let dtvindex_path = tools::resolve_tool(DTVINDEX)?;
+    let chapter_exe_path = tools::resolve_tool(CHAPTER_EXE)?;
+    let join_logo_scp_path = tools::resolve_tool(JOIN_LOGO_SCP)?;
 
     let work_dir = WorkDir::new(config.work_dir.clone(), &config.input, config.no_keep_work)?;
     let result = run_pipeline(
@@ -306,7 +304,16 @@ mod tests {
     // `commands::tests` と共有する（`crate::workdir::test_support` の doc
     // comment 参照）。このモジュールは環境変数を書き換えないが、`WorkDir` 経由で
     // **読む**テストがあるため、同じロックを取る必要がある（下記参照）。
-    use crate::workdir::test_support::{EnvVarGuard, ENV_LOCK};
+    //
+    // `PATH` を書き換えるロックは `tools::tests` と共有する（`resolve_tool` が
+    // `PATH` しか見なくなったため、ツール解決の成功/失敗を作り分けるには
+    // `PATH` の書き換えが唯一の手段になった。`crate::tools::test_support` の
+    // doc comment参照）。2つの環境変数は別物なので別ロックのままでよいが、
+    // 同じ環境変数を書き換えるテストどうしは必ず同じロックを共有する。
+    use crate::tools::test_support::{
+        EnvVarGuard as ToolPathEnvGuard, ENV_LOCK as TOOL_PATH_ENV_LOCK,
+    };
+    use crate::workdir::test_support::{EnvVarGuard as CacheEnvGuard, ENV_LOCK as CACHE_ENV_LOCK};
     use std::process;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -447,19 +454,17 @@ mod tests {
         // その情報を組み立てているので、ここでは `run` から素通しで伝わる
         // ことだけを確認する。
         //
-        // `resolve_from_dirs` は tool_dir が空振りすると最後に `PATH` へ
-        // フォールバックする（`crate::tools` の doc comment の探索順序 4）。
+        // `resolve_tool` は `PATH` だけを探す（`crate::tools` の doc comment）。
         // したがって `docs/toolchain-macos.md` の手順どおりに3ツールを `PATH`
-        // へ入れた環境では、空の tool_dir を渡しても解決が**成功**してしまい、
-        // このテストは「見つからない」前提を失う。`PATH` を空にして隔離する
-        // （`tools::tests::resolve_from_dirs_reports_all_searched_locations_when_missing`
-        // と同じ手法。環境変数はプロセス全体で共有されるので `ENV_LOCK` が要る）。
-        let _env_guard = ENV_LOCK.lock().unwrap();
-        let _path_env = EnvVarGuard::set("PATH", "");
-        let env_tool_dir = unique_scratch_dir("missing-tools-env");
-        let _tool_dir_env = EnvVarGuard::set("TACHIKAZE_TOOL_DIR", &env_tool_dir);
+        // へ入れた環境では解決が**成功**してしまい、このテストは「見つからない」
+        // 前提を失う。`PATH` をツールの無いディレクトリだけに絞って隔離する
+        // （`tools::tests::resolve_tool_reports_all_searched_path_dirs_when_missing`
+        // と同じ手法。環境変数はプロセス全体で共有されるので `TOOL_PATH_ENV_LOCK`
+        // が要る）。
+        let _env_guard = TOOL_PATH_ENV_LOCK.lock().unwrap();
+        let path_dir_without_tools = unique_scratch_dir("missing-tools");
+        let _path_env = ToolPathEnvGuard::set("PATH", &path_dir_without_tools);
 
-        let empty_tool_dir = unique_scratch_dir("missing-tools");
         let output_dir = unique_scratch_dir("missing-tools-output");
         let output = output_dir.join("trim.avs");
 
@@ -467,26 +472,24 @@ mod tests {
             // ツール解決が入力の存在確認より前に走るため、実在しないパスでよい。
             input: PathBuf::from("/nonexistent/input-for-analyze-test.mp4"),
             output,
-            tool_dir: Some(empty_tool_dir.clone()),
             work_dir: None,
             no_keep_work: false,
             jls_set: vec![],
             jl_file: None,
         };
 
-        let err = run(&config).expect_err("空の tool_dir では解決に失敗するはず");
+        let err = run(&config).expect_err("空振りする PATH では解決に失敗するはず");
         let message = err.to_string();
         assert!(
             message.contains(DTVINDEX),
             "エラーメッセージにツール名が含まれていない: {message}"
         );
         assert!(
-            message.contains(&empty_tool_dir.join(DTVINDEX).display().to_string()),
+            message.contains(&path_dir_without_tools.join(DTVINDEX).display().to_string()),
             "エラーメッセージに探索したパスが含まれていない: {message}"
         );
 
-        fs::remove_dir_all(&empty_tool_dir).ok();
-        fs::remove_dir_all(&env_tool_dir).ok();
+        fs::remove_dir_all(&path_dir_without_tools).ok();
         fs::remove_dir_all(&output_dir).ok();
     }
 
@@ -499,15 +502,19 @@ mod tests {
         //
         // このテストは入力が実在し `work_dir: None` / `no_keep_work: false` の
         // ため `WorkDir::new` が `TACHIKAZE_CACHE_DIR` を**読む**。環境変数は
-        // プロセス全体で共有されるので、読むだけでも `ENV_LOCK` を取らないと、
+        // プロセス全体で共有されるので、読むだけでも `CACHE_ENV_LOCK` を取らないと、
         // 並行して書き換える側（`commands::tests` / `workdir::tests`）の値が
         // 漏れ込む。実際に、このテストが `commands::tests` のキャッシュ
         // ディレクトリを掴んで失敗した。自分のキャッシュ位置も明示して隔離する。
-        let _env_guard = ENV_LOCK.lock().unwrap();
+        // 加えて、偽ツールを `PATH` 経由で注入するため `TOOL_PATH_ENV_LOCK` も要る
+        // （`TACHIKAZE_CACHE_DIR` と `PATH` は別の環境変数なので別ロックのまま
+        // でよいが、両方を書き換えるこのテストは両方のロックを取る）。
+        let _cache_env_guard = CACHE_ENV_LOCK.lock().unwrap();
         let cache_root = unique_scratch_dir("stop-on-failure-cache");
-        let _cache_env = EnvVarGuard::set("TACHIKAZE_CACHE_DIR", &cache_root);
+        let _cache_env = CacheEnvGuard::set("TACHIKAZE_CACHE_DIR", &cache_root);
 
-        let tool_dir = unique_scratch_dir("stop-on-failure-tools");
+        let _path_env_guard = TOOL_PATH_ENV_LOCK.lock().unwrap();
+        let fake_tools_dir = unique_scratch_dir("stop-on-failure-tools");
         let input_dir = unique_scratch_dir("stop-on-failure-input");
         let output_dir = unique_scratch_dir("stop-on-failure-output");
 
@@ -516,27 +523,30 @@ mod tests {
 
         // dtvindex: `-o` の次の引数にダミーの中身を書いて成功する。
         write_executable_script(
-            &tool_dir.join(DTVINDEX),
+            &fake_tools_dir.join(DTVINDEX),
             "#!/bin/sh\nprev=\"\"\nfor a in \"$@\"; do\n  if [ \"$prev\" = \"-o\" ]; then\n    printf 'dummy' > \"$a\"\n  fi\n  prev=\"$a\"\ndone\nexit 0\n",
         );
 
         // chapter_exe: 常に失敗し、判定用の stderr を出す。
         write_executable_script(
-            &tool_dir.join(CHAPTER_EXE),
+            &fake_tools_dir.join(CHAPTER_EXE),
             "#!/bin/sh\necho 'FAKE CHAPTER_EXE FAILURE' >&2\nexit 5\n",
         );
 
         // join_logo_scp: 起動されたらマーカーファイルを作る（呼ばれてはいけない）。
-        let marker_path = tool_dir.join("join_logo_scp_was_called.marker");
+        let marker_path = fake_tools_dir.join("join_logo_scp_was_called.marker");
         write_executable_script(
-            &tool_dir.join(JOIN_LOGO_SCP),
+            &fake_tools_dir.join(JOIN_LOGO_SCP),
             &format!("#!/bin/sh\ntouch '{}'\nexit 0\n", marker_path.display()),
         );
+
+        // 偽ツール一式だけを `PATH` に置く（`resolve_tool` は `PATH` しか
+        // 見ないため、これが唯一の解決先の差し替え手段）。
+        let _path_env = ToolPathEnvGuard::set("PATH", &fake_tools_dir);
 
         let config = AnalyzeConfig {
             input: input_path,
             output: output_dir.join("trim.avs"),
-            tool_dir: Some(tool_dir.clone()),
             work_dir: None,
             no_keep_work: false,
             jls_set: vec![],
@@ -558,7 +568,7 @@ mod tests {
             "chapter_exe が失敗した後に join_logo_scp が起動されてはいけない"
         );
 
-        fs::remove_dir_all(&tool_dir).ok();
+        fs::remove_dir_all(&fake_tools_dir).ok();
         fs::remove_dir_all(&input_dir).ok();
         fs::remove_dir_all(&output_dir).ok();
         fs::remove_dir_all(&cache_root).ok();
@@ -572,19 +582,18 @@ mod tests {
     ///
     /// 3ツールの実バイナリはリポジトリに含まれず、用意にも時間がかかる
     /// （`docs/toolchain-macos.md` 参照）ため既定では無視する。実行する場合は
-    /// 該当手順でビルドし、`PATH` か `TACHIKAZE_TOOL_DIR`（または `--tool-dir`
-    /// 相当）から引けるようにした上で、`tests/fixtures/gen.sh` でフィクスチャを
-    /// 生成し `cargo test -- --ignored` で回すこと。
+    /// 該当手順でビルドし、`PATH` から引けるようにした上で、`tests/fixtures/gen.sh`
+    /// でフィクスチャを生成し `cargo test -- --ignored` で回すこと。
     #[test]
     #[ignore = "dtvindex/chapter_exe/join_logo_scp の実バイナリと実サンプルmp4が必要（docs/toolchain-macos.md）"]
     fn analyze_run_produces_trim_list_with_real_tools() {
         // 上の `run_stops_pipeline_and_surfaces_stderr_on_first_failure` と同じ
-        // 理由で `ENV_LOCK` を取る（実在する入力 + `work_dir: None` なので
+        // 理由で `CACHE_ENV_LOCK` を取る（実在する入力 + `work_dir: None` なので
         // `WorkDir::new` が `TACHIKAZE_CACHE_DIR` を読む）。あわせて利用者の
         // 実際のキャッシュ（`~/.cache/tachikaze`）を汚さないようにする。
-        let _env_guard = ENV_LOCK.lock().unwrap();
+        let _env_guard = CACHE_ENV_LOCK.lock().unwrap();
         let cache_root = unique_scratch_dir("integration-cache");
-        let _cache_env = EnvVarGuard::set("TACHIKAZE_CACHE_DIR", &cache_root);
+        let _cache_env = CacheEnvGuard::set("TACHIKAZE_CACHE_DIR", &cache_root);
 
         let output_dir = unique_scratch_dir("integration-output");
         let config = AnalyzeConfig {
@@ -594,7 +603,6 @@ mod tests {
                 "/tests/fixtures/sample.mp4"
             )),
             output: output_dir.join("trim.avs"),
-            tool_dir: None,
             work_dir: None,
             no_keep_work: false,
             jls_set: vec![],

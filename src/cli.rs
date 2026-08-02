@@ -5,11 +5,6 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 #[derive(Debug, Parser)]
 #[command(name = "tachikaze")]
 pub struct Cli {
-    /// 外部ツール（chapter_exe / join_logo_scp / dtvindex / ffmpeg / ffprobe）を
-    /// 探すディレクトリ。指定すると他の探索方法より優先される。
-    #[arg(long, global = true)]
-    pub tool_dir: Option<PathBuf>,
-
     #[command(subcommand)]
     pub command: Commands,
 }
