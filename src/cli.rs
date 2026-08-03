@@ -43,13 +43,13 @@ pub enum Commands {
     ///
     /// アルゴリズムは持たない（`analyze` / `cut` を複製せず呼ぶだけ）。対話プロンプトは
     /// 出さない: gate が疑わしいと判定したら cut を実行せず exit code 3 で停止し、
-    /// `trim.avs` のパスと「直して `cut` する」コマンド例を表示する（`--force` で
+    /// `trim.avs` のパスと「直して `cut` する」コマンド例を表示する（`--ignore-gate` で
     /// 無視できるが、無視できるのは gate の判定だけで、自己検証や `.dtvi` 必須は
     /// 変わらない）。exit code は 0=完了 / 1=エラー / 2=引数の誤り（clap 既定） /
     /// 3=判定で停止 の4種類のみ。1プロセスにつき入力は1本
     /// （複数ファイルはシェルのループに任せる）。
     #[command(after_help = "複数ファイルを処理するときはシェルでループする:\n\
-        \n    for f in *.mp4; do tachikaze auto \"$f\"; done\n")]
+        \n    for f in *.mp4; do tachikaze auto \"$f\" -o \"${f%.mp4}_CMcut.mp4\"; done\n")]
     Auto(AutoArgs),
 }
 
@@ -164,29 +164,25 @@ pub struct AutoArgs {
     /// （複数ファイルを回すときはシェルのループに任せる、`--help` の使用例参照）。
     pub input: PathBuf,
 
-    /// 本編の出力先。既定は入力の隣の `<stem>_CMcut.mp4`。
+    /// 本編の出力先。字幕サイドカーの stem もここから導出する。
     #[arg(short, long)]
-    pub output: Option<PathBuf>,
+    pub output: PathBuf,
 
-    /// CM 側（保持区間の補集合）の出力先。既定は入力の隣の `<stem>_CM.mp4`。
-    /// `--no-cm` とは併用できない。
+    /// CM 側（保持区間の補集合）の出力先。指定したときだけ CM 側ファイルを出す
+    /// （既定では出さない）。
     #[arg(long = "cm-output")]
     pub cm_output: Option<PathBuf>,
 
-    /// CM 側ファイルを出さない（既定では `<stem>_CM.mp4` を出す）。
-    #[arg(long)]
-    pub no_cm: bool,
-
     /// gate が疑わしいと判定しても cut まで進む。gate の判定だけを無視する
     /// （自己検証1〜8や `.dtvi` 必須は緩めない）。
-    #[arg(long)]
-    pub force: bool,
+    #[arg(long = "ignore-gate")]
+    pub ignore_gate: bool,
 
-    /// 既存の出力（本編・CM側・字幕サイドカーのいずれか）があっても上書きする。
-    /// 未指定では、既存の出力があるファイルはその実行をスキップする
-    /// （再実行で成果物を黙って潰さないため）。
-    #[arg(long)]
-    pub overwrite: bool,
+    /// 既存の出力（本編・CM側・字幕サイドカーのいずれか）があっても上書きする
+    /// （`cp -f` / `rm -f` と同じ意味）。未指定では、既存の出力があるファイルは
+    /// その実行をスキップする（再実行で成果物を黙って潰さないため）。
+    #[arg(short = 'f', long)]
+    pub force: bool,
 
     /// `prepare` + `analyze` + gate 判定までで止め、`cut` / `remap-subs` を
     /// 実行しない。止めたあとに `trim.avs` を人手で直して `cut` を直接実行できる

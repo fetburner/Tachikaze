@@ -24,7 +24,7 @@
 //!    `auto` はそれらの関数（`prepare::run` / `subtitle::remap_ass` /
 //!    `subtitle::remap_srt`）をそのまま呼ぶだけなので重複しては確認しない。
 //! 2. **`analyze` に到達する前/到達した直後の配線ロジックを、外部ツール無しで
-//!    確認するテスト**（`--overwrite`・静的な引数検証・exit code）。
+//!    確認するテスト**（`-f`/`--force`・静的な引数検証・exit code）。
 //!    `analyze` 自体は `dtvindex` が無いため必ず失敗するが、
 //!    それは想定どおりの「失敗」として exit code 1 に現れることを確認する
 //!    （gate 停止＝exit code 3 に実際に到達する経路は 1 のテストが担う）。
@@ -62,11 +62,11 @@ const FULL_SUCCESS_TRIM_AVS_CONTENT: &str = "Trim(0,19)";
 const FULL_SUCCESS_KEPT_PACKET_COUNT: usize = 120;
 const FULL_SUCCESS_CM_PACKET_COUNT: usize = 599 - FULL_SUCCESS_KEPT_PACKET_COUNT;
 
-/// `auto_force_overrides_gate_stop_but_gate_alone_stops_without_it` 用の Trim。
+/// `auto_ignore_gate_overrides_gate_stop_but_gate_alone_stops_without_it` 用の Trim。
 /// このテストは gate を意図的に止める（見逃し候補ヒューリスティック経由、
 /// 上記の「素の幅」問題とは無関係）ことが目的なので、cut 自体が正しく動くことだけ
 /// 確認できれば十分で、具体的な保持フレーム数はアサートしない。
-const FORCE_TEST_TRIM_AVS_CONTENT: &str = "Trim(10,109) ++ Trim(370,469)";
+const IGNORE_GATE_TEST_TRIM_AVS_CONTENT: &str = "Trim(10,109) ++ Trim(370,469)";
 
 fn dtvi_path() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/sample.dtvi")
@@ -200,8 +200,9 @@ fn ffprobe_available() -> bool {
 // ---------------------------------------------------------------------
 
 /// 完了条件:
-/// - `tachikaze auto IN.mp4` だけで本編 + CM側まで通る（字幕トラックが無いので
-///   字幕の張り替え部分はこのテストの対象外。上記モジュール doc comment参照）
+/// - `tachikaze auto IN.mp4 -o OUT.mp4 --cm-output OUT_CM.mp4` で本編 + CM側まで
+///   通る（字幕トラックが無いので字幕の張り替え部分はこのテストの対象外。
+///   上記モジュール doc comment参照）
 /// - exit code 0
 /// - gate が「止めない」場合に実際に cut まで進む
 /// - `auto` が `cut` のロジック（区間マップ込み、`--cm-output` の自己検証8）を
@@ -224,12 +225,18 @@ fn auto_completes_full_pipeline_with_fake_tools() {
 
     let bin_dir = setup_fake_analyze_tools(&tmp_dir);
     let cache_root = tmp_dir.join("cache");
+    let out_path = tmp_dir.join("OUT.mp4");
+    let cm_path = tmp_dir.join("OUT_CM.mp4");
 
     let output = Command::new(env!("CARGO_BIN_EXE_tachikaze"))
         .arg("--cache-dir")
         .arg(&cache_root)
         .arg("auto")
         .arg(&input)
+        .arg("-o")
+        .arg(&out_path)
+        .arg("--cm-output")
+        .arg(&cm_path)
         .env("PATH", prepend_path(&bin_dir))
         .output()
         .expect("tachikaze auto の起動に失敗した");
@@ -246,8 +253,6 @@ fn auto_completes_full_pipeline_with_fake_tools() {
         "完了の表示が期待どおりでない: {stderr}"
     );
 
-    let out_path = tmp_dir.join("IN_CMcut.mp4");
-    let cm_path = tmp_dir.join("IN_CM.mp4");
     assert!(out_path.is_file(), "本編が出力されているはず: {stdout}");
     assert!(cm_path.is_file(), "CM側が出力されているはず: {stdout}");
 
@@ -265,14 +270,14 @@ fn auto_completes_full_pipeline_with_fake_tools() {
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }
 
-/// 完了条件: gate が疑わしいと判定しても `--force` で cut まで進める。
+/// 完了条件: gate が疑わしいと判定しても `--ignore-gate` で cut まで進める。
 /// join_logo_scp の偽ツールに `:CM` ブロックが複数の同じ長さで揃った
 /// `detail.jls` を書かせ、`report::missed::find_missed_candidates` が見逃し候補を
 /// 検出する状況を作る（見逃し候補が1件以上あると gate は必ず止める、
 /// `src/gate.rs` の doc comment参照）。
 #[test]
 #[ignore = "tests/fixtures/sample.mp4 と tests/data/sample.dtvi、ffprobe が必要。tests/fixtures/gen.sh を先に実行すること"]
-fn auto_force_overrides_gate_stop_but_gate_alone_stops_without_it() {
+fn auto_ignore_gate_overrides_gate_stop_but_gate_alone_stops_without_it() {
     if common::skip_if_fixture_missing() {
         return;
     }
@@ -291,7 +296,7 @@ fn auto_force_overrides_gate_stop_but_gate_alone_stops_without_it() {
          240 279 1 0 0 :L\n\
          280 598 10 0 0 :L\n";
 
-    for (label, use_force) in [("without-force", false), ("with-force", true)] {
+    for (label, ignore_gate) in [("without-ignore-gate", false), ("with-ignore-gate", true)] {
         let tmp_dir = make_tmp_dir(&format!("gate-{label}"));
         let input = tmp_dir.join("IN.mp4");
         std::fs::copy(common::fixture_path(), &input).expect("フィクスチャをコピーできること");
@@ -314,7 +319,7 @@ fn auto_force_overrides_gate_stop_but_gate_alone_stops_without_it() {
             &bin_dir.join("join_logo_scp"),
             &format!(
                 "#!/bin/sh\nprev=\"\"\nfor a in \"$@\"; do\n  case \"$prev\" in\n    -o) printf '{}' > \"$a\" ;;\n    -oscp) printf '{}' > \"$a\" ;;\n  esac\n  prev=\"$a\"\ndone\nexit 0\n",
-                FORCE_TEST_TRIM_AVS_CONTENT, detail_jls
+                IGNORE_GATE_TEST_TRIM_AVS_CONTENT, detail_jls
             ),
         );
         // JL コマンドファイルは `join_logo_scp` の実体パスから `../../share/...`
@@ -329,30 +334,35 @@ fn auto_force_overrides_gate_stop_but_gate_alone_stops_without_it() {
             .expect("JLファイルを書けること");
 
         let cache_root = tmp_dir.join("cache");
+        let out_path = tmp_dir.join("OUT.mp4");
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_tachikaze"));
         cmd.arg("--cache-dir")
             .arg(&cache_root)
             .arg("auto")
             .arg(&input)
+            .arg("-o")
+            .arg(&out_path)
             .env("PATH", prepend_path(&bin_dir));
-        if use_force {
-            cmd.arg("--force");
+        if ignore_gate {
+            cmd.arg("--ignore-gate");
         }
         let output = cmd.output().expect("tachikaze auto の起動に失敗した");
         let stderr = String::from_utf8_lossy(&output.stderr);
 
-        let out_path = tmp_dir.join("IN_CMcut.mp4");
-        if use_force {
+        if ignore_gate {
             assert!(
                 output.status.success(),
-                "--force のため完走するはず: stderr={stderr}"
+                "--ignore-gate のため完走するはず: stderr={stderr}"
             );
             assert_eq!(output.status.code(), Some(0));
             assert!(
-                stderr.contains("--force"),
-                "--force を使って続行した旨のログが無い: {stderr}"
+                stderr.contains("--ignore-gate"),
+                "--ignore-gate を使って続行した旨のログが無い: {stderr}"
             );
-            assert!(out_path.is_file(), "--force 指定時は cut まで進むはず");
+            assert!(
+                out_path.is_file(),
+                "--ignore-gate 指定時は cut まで進むはず"
+            );
         } else {
             assert_eq!(
                 output.status.code(),
@@ -554,12 +564,20 @@ fn auto_rejects_multiple_inputs_as_usage_error() {
 
 /// 完了条件（issue #71）: 存在しないオプションを渡すと clap の usage error で
 /// exit code 2 になり、gate 停止の exit code 3
-/// （[`auto_force_overrides_gate_stop_but_gate_alone_stops_without_it`]）と
+/// （[`auto_ignore_gate_overrides_gate_stop_but_gate_alone_stops_without_it`]）と
 /// 区別できる。
 #[test]
 fn auto_unknown_option_is_usage_error_exit_code_2() {
     let tmp_dir = make_tmp_dir("unknown-option");
-    let output = run_auto(&["--no-such-option", "/no/such/a.mp4"], &tmp_dir);
+    let output = run_auto(
+        &[
+            "--no-such-option",
+            "/no/such/a.mp4",
+            "-o",
+            tmp_dir.join("OUT.mp4").to_str().unwrap(),
+        ],
+        &tmp_dir,
+    );
     assert_eq!(output.status.code(), Some(2), "clap の usage error のはず");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
@@ -569,18 +587,53 @@ fn auto_unknown_option_is_usage_error_exit_code_2() {
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }
 
-/// 完了条件: `--snap inward` と既定で付く CM 側出力の併用を、auto の文脈に
-/// 沿ったメッセージで拒否する（issue #62「罠」8）。
+/// 完了条件: `--cm-output` を明示したときの `--snap inward` との併用を拒否する
+/// （issue #73「やること」4。既定では CM 側出力を作らないため、`--cm-output` を
+/// 指定しない限りこの検証には抵触しない）。
 #[test]
-fn auto_rejects_snap_inward_with_default_cm_output() {
+fn auto_rejects_snap_inward_with_explicit_cm_output() {
     let tmp_dir = make_tmp_dir("reject-snap-inward");
-    let output = run_auto(&["--snap", "inward", "/no/such/a.mp4"], &tmp_dir);
+    let output = run_auto(
+        &[
+            "--snap",
+            "inward",
+            "--cm-output",
+            tmp_dir.join("CM.mp4").to_str().unwrap(),
+            "/no/such/a.mp4",
+            "-o",
+            tmp_dir.join("OUT.mp4").to_str().unwrap(),
+        ],
+        &tmp_dir,
+    );
     assert_eq!(output.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("--snap inward"), "stderr={stderr}");
+    assert!(stderr.contains("--cm-output"), "stderr={stderr}");
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+/// 完了条件: `--cm-output` を指定しなければ `--snap inward` は拒否されない
+/// （既定では CM 側出力を作らないため）。入力自体が無いので別のエラー
+/// （"入力がありません"）にはなるが、`--snap inward` を理由にした事前拒否では
+/// ないことを確認する。
+#[test]
+fn auto_allows_snap_inward_without_cm_output() {
+    let tmp_dir = make_tmp_dir("allow-snap-inward");
+    let output = run_auto(
+        &[
+            "--snap",
+            "inward",
+            "/no/such/a.mp4",
+            "-o",
+            tmp_dir.join("OUT.mp4").to_str().unwrap(),
+        ],
+        &tmp_dir,
+    );
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("--no-cm"),
-        "auto 固有の語彙で案内するはず: {stderr}"
+        stderr.contains("入力がありません"),
+        "「--snap inward」を理由にした事前拒否ではないはず: {stderr}"
     );
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }
@@ -589,7 +642,14 @@ fn auto_rejects_snap_inward_with_default_cm_output() {
 #[test]
 fn auto_fails_for_missing_input_with_exit_code_1() {
     let tmp_dir = make_tmp_dir("missing-input");
-    let output = run_auto(&["/no/such/input-for-auto-test.mp4"], &tmp_dir);
+    let output = run_auto(
+        &[
+            "/no/such/input-for-auto-test.mp4",
+            "-o",
+            tmp_dir.join("OUT.mp4").to_str().unwrap(),
+        ],
+        &tmp_dir,
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(
@@ -601,12 +661,63 @@ fn auto_fails_for_missing_input_with_exit_code_1() {
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }
 
+/// 完了条件: `auto` は `-o` を必須にする（issue #73「やること」3）ため、
+/// 省略すると clap の usage error（exit code 2）になる。
+#[test]
+fn auto_requires_output_as_usage_error() {
+    let tmp_dir = make_tmp_dir("require-output");
+    let output = run_auto(&["/no/such/a.mp4"], &tmp_dir);
+    assert_eq!(output.status.code(), Some(2), "clap の usage error のはず");
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+/// 完了条件(issue #73「やること」5): 字幕サイドカーの既存判定が `-o` の stem
+/// （入力の stem ではなく）から導出されることを固定する。`-o OUT.mp4` に対して
+/// `OUT.ass`（`-o` の stem）を先に置くとスキップし、入力の stem 由来のパス
+/// （`IN.ass`）は無関係であることを確認する。
+///
+/// [`run_auto_without_tools`] を使う: もし字幕サイドカーの既存判定が入力の stem
+/// から導出する古い実装に戻ってしまっていたら、`OUT.ass` を見つけられずスキップ
+/// せず実処理へ進む。外部ツールが引けない環境では実処理は必ず失敗する（exit 1）
+/// ため、リグレッションが「実ツールがあるので黙って成功する」という偽陰性に
+/// ならない。
+#[test]
+fn auto_detects_existing_subtitle_sidecar_from_output_stem() {
+    if common::skip_if_fixture_missing() {
+        return;
+    }
+
+    let tmp_dir = make_tmp_dir("subs-sidecar-stem");
+    let input = tmp_dir.join("IN.mp4");
+    std::fs::copy(common::fixture_path(), &input).expect("フィクスチャをコピーできること");
+    let out_path = tmp_dir.join("OUT.mp4");
+    let existing_ass = tmp_dir.join("OUT.ass");
+    std::fs::write(&existing_ass, b"stale ass").expect("既存字幕を書けること");
+
+    let output = run_auto_without_tools(
+        &[input.to_str().unwrap(), "-o", out_path.to_str().unwrap()],
+        &tmp_dir.join("cache"),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        output.status.success(),
+        "OUT.ass の存在だけでスキップして exit 0 になるはず: {stderr}"
+    );
+    assert!(
+        stderr.contains(&existing_ass.display().to_string()),
+        "-o の stem から導出した字幕サイドカーが既存出力として検出されるはず: {stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
 /// 完了条件: 既存の出力（本編）があるときは既定でスキップし、exit code は 0
 /// （スキップは失敗でも判定停止でもない、`src/auto.rs` の doc comment参照）。
 /// 罠: 再実行で成果物を黙って潰さない — 既存ファイルの中身が変わって
 /// いないことも確認する。
 #[test]
-fn auto_skips_existing_output_without_overwrite() {
+fn auto_skips_existing_output_without_force() {
     if common::skip_if_fixture_missing() {
         return;
     }
@@ -614,10 +725,17 @@ fn auto_skips_existing_output_without_overwrite() {
     let tmp_dir = make_tmp_dir("skip-existing");
     let input = tmp_dir.join("IN.mp4");
     std::fs::copy(common::fixture_path(), &input).expect("フィクスチャをコピーできること");
-    let existing_out = tmp_dir.join("IN_CMcut.mp4");
+    let existing_out = tmp_dir.join("OUT.mp4");
     std::fs::write(&existing_out, b"stale placeholder").expect("既存出力を書けること");
 
-    let output = run_auto(&[input.to_str().unwrap()], &tmp_dir.join("cache"));
+    let output = run_auto(
+        &[
+            input.to_str().unwrap(),
+            "-o",
+            existing_out.to_str().unwrap(),
+        ],
+        &tmp_dir.join("cache"),
+    );
     let stderr = String::from_utf8_lossy(&output.stderr);
 
     assert!(
@@ -635,24 +753,29 @@ fn auto_skips_existing_output_without_overwrite() {
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }
 
-/// 完了条件: `--overwrite` を付けるとスキップせず実処理（`prepare` 以降）に進む。
+/// 完了条件: `-f`/`--force` を付けるとスキップせず実処理（`prepare` 以降）に進む。
 /// [`run_auto_without_tools`] で `analyze` を必ず失敗させるが、それは
 /// 「スキップした」のではなく「実際に処理を試みて失敗した」ことの証拠になる
 /// （スキップのメッセージが出ないこと、`prepare` の実行ログが出ることで確認する）。
 #[test]
-fn auto_overwrite_bypasses_skip_and_reaches_analyze() {
+fn auto_force_bypasses_skip_and_reaches_analyze() {
     if common::skip_if_fixture_missing() {
         return;
     }
 
-    let tmp_dir = make_tmp_dir("overwrite-bypass");
+    let tmp_dir = make_tmp_dir("force-bypass");
     let input = tmp_dir.join("IN.mp4");
     std::fs::copy(common::fixture_path(), &input).expect("フィクスチャをコピーできること");
-    let existing_out = tmp_dir.join("IN_CMcut.mp4");
+    let existing_out = tmp_dir.join("OUT.mp4");
     std::fs::write(&existing_out, b"stale placeholder").expect("既存出力を書けること");
 
     let output = run_auto_without_tools(
-        &["--overwrite", input.to_str().unwrap()],
+        &[
+            "-f",
+            input.to_str().unwrap(),
+            "-o",
+            existing_out.to_str().unwrap(),
+        ],
         &tmp_dir.join("cache"),
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -661,15 +784,57 @@ fn auto_overwrite_bypasses_skip_and_reaches_analyze() {
     assert_eq!(output.status.code(), Some(1), "stderr={stderr}");
     assert!(
         !stderr.contains("既存の出力があるためスキップします"),
-        "--overwrite 指定時はスキップしないはず: {stderr}"
+        "-f 指定時はスキップしないはず: {stderr}"
     );
     assert!(
         stderr.contains("[auto] prepare"),
-        "--overwrite 指定時は prepare まで進むはず: {stderr}"
+        "-f 指定時は prepare まで進むはず: {stderr}"
     );
     assert!(
         stderr.contains("analyze に失敗しました"),
         "analyze で失敗した旨が出ていない: stderr={stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+/// 完了条件（issue #73「罠」）: `--ignore-gate` が無視するのは gate の判定だけで、
+/// `.dtvi` 必須（CLAUDE.md 罠3）や自己検証は緩めない。`--ignore-gate` を付けても
+/// 外部ツールが引けず `.dtvi` を生成できない状態では、gate に到達する前の
+/// `analyze` の段階で失敗する（[`run_auto_without_tools`] と同じ手法）。
+#[test]
+fn auto_ignore_gate_does_not_bypass_dtvi_requirement() {
+    if common::skip_if_fixture_missing() {
+        return;
+    }
+
+    let tmp_dir = make_tmp_dir("ignore-gate-no-dtvi");
+    let input = tmp_dir.join("IN.mp4");
+    std::fs::copy(common::fixture_path(), &input).expect("フィクスチャをコピーできること");
+
+    let output = run_auto_without_tools(
+        &[
+            "--ignore-gate",
+            input.to_str().unwrap(),
+            "-o",
+            tmp_dir.join("OUT.mp4").to_str().unwrap(),
+        ],
+        &tmp_dir.join("cache"),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "--ignore-gate があっても .dtvi を生成できなければ失敗するはず: stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("analyze に失敗しました"),
+        "gate に到達する前に analyze の段階で失敗するはず: stderr={stderr}"
+    );
+    assert!(
+        !tmp_dir.join("OUT.mp4").is_file(),
+        "cut まで進んでいないはず"
     );
 
     let _ = std::fs::remove_dir_all(&tmp_dir);
@@ -693,7 +858,12 @@ fn auto_analyze_only_stops_before_cut() {
     std::fs::copy(common::fixture_path(), &input).expect("フィクスチャをコピーできること");
 
     let output = run_auto_without_tools(
-        &["--analyze-only", input.to_str().unwrap()],
+        &[
+            "--analyze-only",
+            input.to_str().unwrap(),
+            "-o",
+            tmp_dir.join("OUT.mp4").to_str().unwrap(),
+        ],
         &tmp_dir.join("cache"),
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
