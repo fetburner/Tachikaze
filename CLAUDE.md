@@ -7,12 +7,13 @@ mp4 に変換済みの録画ファイルを、**再エンコードせずに CM �
 ```console
 $ tachikaze analyze IN.mp4 -o trim.avs --report
 $ tachikaze cut IN.mp4 --trim trim.avs -o OUT.mp4
-$ tachikaze auto IN.mp4 [IN2 ...]   # prepare → analyze → gate → cut → remap-subs を対話なしで合成
+$ tachikaze auto IN.mp4 -o OUT.mp4   # prepare → analyze → gate → cut → remap-subs を対話なしで合成
+$ for f in *.mp4; do case "$f" in *_CMcut.mp4) continue;; esac; tachikaze auto "$f" -o "${f%.mp4}_CMcut.mp4"; done   # 複数ファイルはシェルのループで（出力を *_CMcut.mp4 に固定して glob の再取り込みを避ける）
 ```
 
 `--cache-dir` / `--dtvi` は省略可（既定 `~/.cache/tachikaze/<入力ごと>/` から自動的に繋がる。探索順は [docs/architecture.md](docs/architecture.md)「パス解決」節）。インストールして使う場合の配置先は [docs/toolchain-macos.md](docs/toolchain-macos.md)「ビルド後の配置とインストール」。外部3ツールを自分でビルドせず使いたい場合は [docs/docker.md](docs/docker.md)。
 
-手元のファイルを一通しで処理するときは `tachikaze auto`（gate が疑わしいと判定したら cut せず exit code 2 で停止し、直して `cut` するコマンド例を出す。`--force` で無視できるが gate の判定だけを無視する）。判断を挟みながら進めたい場合は従来どおり `analyze` → 目視 → `cut`。
+手元のファイルを一通しで処理するときは `tachikaze auto`（gate が疑わしいと判定したら cut せず exit code 3 で停止し、直して `cut` するコマンド例を出す。`--ignore-gate` で無視できるが gate の判定だけを無視する。引数の誤りは clap の既定 exit code（2）のまま、gate 停止だけを3に分けている）。判断を挟みながら進めたい場合は従来どおり `analyze` → 目視 → `cut`。1プロセスにつき入力は1本で、繰り返しはシェルのループに任せる。
 
 現在のコマンド構成・モジュール構成・自己検証の一覧は
 [docs/architecture.md](docs/architecture.md)。

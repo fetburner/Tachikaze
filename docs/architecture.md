@@ -8,6 +8,8 @@
 
 **解析とカットは別のコマンドに分かれている。** 検出の見逃しが実際に起きるため（[jls-settings.md](jls-settings.md)）、目視確認と手動修正を挟めるようにしてある。
 
+`tachikaze --version` でバージョンを表示する（#71、`Cargo.toml` の version をそのまま出す）。
+
 ```
 tachikaze prepare IN.mp4 [--subs PATH]
     0. elst(edit list) 除去・字幕トラック除去・字幕抽出を1回の ffmpeg 呼び出しに
@@ -21,13 +23,13 @@ tachikaze prepare IN.mp4 [--subs PATH]
        「複数トラックの扱い」参照）。字幕トラックが2本以上ある場合はエラーに
        せず警告のうえ先頭の1本のみ抽出する
 
-tachikaze analyze IN.mp4 -o trim.avs [--report] [--cache-dir DIR]
+tachikaze analyze IN.mp4 [-o trim.avs|-] [--report] [--cache-dir DIR]
                                      [--jls-set KEY=VALUE]... [--jl-file FILE]
     1. dtvindex build              （外部プロセス）
     2. chapter_exe                 （外部プロセス）
     3. join_logo_scp               （外部プロセス）
                                    -set autocm_sub 11 -set param_cuttr 1 を既定付与
-    4. --report で以下を出力
+    4. --report で以下を stderr に出力
        ・各カット境界とキーフレームの距離
        ・余分に残る合計秒数
        ・見逃し候補の警告（既知の CM ブロック長と一致する未カット区間）
@@ -35,11 +37,19 @@ tachikaze analyze IN.mp4 -o trim.avs [--report] [--cache-dir DIR]
          保持率・格子誤差ずれは参考値のみ。`src/gate.rs`、#61）。`auto` はこの判定を
          使って cut するかどうかを機械的に決める（下記参照）
 
+    `-o` は省略できる（キャッシュにだけ書き、その場所を stderr へ案内する）。
+    `-o -` は `trim.avs` を標準出力へ書く（stdout はこの内容だけで、進捗・
+    レポート等の診断はすべて stderr。`tachikaze analyze IN.mp4 -o - > trim.avs` や
+    `tachikaze analyze IN.mp4 -o - | tachikaze cut IN.mp4 --trim - -o OUT.mp4` のようにパイプへ
+    流せる。#72）
+
 （必要なら trim.avs を人手で編集）
 
-tachikaze cut IN.mp4 --trim trim.avs -o OUT.mp4 [--dtvi work.mp4.dtvi] [--cache-dir DIR]
+tachikaze cut IN.mp4 --trim trim.avs|- -o OUT.mp4 [--dtvi work.mp4.dtvi] [--cache-dir DIR]
                                      [--snap outward|inward] [--cm-output CM.mp4]
                                      [--video-only] [--verify] [--segment-map PATH]
+    `--trim -` で標準入力から Trim リストを読める（`analyze -o -` の出力を
+    そのまま渡せる。#72）
     5. mp4-atom でサンプル表を読み、表示順↔デコード順を導出
        → .dtvi と一致するか assert（不一致なら停止）
     6. Trim をキーフレーム境界へスナップ（既定 outward）
@@ -69,26 +79,59 @@ tachikaze remap-subs IN.mp4 [--segment-map PATH] [--subs PATH] [-o OUT.ass|OUT.s
        件数を必ずログに出す。時刻以外のフィールド・行はそのまま素通しする
        （`src/subtitle.rs`）
 
-tachikaze auto IN.mp4 [IN2 ...] [-o OUT | --cm-output PATH | --no-cm] [--force]
-                                [--overwrite] [--analyze-only] [--no-subtitles]
+tachikaze auto IN.mp4 -o OUT.mp4 [--cm-output CM.mp4] [--ignore-gate]
+                                [-f|--force] [--analyze-only] [--no-subtitles]
                                 [--snap] [--verify] [--jl-file] [--jls-set] [--cache-dir]
    16. prepare(0) → analyze(1〜4) → gate 判定 → cut(5〜12) → remap-subs(13〜15) を
        対話なしで合成する（`src/auto.rs`、#62）。アルゴリズムは持たない: 各ステップは
        上記の関数・処理をそのまま呼ぶ（`commands::execute_cut` を `cut` サブコマンドと
        共有。詳細は `src/commands.rs` / `src/auto.rs` の doc comment）
-   17. gate が「疑わしいので止める」と判定したら cut せず exit code 2 で停止し、
-       trim.avs のパスと「直して cut する」コマンド例を出す（`--force` で無視できるが、
-       無視できるのは gate の判定だけで自己検証や `.dtvi` 必須は変わらない）
-   18. 複数入力では入力ごとに失敗を隔離し、最後に「完了 N / 判定で停止 M / 失敗 K /
-       既存出力のためスキップ L」の内訳を出す。exit code は 0=完了 / 1=エラー
-       （1本でも失敗があれば）/ 2=判定で停止（失敗が無く1本でも判定停止があれば）
-   19. 出力（`*_CMcut.mp4` / `*_CM.mp4` / 字幕サイドカー）が既に存在すれば既定で
-       その入力をスキップする（`--overwrite` で上書き）。`analyze` はキャッシュが
-       あっても毎回実行する（キャッシュキーが入力の絶対パスのハッシュだけで、
-       内容の変化を検出できないため。`src/auto.rs` の doc comment参照）
+   17. gate が「疑わしいので止める」と判定したら cut せず exit code 3 で停止し、
+       trim.avs のパスと「直して cut する」コマンド例を出す（`--ignore-gate` で
+       無視できるが、無視できるのは gate の判定だけで自己検証や `.dtvi` 必須は
+       変わらない）。`--analyze-only` を付けた場合は `--ignore-gate` の有無に
+       関わらず cut へ進まないため、gate が疑わしいと判定していれば exit code
+       は 3 のままになる（無視の対象は「cut へ進むかどうか」で、停止コード
+       そのものではない）
+   18. 1プロセスにつき入力は1本（#70）。複数ファイルを処理する場合はシェルの
+       ループに任せる（`for f in *.mp4; do case "$f" in *_CMcut.mp4) continue;; esac; tachikaze auto "$f" -o "${f%.mp4}_CMcut.mp4"; done`。
+       出力名を `_CMcut.mp4` サフィックス付きに固定し、`*.mp4` の glob が
+       前回の出力を再び入力として取り込まないよう `case` で弾く）。
+       1入力1プロセスにすることで、exit code の意味が「その1本に対する答え」に
+       一意になる（下記の表参照）
+   19. `-o` は必須（出力先を暗黙に決めない）。CM側は `--cm-output` を指定した
+       ときだけ出す（未指定なら作らない）。本編・CM側・字幕サイドカー（`-o` と
+       同じ stem の `.ass`/`.srt`）のいずれかが既に存在すれば既定でその入力を
+       スキップする（`-f`/`--force` で上書き。`cp -f` の慣習に合わせた改名、#73）。
+       ただし字幕トラックがある入力で字幕サイドカーだけ欠けている場合は、
+       本編/CM側が揃っていてもスキップせず再試行する（前回 `remap-subs` が
+       失敗した状態を次回実行で自動的に直すため、`src/auto.rs` の doc
+       comment「既存出力のスキップと -f/--force」参照）。`analyze` はキャッシュ
+       があっても毎回実行する（キャッシュキーが入力の
+       絶対パスのハッシュだけで、内容の変化を検出できないため。`src/auto.rs`
+       の doc comment参照）
 ```
 
+### exit code
+
+| code | 意味 |
+|---|---|
+| 0 | 完了（`auto` が既存出力を検出してスキップした場合も 0。失敗でも判定停止でもないため） |
+| 1 | エラー |
+| 2 | 引数の誤り（clap の既定。実測: `tachikaze --bogus` → exit 2） |
+| 3 | `auto` の gate が疑わしいと判定して停止（`analyze`/`cut`/`prepare`/`remap-subs` はこの値を返す経路を持たない） |
+
+**なぜ gate 停止が 2 ではなく 3 なのか**: clap が引数の誤り（usage error）に使う exit code が 2 であるため（実測、上記表参照）。空いている最小の番号が 3 になる（#71）。
+
 `.dtvi` はオープン GOP の判定（[lossless-cut.md](lossless-cut.md)）と自己検証 4（表示順/デコード順の突き合わせ）に必須で、これ自体は変わっていない。省略できるようにしたのは**パスの指定**だけで、`.dtvi` 無しで動くようにしたわけではない（`cut --dtvi` を省略すると、`analyze` と同じ入力ごとのキャッシュディレクトリ規則から `work.mp4.dtvi` を自動的に探す。見つからなければ `analyze` を実行するコマンド例を添えて停止する。探索順・キャッシュの場所は次節「パス解決」参照）。
+
+**なぜ `auto` の入力を1本に絞ったのか**: 複数の入力ファイルを1コマンドで並べて渡す形を受け付けていた時期があったが、1プロセスの exit code が「N本中M本失敗」という集計に潰れてしまい、スクリプトから「その入力がどうなったか」を一意に読み取れなかった。1プロセス1入力にして、繰り返しをシェル（`for` / `xargs -n1`）に任せることで、exit code の意味を一意にした（#70）。
+
+**なぜ `-f`/`--force` が上書きの意味なのか**: 以前は「gate の判定を無視する」意味のフラグに `--force` を、「既存出力を上書きする」意味のフラグには別の長いオプション名を使っていた。`cp -f` / `rm -f` の慣習では `-f`/`--force` は「上書き」を指すため、`--force` が「上書きする」と誤読されやすかった。gate 無視は `--ignore-gate` に改名し、`-f`/`--force` を慣習どおり「上書き」の意味に統一した（#73）。
+
+**なぜ `auto -o` を必須にしたのか**: 以前は `-o` を省略すると `<stem>_CMcut.mp4` を暗黙に導出していた。出力先は暗黙に決めるより明示させる方が自然で、CM側も `--cm-output` の指定有無だけで決まるようにしたことで、CM側出力の有無だけを切り替える専用フラグが不要になった（#73）。
+
+**なぜ診断を stderr に寄せたのか**: 以前は進捗・警告・レポート等の診断と `analyze` の `trim.avs` 本体が両方 stdout に混在していた。UNIX の作法（stdout はデータ、stderr は診断）に合わせて診断をすべて stderr に移し、空いた stdout を `analyze -o -` で `trim.avs` をパイプに流すために使えるようにした（#72）。
 
 **かつては「CLI に `auto` は用意していない」方針だった**（検出の見逃しがあるため、`analyze` と `cut` のあいだに人手を挟める設計を崩さない、という判断）。**この方針を変えて `auto`（#62）を追加した理由は3つ**:
 
@@ -107,7 +150,7 @@ tachikaze auto IN.mp4 [IN2 ...] [-o OUT | --cm-output PATH | --no-cm] [--force]
 | 実行ファイル | `tachikaze` / `chapter_exe` / `join_logo_scp` / `dtvindex` / `ffmpeg` / `ffprobe` | `PATH` のみ（`src/tools.rs::resolve_tool`）。別の場所に置いているものを使いたければ `PATH=/opt/jls/bin:$PATH tachikaze ...` のように前置する |
 | 読み取り専用データ | JL コマンドファイル（既定 `JL_標準.txt`） | `--jl-file` → `<join_logo_scp の実体パス>/../../share/join_logo_scp/JL/`（`make install` 配置前提の1段のみ、`src/tools.rs::default_jl_command_file`） |
 | キャッシュ（再生成可能な中間物） | `work.mp4.dtvi` / `trim.avs` / `detail.jls` / `work.mp4`（入力への symlink） / `work.mp4.segmap.json`（`cut` が書く区間マップ、`src/segmap.rs`、#57） / `input_prepared.mp4`（`prepare` が elst 除去・字幕除去後に書く前処理済み入力、`src/prepare.rs`、#58） / `subs.ass`・`subs.srt`（`prepare` が mp4 内蔵字幕トラックから抽出した字幕サイドカー。`remap-subs` の入力） | `--cache-dir`（グローバルオプション、キャッシュの根） → 既定 `<ホームディレクトリ>/.cache/tachikaze/`（`std::env::home_dir()` から決まる。ホームが特定できない場合は `--cache-dir` を促すエラーで停止する）。いずれの根からも入力ごとに `<根>/<入力絶対パスのハッシュ>-<stem>/` を使い、削除せず、同じ入力を再実行すると再利用する（`src/workdir.rs`）。`cut --dtvi` 省略時もこの規則から `work.mp4.dtvi` を自動的に探す。`work.mp4.segmap.json` / `input_prepared.mp4` / `subs.*` も同じ規則（`workdir::cached_segment_map_path` / `workdir::prepared_input_path` / `workdir::subs_path`）で、`cut --segment-map PATH` で区間マップだけは任意の場所にも書ける |
-| 出力 | `*_CMcut.mp4` / `*_CM.mp4` / `*_CMcut.ass`・`*_CMcut.srt`（`remap-subs` の既定出力、`src/commands.rs::default_remap_subs_output_path`、#59） | 入力の隣（変更しない）。本編出力と同じ stem にすることでプレイヤーが自動で字幕を読み込める |
+| 出力 | `cut -o` / `auto -o`（本編、必須） / `--cm-output`（CM側、`auto` は指定時のみ） / `*_CMcut.ass`・`*_CMcut.srt`（`remap-subs` 単体実行時の既定出力、`src/commands.rs::default_remap_subs_output_path`、#59） | いずれも明示指定（`cut`/`auto` の `-o` は必須、#73）。`remap-subs` を単体で使うときだけ入力の隣に `*_CMcut.<ext>` を既定で置く。`auto` の字幕サイドカーは `-o` と同じ stem・別拡張子（`src/auto.rs::subs_sidecar_path`）で、本編出力と揃えることでプレイヤーが自動で字幕を読み込める |
 
 `--jl-file` / `--cache-dir` / `--dtvi` を明示指定した場合は、いずれも上記の探索より最優先でそのまま使う。
 
@@ -120,7 +163,7 @@ tachikaze auto IN.mp4 [IN2 ...] [-o OUT | --cm-output PATH | --no-cm] [--force]
 - **外部ツール専用の配置ディレクトリを指定するオプションと「自分の実行ファイルの隣」を削った理由（E12-1）**: `PATH=/opt/jls/bin:$PATH tachikaze ...` のように `PATH` を前置すれば同じことができ、インストールしたくない場合は Docker イメージ（[docker.md](docker.md)）がある。口を1つに絞ることで、複数の口が同時に設定されたときどちらが効くか読まないと分からない状態を無くした
 - **作業ディレクトリを明示するオプションと使い捨て一時ディレクトリに戻すオプションを `--cache-dir` に統合した理由（E12-2）**: どちらも「キャッシュの置き場所」という同じ軸の粒度違いにすぎない。使い捨てにしたい場合は `--cache-dir "$(mktemp -d)"` で足りるため、専用オプションを別に持つ必要がない
 - **JL ファイルの探索を1段だけにした理由（E12-1）**: かつては環境変数によるディレクトリ指定・XDG のデータディレクトリ群・prefix 相対の `share/`・`join_logo_scp` と同じディレクトリの `JL/`（1ディレクトリ配布との後方互換）まで5段あった。`make install` 配置（[toolchain-macos.md](toolchain-macos.md)「ビルド後の配置とインストール」）に一本化したことで、1ディレクトリ配布の後方互換段は不要になった。個別配置にしたい場合は `--jl-file` で直接指定する
-- **出力だけ入力の隣のままにした理由**: 出力は録画ファイルと同じ場所で管理したいという運用上の要求があり、消えても再生成できるキャッシュとは性質が違う（ユーザーの成果物）ため対象外にした
+- **出力だけキャッシュの探索規則から外した理由**: 出力は録画ファイルと同じ場所で管理したいという運用上の要求があり、消えても再生成できるキャッシュとは性質が違う（ユーザーの成果物）ため対象外にした。`cut`/`auto` は `-o` で出力先を明示指定させる（#73）。`remap-subs` を単体で使うときだけ、利便性のために入力の隣へ既定の出力名を置く（`src/commands.rs::default_remap_subs_output_path`）
 - **設定ファイル用の置き場所を用意しなかった理由**: 現時点で設定ファイルに載せる項目がなく、XDG の config ディレクトリ相当は使っていない。必要になるまで空けておく方針
 
 ## モジュール構成
@@ -216,11 +259,11 @@ struct DecodeIdx(u32);    // デコード順（mp4 のサンプル番号 / .dtvi
 | ロゴ検出 | delogo 済み mp4 では原理的に不可 |
 | 映像の再エンコード | 数秒の CM 残りを許容する方針 |
 | 音声の再エンコード | 継ぎ目のノイズは残存 CM の範囲内 |
+| `auto` の複数入力・ディレクトリ一括処理（glob 展開） | 1プロセス1入力にすると exit code の意味が一意になる（#70）。繰り返しはシェル（`for` / `xargs -n1`）の仕事 |
 
 **ただし「境界 GOP だけ再エンコードすればフレーム精度になる」ことは覚えておく。** 実測で境界あたり 4 秒（120 フレーム）分のエンコードで済む。30 分番組・8 境界なら 32 秒分。方針が変わったときの逃げ道として安い。
 
 ## 将来的な拡張候補
 
-- **バッチ処理**: `auto`（#62）が複数入力の指定（`tachikaze auto IN1.mp4 IN2.mp4 ...`）には対応した。**ディレクトリを指定した一括処理（glob 展開）は未対応**（呼び出し側でシェルのグロブに展開してから渡す運用を想定）
 - **チャプター出力**: dtvindex に `create_join_logo_scp_chapters` があるのでそれを呼ぶだけ
 - **局別 JL ファイルの選択**: 現状は `JL_標準.txt` 既定（`--jl-file` で差し替えは可能）
