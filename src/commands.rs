@@ -59,9 +59,8 @@ fn run_auto(cache_dir: Option<PathBuf>, args: AutoArgs) -> anyhow::Result<ExitOu
         input,
         output,
         cm_output,
-        no_cm,
+        ignore_gate,
         force,
-        overwrite,
         analyze_only,
         no_subtitles,
         snap,
@@ -74,9 +73,8 @@ fn run_auto(cache_dir: Option<PathBuf>, args: AutoArgs) -> anyhow::Result<ExitOu
         cache_dir,
         output,
         cm_output,
-        no_cm,
+        ignore_gate,
         force,
-        overwrite,
         analyze_only,
         no_subtitles,
         snap,
@@ -272,16 +270,20 @@ pub(crate) fn reject_dash_output(path: &Path, flag: &str) -> anyhow::Result<()> 
     Ok(())
 }
 
-/// `-o` 省略時の出力先。`cut` の既定の出力名 `*_CMcut.mp4`
+/// `remap-subs` の `-o` 省略時の出力先。`*_CMcut.<ext>` という stem を使う
 /// （かつて存在したシェルラッパー `scripts/tachikaze-cmcut` の `build_output_path`
-/// も同じ規則だった。`auto` の追加に伴い削除済み、`[E11-7]`）と同じ stem に
-/// することで、多くのプレイヤーが同名の字幕サイドカーを自動的に読み込める形にする
-/// （issue #59「やること」5）。出力は入力の隣に置く（`docs/architecture.md`
-/// 「パス解決」節の「出力」分類と同じ扱い。キャッシュではなく成果物）。
+/// が使っていた、`cut` の当時の既定出力名 `*_CMcut.mp4` と同じ規則。`cut` の `-o`
+/// は現在は必須で既定名を持たないが、`remap-subs` を単体で使うときの利便性の
+/// ためにこの規則を残している。`auto` の追加に伴いシェルラッパー自体は削除済み、
+/// `[E11-7]`）ことで、多くのプレイヤーが同名の字幕サイドカーを自動的に読み込める
+/// 形にする（issue #59「やること」5）。出力は入力の隣に置く
+/// （`docs/architecture.md`「パス解決」節の「出力」分類と同じ扱い。キャッシュ
+/// ではなく成果物）。
 ///
-/// `pub(crate)`: `auto::run`（#62）が `remap-subs` と同じ字幕出力先の規則を
-/// 複製せずに再利用するため。
-pub(crate) fn default_remap_subs_output_path(input: &Path, extension: &str) -> PathBuf {
+/// `auto` は入力の stem ではなく `-o` の stem から字幕サイドカーを導出するため
+/// （`src/auto.rs::subs_sidecar_path`、issue #73「やること」5）、この関数は
+/// 使わない。
+fn default_remap_subs_output_path(input: &Path, extension: &str) -> PathBuf {
     let dir = input.parent().map(Path::to_path_buf).unwrap_or_default();
     let stem = input
         .file_stem()

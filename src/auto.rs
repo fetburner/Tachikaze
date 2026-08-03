@@ -34,22 +34,22 @@
 //! 「古い `.dtvi` を新しい入力に対して誤って使う」という、CLAUDE.md の最優先事項
 //! （静かに壊れる）に直結するリスクを持つ機能なので、要求されていない現時点では
 //! 追加しない。`auto` がキャッシュを使うのは「最終成果物（本編/CM側/字幕）が
-//! 既に存在するか」の判定（後述の `--overwrite`）だけであり、これは常に
+//! 既に存在するか」の判定（後述の `-f`/`--force`）だけであり、これは常に
 //! 実ファイルの存在を直接見るため上記のリスクを持たない。
 //!
-//! ## `--force` の範囲
+//! ## `--ignore-gate` の範囲
 //!
-//! `--force` は gate の「疑わしいので止める」判定だけを無視する。自己検証
+//! `--ignore-gate` は gate の「疑わしいので止める」判定だけを無視する。自己検証
 //! （`docs/architecture.md`「自己検証」節の1〜8）や `.dtvi` 必須（CLAUDE.md 罠3）は
 //! `execute_cut` の内部でそのまま実行される（`auto` はそれらを迂回する経路を
 //! 持たない）。
 //!
-//! ## 既存出力のスキップと `--overwrite`
+//! ## 既存出力のスキップと `-f`/`--force`
 //!
-//! 入力ごとに、最終成果物になり得るパス（本編 `*_CMcut.mp4` / CM側 `*_CM.mp4`
-//! （`--no-cm` 時は対象外）/ 字幕サイドカー `*_CMcut.ass` と `*_CMcut.srt`
-//! （`--no-subtitles` 時は対象外、拡張子は実際に抽出されるまで確定しないため
-//! 両方を候補にする））のいずれかが既に存在すれば、`--overwrite` が無い限り
+//! 入力ごとに、最終成果物になり得るパス（本編 `-o` の出力 / CM側 `--cm-output`
+//! 指定時のみ / 字幕サイドカー（`-o` と同じ stem の `.ass`/`.srt`、
+//! `--no-subtitles` 時は対象外、拡張子は実際に抽出されるまで確定しないため
+//! 両方を候補にする））のいずれかが既に存在すれば、`-f`/`--force` が無い限り
 //! その入力の処理全体をスキップする（再実行で成果物を黙って
 //! 潰さないため）。判定は実処理（`prepare`/`analyze`/`cut`)を始める前に行うため、
 //! 800MB 級の重い処理を無駄に行わない。
@@ -82,12 +82,15 @@ use crate::{analyze, cli, commands, gate, mp4io, prepare, report, segmap, subtit
 pub struct AutoConfig {
     /// `--cache-dir`（キャッシュの根）。
     pub cache_dir: Option<PathBuf>,
-    pub output: Option<PathBuf>,
-    /// `no_cm` とは併用できない。
+    /// 本編の出力先（必須）。字幕サイドカーの stem もここから導出する。
+    pub output: PathBuf,
+    /// CM 側の出力先。指定したときだけ CM 側ファイルを出す。
     pub cm_output: Option<PathBuf>,
-    pub no_cm: bool,
+    /// gate の判定だけを無視する（`--ignore-gate`。自己検証1〜8 と `.dtvi` 必須は
+    /// 緩めない）。
+    pub ignore_gate: bool,
+    /// 既存の出力があっても上書きする（`-f`/`--force`）。
     pub force: bool,
-    pub overwrite: bool,
     pub analyze_only: bool,
     pub no_subtitles: bool,
     pub snap: cli::Snap,
@@ -107,39 +110,29 @@ pub enum InputStatus {
 
 /// `auto` を入力1本に対して実行する。
 ///
-/// `--no-cm` と `--cm-output` を併用できない、`--snap inward` を既定の CM 側出力
-/// （`--no-cm` 未指定）と併用できない、といった**静的な設定の誤り**は、実処理を
-/// 始める前に検出してすぐ `Err` を返す（重い処理が走ってから初めて設定ミスが
-/// 分かる事態を避ける）。
+/// `--cm-output` を指定したときに `--snap inward` と併用できない、といった
+/// **静的な設定の誤り**は、実処理を始める前に検出してすぐ `Err` を返す
+/// （重い処理が走ってから初めて設定ミスが分かる事態を避ける）。
 pub fn run(config: &AutoConfig, input: &Path) -> anyhow::Result<InputStatus> {
     // mp4 は seek が要るため標準出力には出せない（`commands::reject_dash_output`
     // の doc comment参照）。`execute_cut` も同じ検証をするが、`prepare`/`analyze`
     // という重い処理が走ってから初めて設定ミスが分かる事態を避けるため、ここでも
     // 事前に検証する。
-    if let Some(path) = &config.output {
-        commands::reject_dash_output(path, "-o/--output")?;
-    }
+    commands::reject_dash_output(&config.output, "-o/--output")?;
     if let Some(path) = &config.cm_output {
         commands::reject_dash_output(path, "--cm-output")?;
     }
 
-    anyhow::ensure!(
-        !(config.no_cm && config.cm_output.is_some()),
-        "--no-cm と --cm-output は併用できません"
-    );
-
-    // `auto` は既定で CM 側出力を付ける（`--no-cm` を指定しない限り）。`--snap inward`
-    // は保持区間を退化させうるため `--cm-output` と併用できない
-    // （`commands::execute_cut` にも同じ検査がある。ここでは「auto は既定で
-    // --cm-output 相当を付ける」という auto 固有の文脈に沿ったメッセージにする
-    // ため、`execute_cut` の一般的なメッセージより前に、auto の語彙で説明する
-    // （issue #62「罠」8）。
-    if config.snap == cli::Snap::Inward && !config.no_cm {
+    // `--cm-output` を指定したときのみ CM 側出力を作る（既定では作らない）。
+    // `--snap inward` は保持区間を退化させうるため `--cm-output` と併用できない
+    // （`commands::execute_cut` にも同じ検査がある。ここで早期に弾くのは
+    // `prepare`/`analyze` という重い処理より前に設定ミスを検出するため。
+    // 理由は `execute_cut` 側の検証と同じ、issue #62「罠」8）。
+    if config.cm_output.is_some() && config.snap == cli::Snap::Inward {
         bail!(
-            "--snap inward は、auto が既定で付ける CM 側出力（*_CM.mp4 / --cm-output）と \
-             併用できません。inward スナップでは保持区間が退化しうるため、CM 側（補集合）の \
-             区間の順序も壊れます。--no-cm を付けるか、--snap を既定の outward のままにして \
-             ください。"
+            "--cm-output と --snap inward は併用できません。inward スナップでは保持区間が \
+             退化しうるため、CM 側（補集合）の区間の順序も壊れます。--snap を既定の \
+             outward のままにしてください。"
         );
     }
 
@@ -161,20 +154,8 @@ fn process_one(
 ) -> anyhow::Result<InputStatus> {
     anyhow::ensure!(input.is_file(), "入力がありません: {}", input.display());
 
-    let out_path = config
-        .output
-        .clone()
-        .unwrap_or_else(|| sibling_output_path(input, "_CMcut", "mp4"));
-    let cm_out_path = if config.no_cm {
-        None
-    } else {
-        Some(
-            config
-                .cm_output
-                .clone()
-                .unwrap_or_else(|| sibling_output_path(input, "_CM", "mp4")),
-        )
-    };
+    let out_path = config.output.clone();
+    let cm_out_path = config.cm_output.clone();
 
     // 既存出力のスキップ判定（本モジュール冒頭の doc comment参照）。実処理を始める
     // 前に行うことで、800MB級の重い処理を無駄にしない。
@@ -192,7 +173,7 @@ fn process_one(
     } else {
         ["ass", "srt"]
             .into_iter()
-            .map(|ext| commands::default_remap_subs_output_path(input, ext))
+            .map(|ext| subs_sidecar_path(&out_path, ext))
             .filter(|p| p.is_file())
             .collect()
     };
@@ -200,7 +181,7 @@ fn process_one(
 
     // 「字幕が必要なのに字幕サイドカー出力が無い」場合は、他の出力(本編/CM側)が
     // 揃っていてもスキップしない（本モジュール冒頭 doc comment「既存出力のスキップと
-    // --overwrite」の例外、レビュー指摘#2）。前回 remap-subs が失敗して本編/CM側だけ
+    // -f/--force」の例外、レビュー指摘#2）。前回 remap-subs が失敗して本編/CM側だけ
     // 残った状態を、次回再実行で自動的に再試行できるようにするため。
     let subs_missing_but_expected =
         !config.no_subtitles && subs_existing.is_empty() && input_has_subtitle_track(input);
@@ -211,9 +192,9 @@ fn process_one(
              （前回 remap-subs が失敗した可能性があります）。スキップせず再試行します: {}",
             input.display()
         );
-    } else if !existing.is_empty() && !config.overwrite {
+    } else if !existing.is_empty() && !config.force {
         eprintln!(
-            "[auto] 既存の出力があるためスキップします（--overwrite で上書き）: {}",
+            "[auto] 既存の出力があるためスキップします（-f/--force で上書き）: {}",
             existing
                 .iter()
                 .map(|p| p.display().to_string())
@@ -320,8 +301,10 @@ fn process_one(
     }
 
     if verdict.stop {
-        if config.force {
-            eprintln!("[auto] --force が指定されているため、gate の停止判定を無視して続行します。");
+        if config.ignore_gate {
+            eprintln!(
+                "[auto] --ignore-gate が指定されているため、gate の停止判定を無視して続行します。"
+            );
         } else {
             eprintln!("[auto] gate が疑わしいと判定したため、cut を実行せず停止します。");
             eprintln!("  trim: {}", trim_path.display());
@@ -370,16 +353,19 @@ fn process_one(
     if config.no_subtitles {
         eprintln!("[auto] --no-subtitles のため字幕の張り替えは行いません。");
     } else if let Some(subs_input) = &prepare_outcome.subtitle_path {
-        if let Err(err) =
-            remap_subtitles(config.cache_dir.as_deref(), &media_path, subs_input, input)
-        {
+        if let Err(err) = remap_subtitles(
+            config.cache_dir.as_deref(),
+            &media_path,
+            subs_input,
+            &out_path,
+        ) {
             // 本編/CM側は既に最終パスへ rename 済み（失敗しても削除しない、
             // モジュール冒頭 doc comment参照）。この入力は従来どおり失敗扱いに
             // するが（issue #62「やること」7: 本編だけ出して字幕を黙って落とさない）、
             // 次回実行時に何が起きるかを明示する（レビュー指摘#2）。
             eprintln!(
                 "[auto] 警告: 本編{}の出力は完了していますが、字幕の張り替えに失敗しました。\
-                 字幕サイドカーが未作成のため、次回（--overwrite なしでも）\
+                 字幕サイドカーが未作成のため、次回（-f/--force なしでも）\
                  再実行すると自動的に再試行します: {}",
                 if cm_out_path.is_some() { "/CM側" } else { "" },
                 input.display()
@@ -410,7 +396,7 @@ fn process_one(
 
 /// cut が書いた区間マップ（`workdir::cached_segment_map_path`）を読み、
 /// `prepare` が抽出した字幕サイドカーを cut 後のタイムラインへ張り替えて
-/// `commands::default_remap_subs_output_path` の既定パスへ書き出す。
+/// [`subs_sidecar_path`]（`out_path` と同じ stem）へ書き出す。
 ///
 /// `remap-subs` サブコマンド（`commands::run_remap_subs`）と同じ処理を、
 /// パス解決（キャッシュ探索）を経由せず直接行う: `auto` は区間マップと字幕の
@@ -421,7 +407,7 @@ fn remap_subtitles(
     cache_dir: Option<&Path>,
     media_path: &Path,
     subs_input: &Path,
-    original_input: &Path,
+    out_path: &Path,
 ) -> anyhow::Result<()> {
     let segment_map_path = workdir::cached_segment_map_path(cache_dir, media_path)
         .context("区間マップのキャッシュパス解決に失敗しました")?;
@@ -461,7 +447,7 @@ fn remap_subtitles(
     }
     .map_err(|err| anyhow!("{err}"))?;
 
-    let subs_out = commands::default_remap_subs_output_path(original_input, format.extension());
+    let subs_out = subs_sidecar_path(out_path, format.extension());
     fs::write(&subs_out, &remap_output.content)
         .with_context(|| format!("字幕の書き出しに失敗しました: {}", subs_out.display()))?;
 
@@ -483,7 +469,7 @@ fn remap_subtitles(
 /// 入力 mp4 に字幕トラックがあるかどうかを、`prepare::run` を呼ばず（＝ffmpeg を
 /// 起動せず）軽量に判定する。`moov` を読むだけなので800MB級の入力でも安い
 /// （既存出力のスキップ判定「字幕が必要なのに無い」の検出に使う。本モジュール
-/// 冒頭の doc comment「既存出力のスキップと --overwrite」参照）。入力が読めない
+/// 冒頭の doc comment「既存出力のスキップと -f/--force」参照）。入力が読めない
 /// 場合は `false` を返す（どのみち後続の `prepare::run` が同じ入力に対して同じ
 /// エラーで失敗するため、ここでエラーの経路を増やす必要が無い）。
 fn input_has_subtitle_track(input: &Path) -> bool {
@@ -493,17 +479,13 @@ fn input_has_subtitle_track(input: &Path) -> bool {
     }
 }
 
-/// `input` の隣に `<stem><suffix>.<ext>` という名前のパスを作る
-/// （`*_CMcut.mp4` / `*_CM.mp4` の既定命名規則。かつて存在したシェルラッパー
-/// `scripts/tachikaze-cmcut` の `default_out_path` / `default_cm_path` も
-/// 同じ規則だった。`auto` の追加に伴い削除済み、`[E11-7]`）。
-fn sibling_output_path(input: &Path, suffix: &str, ext: &str) -> PathBuf {
-    let dir = input.parent().map(Path::to_path_buf).unwrap_or_default();
-    let stem = input
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("output");
-    dir.join(format!("{stem}{suffix}.{ext}"))
+/// 字幕サイドカーの出力先を、`out_path`（`-o`）と同じ stem・別拡張子で作る
+/// （issue #73「やること」5: プレイヤーが本編と同名の字幕を自動で読み込むため。
+/// `commands::default_remap_subs_output_path` は入力の stem から `_CMcut` を
+/// 付けて導出するが、`auto` は `-o` の値そのものが最終的な本編出力なので、
+/// そちらに揃える）。
+fn subs_sidecar_path(out_path: &Path, extension: &str) -> PathBuf {
+    out_path.with_extension(extension)
 }
 
 /// 完了時に、何がどこに残るか（ディスク使用量）をログへ出す
@@ -554,47 +536,25 @@ mod tests {
     }
 
     #[test]
-    fn sibling_output_path_uses_stem_and_suffix() {
-        let input = Path::new("/rec/番組.mp4");
+    fn subs_sidecar_path_uses_out_path_stem() {
+        let out_path = Path::new("/rec/OUT.mp4");
         assert_eq!(
-            sibling_output_path(input, "_CMcut", "mp4"),
-            PathBuf::from("/rec/番組_CMcut.mp4")
+            subs_sidecar_path(out_path, "ass"),
+            PathBuf::from("/rec/OUT.ass")
         );
         assert_eq!(
-            sibling_output_path(input, "_CM", "mp4"),
-            PathBuf::from("/rec/番組_CM.mp4")
+            subs_sidecar_path(out_path, "srt"),
+            PathBuf::from("/rec/OUT.srt")
         );
     }
 
     #[test]
-    fn run_rejects_no_cm_and_cm_output_together() {
+    fn run_rejects_snap_inward_with_explicit_cm_output() {
         let config = AutoConfig {
-            output: None,
+            output: PathBuf::from("/tmp/out.mp4"),
             cm_output: Some(PathBuf::from("/tmp/cm.mp4")),
-            no_cm: true,
+            ignore_gate: false,
             force: false,
-            overwrite: false,
-            analyze_only: false,
-            no_subtitles: false,
-            snap: cli::Snap::Outward,
-            verify: false,
-            jl_file: None,
-            jls_set: vec![],
-            cache_dir: None,
-        };
-        let err = run(&config, Path::new("/a.mp4"))
-            .expect_err("--no-cm と --cm-output の併用は拒否するはず");
-        assert!(err.to_string().contains("--no-cm"));
-    }
-
-    #[test]
-    fn run_rejects_snap_inward_with_default_cm_output() {
-        let config = AutoConfig {
-            output: None,
-            cm_output: None,
-            no_cm: false,
-            force: false,
-            overwrite: false,
             analyze_only: false,
             no_subtitles: false,
             snap: cli::Snap::Inward,
@@ -604,21 +564,21 @@ mod tests {
             cache_dir: None,
         };
         let err = run(&config, Path::new("/a.mp4"))
-            .expect_err("--snap inward は既定の CM 側出力と併用できないはず");
+            .expect_err("--cm-output 指定時の --snap inward は拒否するはず");
         assert!(err.to_string().contains("--snap inward"));
     }
 
     #[test]
-    fn run_allows_snap_inward_with_no_cm() {
-        // `--no-cm` があれば `--snap inward` の併用禁止には抵触しない。この場合、
-        // 入力ファイルが実在しないため別のエラー（"入力がありません"）にはなるが、
-        // 「--snap inward」を理由にした事前拒否はされないことを確認する。
+    fn run_allows_snap_inward_without_cm_output() {
+        // `--cm-output` を指定しなければ CM 側出力を作らないので、
+        // `--snap inward` の併用禁止には抵触しない。この場合、入力ファイルが
+        // 実在しないため別のエラー（"入力がありません"）にはなるが、
+        // 「--snap inward」を理由にした事前拒否ではないことを確認する。
         let config = AutoConfig {
-            output: None,
+            output: PathBuf::from("/tmp/out.mp4"),
             cm_output: None,
-            no_cm: true,
+            ignore_gate: false,
             force: false,
-            overwrite: false,
             analyze_only: false,
             no_subtitles: false,
             snap: cli::Snap::Inward,
@@ -636,13 +596,50 @@ mod tests {
     }
 
     #[test]
+    fn run_rejects_dash_as_output() {
+        let config = AutoConfig {
+            output: PathBuf::from("-"),
+            cm_output: None,
+            ignore_gate: false,
+            force: false,
+            analyze_only: false,
+            no_subtitles: false,
+            snap: cli::Snap::Outward,
+            verify: false,
+            jl_file: None,
+            jls_set: vec![],
+            cache_dir: None,
+        };
+        let err = run(&config, Path::new("/a.mp4")).expect_err("-o - は拒否するはず");
+        assert!(err.to_string().contains("-o/--output"));
+    }
+
+    #[test]
+    fn run_rejects_dash_as_cm_output() {
+        let config = AutoConfig {
+            output: PathBuf::from("/tmp/out.mp4"),
+            cm_output: Some(PathBuf::from("-")),
+            ignore_gate: false,
+            force: false,
+            analyze_only: false,
+            no_subtitles: false,
+            snap: cli::Snap::Outward,
+            verify: false,
+            jl_file: None,
+            jls_set: vec![],
+            cache_dir: None,
+        };
+        let err = run(&config, Path::new("/a.mp4")).expect_err("--cm-output - は拒否するはず");
+        assert!(err.to_string().contains("--cm-output"));
+    }
+
+    #[test]
     fn run_rejects_invalid_jls_set_before_processing_input() {
         let config = AutoConfig {
-            output: None,
+            output: PathBuf::from("/tmp/out.mp4"),
             cm_output: None,
-            no_cm: false,
+            ignore_gate: false,
             force: false,
-            overwrite: false,
             analyze_only: false,
             no_subtitles: false,
             snap: cli::Snap::Outward,
