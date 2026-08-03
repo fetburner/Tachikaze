@@ -29,10 +29,6 @@ use crate::{
 /// はこの値を返す経路を持たない（常に `Ok(ExitOutcome::Success)` か `Err`
 /// （呼び出し元の `main.rs` で exit code 1 になる、変更前と同じ挙動）のどちらかで、
 /// **既存の CLI 挙動を一切変えない**）。
-///
-/// `auto` が複数入力を処理した場合の優先順位は [`auto::run`] の doc comment 参照
-/// （「1本でも失敗があれば `Err`」「失敗が無く1本でも gate 停止があれば
-/// `GateStopped`」「全部完了なら `Success`」）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExitOutcome {
     Success,
@@ -54,18 +50,11 @@ pub fn run(cli: Cli) -> anyhow::Result<ExitOutcome> {
 
 /// `auto` サブコマンドの実行。処理本体は [`auto::run`] に集約してあり（`commands.rs`
 /// はアルゴリズムを持たない方針、本ファイル冒頭の doc comment参照）、ここでは
-/// [`auto::AutoConfig`] の組み立てと、バッチ集計から exit code（[`ExitOutcome`]）への
-/// 変換だけを行う。
-///
-/// 変換方針: 1本でも失敗（[`auto::BatchTally::failed`] > 0）があれば `Err` を返す
-/// （`main.rs` で exit code 1 になる）。失敗が無く1本でも gate 停止
-/// （[`auto::BatchTally::gate_stopped`] > 0）があれば [`ExitOutcome::GateStopped`]
-/// （exit code 2）。すべて完了 / スキップなら [`ExitOutcome::Success`]（exit code 0）。
-/// 失敗を最優先するのは、「止まった」（人手を待っているだけ）より「壊れた」方が
-/// 深刻度が高く、バッチ運用で見逃してはいけないため。
+/// [`auto::AutoConfig`] の組み立てと、[`auto::InputStatus`] から exit code
+/// （[`ExitOutcome`]）への変換だけを行う。
 fn run_auto(cache_dir: Option<PathBuf>, args: AutoArgs) -> anyhow::Result<ExitOutcome> {
     let AutoArgs {
-        inputs,
+        input,
         output,
         cm_output,
         no_cm,
@@ -94,34 +83,10 @@ fn run_auto(cache_dir: Option<PathBuf>, args: AutoArgs) -> anyhow::Result<ExitOu
         jls_set,
     };
 
-    let tally = auto::run(&config, &inputs)?;
-    exit_outcome_for_tally(&tally)
-}
-
-/// [`auto::BatchTally`] から [`ExitOutcome`] を決める、副作用の無い純粋関数。
-///
-/// `run_auto` 本体から切り出してあるのは、この決定ロジック（優先順位:
-/// 失敗 > gate停止 > 完了）を `dtvindex` 等の外部ツールを一切使わずに単体テスト
-/// できるようにするため（この環境には外部ツールが無く、実際に gate 停止に
-/// 到達する E2E は組めない。`tests/auto_e2e.rs` の doc comment参照）。
-///
-/// 優先順位の根拠は [`ExitOutcome`] の doc comment参照（「止まった」より
-/// 「壊れた」の方が深刻度が高く、バッチ運用で見逃してはいけないため）。
-fn exit_outcome_for_tally(tally: &auto::BatchTally) -> anyhow::Result<ExitOutcome> {
-    if tally.failed > 0 {
-        bail!(
-            "{} 本が失敗しました（内訳: 完了 {} / 判定で停止 {} / 既存出力のため\
-             スキップ {}）。詳細は上記ログを参照してください",
-            tally.failed,
-            tally.completed,
-            tally.gate_stopped,
-            tally.skipped
-        );
+    match auto::run(&config, &input)? {
+        auto::InputStatus::Completed | auto::InputStatus::Skipped => Ok(ExitOutcome::Success),
+        auto::InputStatus::GateStopped => Ok(ExitOutcome::GateStopped),
     }
-    if tally.gate_stopped > 0 {
-        return Ok(ExitOutcome::GateStopped);
-    }
-    Ok(ExitOutcome::Success)
 }
 
 /// `prepare` サブコマンドの実行。処理本体は [`prepare::run`] に集約してあり、
@@ -1120,72 +1085,6 @@ mod tests {
     use std::env;
     use std::process;
     use std::time::{SystemTime, UNIX_EPOCH};
-
-    // --- exit_outcome_for_tally: auto の exit code 決定ロジック ---
-    //
-    // 実際に gate 停止まで到達する E2E はこの環境には無い外部ツール
-    // （dtvindex/chapter_exe/join_logo_scp）が要るため組めない
-    // （`tests/auto_e2e.rs` の doc comment参照）。決定ロジック自体は純粋関数
-    // なので、ここで `BatchTally` を直接組み立てて exit code 0/1/2 の区別を検証する
-    // （issue #62 完了条件「exit code 0 / 1 / 2 が区別されていることをテストしている」）。
-
-    #[test]
-    fn exit_outcome_is_success_when_all_completed() {
-        let tally = auto::BatchTally {
-            completed: 3,
-            gate_stopped: 0,
-            failed: 0,
-            skipped: 0,
-        };
-        assert_eq!(
-            exit_outcome_for_tally(&tally).expect("成功のはず"),
-            ExitOutcome::Success
-        );
-    }
-
-    #[test]
-    fn exit_outcome_is_success_when_some_skipped_but_none_failed_or_stopped() {
-        // スキップは「既存の出力があるので何もしなかった」だけで、失敗でも
-        // 判定停止でもない（`auto.rs` の doc comment参照）。
-        let tally = auto::BatchTally {
-            completed: 1,
-            gate_stopped: 0,
-            failed: 0,
-            skipped: 2,
-        };
-        assert_eq!(
-            exit_outcome_for_tally(&tally).expect("成功のはず"),
-            ExitOutcome::Success
-        );
-    }
-
-    #[test]
-    fn exit_outcome_is_gate_stopped_when_no_failures_but_one_stopped() {
-        let tally = auto::BatchTally {
-            completed: 1,
-            gate_stopped: 1,
-            failed: 0,
-            skipped: 0,
-        };
-        assert_eq!(
-            exit_outcome_for_tally(&tally).expect("gate 停止のはず"),
-            ExitOutcome::GateStopped
-        );
-    }
-
-    #[test]
-    fn exit_outcome_is_error_when_any_failed_even_with_gate_stopped_present() {
-        // 失敗が最優先（「止まった」より「壊れた」の方が深刻度が高い、
-        // `ExitOutcome` の doc comment参照）。
-        let tally = auto::BatchTally {
-            completed: 0,
-            gate_stopped: 5,
-            failed: 1,
-            skipped: 0,
-        };
-        let err = exit_outcome_for_tally(&tally).expect_err("失敗が1件でもエラーになるはず");
-        assert!(err.to_string().contains("失敗"));
-    }
 
     fn make_scratch_dir(label: &str) -> PathBuf {
         let base = env::temp_dir();

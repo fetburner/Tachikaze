@@ -50,7 +50,7 @@
 //! （`--no-cm` 時は対象外）/ 字幕サイドカー `*_CMcut.ass` と `*_CMcut.srt`
 //! （`--no-subtitles` 時は対象外、拡張子は実際に抽出されるまで確定しないため
 //! 両方を候補にする））のいずれかが既に存在すれば、`--overwrite` が無い限り
-//! その入力の処理全体をスキップする（バッチの再実行で成果物を黙って
+//! その入力の処理全体をスキップする（再実行で成果物を黙って
 //! 潰さないため）。判定は実処理（`prepare`/`analyze`/`cut`)を始める前に行うため、
 //! 800MB 級の重い処理を無駄に行わない。
 //!
@@ -58,7 +58,7 @@
 //! `remap_subtitles` は `cut` が本編・CM側を最終パスへ rename した**後**に走る
 //! ため、字幕の張り替えに失敗すると本編/CM側だけが最終パスに残った状態で
 //! この入力全体が失敗扱いになる（字幕を黙って落とさないための意図的な仕様、
-//! 下記「字幕の張り替えと失敗時の扱い」参照）。この状態で次回バッチを
+//! 下記「字幕の張り替えと失敗時の扱い」参照）。この状態で次回
 //! 再実行すると、上記の素朴な判定では「本編がある」だけでスキップと判定されて
 //! しまい、**字幕が永久に欠落したまま「完了」扱いになる**（実処理を始める前の
 //! ファイル存在チェックだけを見ているため、前回が完走したのか途中で
@@ -80,14 +80,10 @@ use crate::{analyze, cli, commands, gate, mp4io, prepare, report, segmap, subtit
 /// `auto` サブコマンドの設定（`src/cli.rs::Commands::Auto` の CLI 引数と1対1）。
 #[derive(Debug, Clone)]
 pub struct AutoConfig {
-    /// `--cache-dir`（キャッシュの根）。複数入力でも共通のまま使える
-    /// （根だけを差し替えるオプションで、入力ごとのサブディレクトリは
-    /// 常にハッシュから決まるため、複数入力時に個別指定できない
-    /// `output` / `cm_output` とは事情が異なる）。
+    /// `--cache-dir`（キャッシュの根）。
     pub cache_dir: Option<PathBuf>,
-    /// 単一入力時のみ有効。複数入力時は `run` が事前に拒否する。
     pub output: Option<PathBuf>,
-    /// 単一入力時のみ有効。`no_cm` とは併用できない。
+    /// `no_cm` とは併用できない。
     pub cm_output: Option<PathBuf>,
     pub no_cm: bool,
     pub force: bool,
@@ -100,60 +96,22 @@ pub struct AutoConfig {
     pub jls_set: Vec<String>,
 }
 
-/// 入力1本の処理結果（失敗は `anyhow::Result::Err` で表す。`run` 側で集計する）。
+/// 入力1本の処理結果（失敗は `anyhow::Result::Err` で表す。`commands::run_auto`
+/// が `ExitOutcome` へ変換する）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum InputStatus {
+pub enum InputStatus {
     Completed,
     GateStopped,
     Skipped,
 }
 
-/// バッチ全体の集計。「完了 N / 判定で停止 M / 失敗 K / スキップ L」の内訳
-/// （issue #62 完了条件「複数入力で1本失敗しても残りが処理され、最後に内訳が出る」）。
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct BatchTally {
-    pub completed: usize,
-    pub gate_stopped: usize,
-    pub failed: usize,
-    pub skipped: usize,
-}
-
-impl BatchTally {
-    fn total(&self) -> usize {
-        self.completed + self.gate_stopped + self.failed + self.skipped
-    }
-}
-
-/// `auto` バッチ全体を実行する。1本の失敗で残りを止めない
-/// （入力ごとに panic ではなく通常の `Result` で失敗を隔離する）。
+/// `auto` を入力1本に対して実行する。
 ///
-/// 複数入力時に `-o` / `--cm-output` を使えない、`--no-cm` と
-/// `--cm-output` を併用できない、`--snap inward` を既定の CM 側出力
-/// （`--no-cm` 未指定）と併用できない、といった**静的な設定の誤り**は、
-/// どの入力の処理も始める前に検出してすぐ `Err` を返す（1本目の重い処理が
-/// 走ってから初めて設定ミスが分かる事態を避ける）。
-///
-/// 個々の入力の失敗はここでは `Err` にしない（呼び出し元の [`crate::commands`]
-/// が `BatchTally::failed` を見て exit code を決める。`ExitOutcome` の doc
-/// comment参照）。
-pub fn run(config: &AutoConfig, inputs: &[PathBuf]) -> anyhow::Result<BatchTally> {
-    anyhow::ensure!(!inputs.is_empty(), "入力 mp4 を指定してください");
-
-    if inputs.len() > 1 {
-        anyhow::ensure!(
-            config.output.is_none(),
-            "複数入力時は -o を指定できません（各入力の隣に既定名 *_CMcut.mp4 で出力します）"
-        );
-        anyhow::ensure!(
-            config.cm_output.is_none(),
-            "複数入力時は --cm-output を指定できません（各入力の隣に既定名 *_CM.mp4 で出力します）"
-        );
-        // `--cache-dir` はキャッシュの根だけを指すオプションで、入力ごとの
-        // サブディレクトリは常に絶対パスのハッシュから決まる（`workdir.rs` の
-        // doc comment参照）。そのため `-o` / `--cm-output` と違い、複数入力でも
-        // 共通のまま使えるので拒否しない。
-    }
-
+/// `--no-cm` と `--cm-output` を併用できない、`--snap inward` を既定の CM 側出力
+/// （`--no-cm` 未指定）と併用できない、といった**静的な設定の誤り**は、実処理を
+/// 始める前に検出してすぐ `Err` を返す（重い処理が走ってから初めて設定ミスが
+/// 分かる事態を避ける）。
+pub fn run(config: &AutoConfig, input: &Path) -> anyhow::Result<InputStatus> {
     anyhow::ensure!(
         !(config.no_cm && config.cm_output.is_some()),
         "--no-cm と --cm-output は併用できません"
@@ -180,34 +138,11 @@ pub fn run(config: &AutoConfig, inputs: &[PathBuf]) -> anyhow::Result<BatchTally
         .map(|raw| analyze::parse_jls_set_arg(raw))
         .collect::<anyhow::Result<Vec<_>>>()?;
 
-    let mut tally = BatchTally::default();
-    for input in inputs {
-        println!("\n======== {} ========", input.display());
-        match process_one(config, &jls_set, input) {
-            Ok(InputStatus::Completed) => tally.completed += 1,
-            Ok(InputStatus::GateStopped) => tally.gate_stopped += 1,
-            Ok(InputStatus::Skipped) => tally.skipped += 1,
-            Err(err) => {
-                eprintln!("[auto] エラー: {}: {err:?}", input.display());
-                tally.failed += 1;
-            }
-        }
-    }
-
-    println!(
-        "\n完了 {} / 判定で停止 {} / 失敗 {} / 既存出力のためスキップ {}（計 {} 件）",
-        tally.completed,
-        tally.gate_stopped,
-        tally.failed,
-        tally.skipped,
-        tally.total()
-    );
-
-    Ok(tally)
+    process_one(config, &jls_set, input)
 }
 
 /// 入力1本を処理する。戻り値は成功時の状態（[`InputStatus`]）、失敗時は
-/// `anyhow::Error`（呼び出し元の `run` が握りつぶしてタリーに反映する）。
+/// `anyhow::Error`（呼び出し元の `run` がそのまま伝播する）。
 fn process_one(
     config: &AutoConfig,
     jls_set: &[(String, String)],
@@ -255,7 +190,7 @@ fn process_one(
     // 「字幕が必要なのに字幕サイドカー出力が無い」場合は、他の出力(本編/CM側)が
     // 揃っていてもスキップしない（本モジュール冒頭 doc comment「既存出力のスキップと
     // --overwrite」の例外、レビュー指摘#2）。前回 remap-subs が失敗して本編/CM側だけ
-    // 残った状態を、次回バッチ再実行で自動的に再試行できるようにするため。
+    // 残った状態を、次回再実行で自動的に再試行できるようにするため。
     let subs_missing_but_expected =
         !config.no_subtitles && subs_existing.is_empty() && input_has_subtitle_track(input);
 
@@ -426,10 +361,10 @@ fn process_one(
             // 本編/CM側は既に最終パスへ rename 済み（失敗しても削除しない、
             // モジュール冒頭 doc comment参照）。この入力は従来どおり失敗扱いに
             // するが（issue #62「やること」7: 本編だけ出して字幕を黙って落とさない）、
-            // 次回バッチ実行時に何が起きるかを明示する（レビュー指摘#2）。
+            // 次回実行時に何が起きるかを明示する（レビュー指摘#2）。
             eprintln!(
                 "[auto] 警告: 本編{}の出力は完了していますが、字幕の張り替えに失敗しました。\
-                 字幕サイドカーが未作成のため、次回このバッチを（--overwrite なしでも）\
+                 字幕サイドカーが未作成のため、次回（--overwrite なしでも）\
                  再実行すると自動的に再試行します: {}",
                 if cm_out_path.is_some() { "/CM側" } else { "" },
                 input.display()
@@ -464,7 +399,7 @@ fn process_one(
 ///
 /// `remap-subs` サブコマンド（`commands::run_remap_subs`）と同じ処理を、
 /// パス解決（キャッシュ探索）を経由せず直接行う: `auto` は区間マップと字幕の
-/// 場所を既に知っている（このバッチ内で `cut` と `prepare` を呼んだ直後）ため、
+/// 場所を既に知っている（この実行内で `cut` と `prepare` を呼んだ直後）ため、
 /// `resolve_segment_map_path` / `resolve_subs_path` のキャッシュ自動探索
 /// （他人が置いた古いキャッシュを拾う可能性がある）を経由する必要が無い。
 fn remap_subtitles(
@@ -617,87 +552,6 @@ mod tests {
     }
 
     #[test]
-    fn batch_tally_total_sums_all_categories() {
-        let tally = BatchTally {
-            completed: 2,
-            gate_stopped: 1,
-            failed: 1,
-            skipped: 3,
-        };
-        assert_eq!(tally.total(), 7);
-    }
-
-    #[test]
-    fn run_rejects_empty_inputs() {
-        let config = AutoConfig {
-            output: None,
-            cm_output: None,
-            no_cm: false,
-            force: false,
-            overwrite: false,
-            analyze_only: false,
-            no_subtitles: false,
-            snap: cli::Snap::Outward,
-            verify: false,
-            jl_file: None,
-            jls_set: vec![],
-            cache_dir: None,
-        };
-        let err = run(&config, &[]).expect_err("空の入力リストは拒否するはず");
-        assert!(err.to_string().contains("入力"));
-    }
-
-    #[test]
-    fn run_rejects_multiple_inputs_with_explicit_output() {
-        let config = AutoConfig {
-            output: Some(PathBuf::from("/tmp/out.mp4")),
-            cm_output: None,
-            no_cm: false,
-            force: false,
-            overwrite: false,
-            analyze_only: false,
-            no_subtitles: false,
-            snap: cli::Snap::Outward,
-            verify: false,
-            jl_file: None,
-            jls_set: vec![],
-            cache_dir: None,
-        };
-        let inputs = vec![PathBuf::from("/a.mp4"), PathBuf::from("/b.mp4")];
-        let err = run(&config, &inputs).expect_err("複数入力 + -o は拒否するはず");
-        assert!(err.to_string().contains("-o"));
-    }
-
-    /// 完了条件: `--cache-dir` はキャッシュの根だけを指すオプションなので、
-    /// `-o` / `--cm-output`（削除済みの `--work-dir` はこちらの仲間だった）とは
-    /// 違い、複数入力でも拒否されない。
-    #[test]
-    fn run_allows_multiple_inputs_with_explicit_cache_dir() {
-        let config = AutoConfig {
-            cache_dir: Some(PathBuf::from("/tmp/cache")),
-            output: None,
-            cm_output: None,
-            no_cm: false,
-            force: false,
-            overwrite: false,
-            analyze_only: false,
-            no_subtitles: false,
-            snap: cli::Snap::Outward,
-            verify: false,
-            jl_file: None,
-            jls_set: vec![],
-        };
-        let inputs = vec![
-            PathBuf::from("/nonexistent-for-auto-test-a.mp4"),
-            PathBuf::from("/nonexistent-for-auto-test-b.mp4"),
-        ];
-        // `--cache-dir` を理由にした事前拒否はされない（入力自体が無いので
-        // 個々の処理は failed になるが、静的検証は通る）。
-        let tally = run(&config, &inputs).expect("--cache-dir は複数入力でも拒否されないはず");
-        assert_eq!(tally.failed, 2);
-    }
-
-    #[test]
     fn run_rejects_no_cm_and_cm_output_together() {
         let config = AutoConfig {
             output: None,
@@ -713,8 +567,8 @@ mod tests {
             jls_set: vec![],
             cache_dir: None,
         };
-        let inputs = vec![PathBuf::from("/a.mp4")];
-        let err = run(&config, &inputs).expect_err("--no-cm と --cm-output の併用は拒否するはず");
+        let err = run(&config, Path::new("/a.mp4"))
+            .expect_err("--no-cm と --cm-output の併用は拒否するはず");
         assert!(err.to_string().contains("--no-cm"));
     }
 
@@ -734,9 +588,8 @@ mod tests {
             jls_set: vec![],
             cache_dir: None,
         };
-        let inputs = vec![PathBuf::from("/a.mp4")];
-        let err =
-            run(&config, &inputs).expect_err("--snap inward は既定の CM 側出力と併用できないはず");
+        let err = run(&config, Path::new("/a.mp4"))
+            .expect_err("--snap inward は既定の CM 側出力と併用できないはず");
         assert!(err.to_string().contains("--snap inward"));
     }
 
@@ -759,13 +612,16 @@ mod tests {
             jls_set: vec![],
             cache_dir: None,
         };
-        let inputs = vec![PathBuf::from("/nonexistent-for-auto-test.mp4")];
-        let tally = run(&config, &inputs).expect("事前の静的検証は通るはず（入力自体は無い）");
-        assert_eq!(tally.failed, 1, "存在しない入力なので failed が1件のはず");
+        let err = run(&config, Path::new("/nonexistent-for-auto-test.mp4"))
+            .expect_err("入力が無いのでエラーになるはず");
+        assert!(
+            err.to_string().contains("入力がありません"),
+            "「--snap inward」を理由にした事前拒否ではないはず: {err}"
+        );
     }
 
     #[test]
-    fn run_rejects_invalid_jls_set_before_processing_any_input() {
+    fn run_rejects_invalid_jls_set_before_processing_input() {
         let config = AutoConfig {
             output: None,
             cm_output: None,
@@ -780,8 +636,8 @@ mod tests {
             jls_set: vec!["not-key-value".to_string()],
             cache_dir: None,
         };
-        let inputs = vec![PathBuf::from("/nonexistent-for-auto-test.mp4")];
-        let err = run(&config, &inputs).expect_err("--jls-set の形式不正は事前に拒否するはず");
+        let err = run(&config, Path::new("/nonexistent-for-auto-test.mp4"))
+            .expect_err("--jls-set の形式不正は事前に拒否するはず");
         assert!(err.to_string().contains("KEY=VALUE"));
     }
 }
