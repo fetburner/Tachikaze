@@ -68,31 +68,17 @@ const FULL_SUCCESS_CM_PACKET_COUNT: usize = 599 - FULL_SUCCESS_KEPT_PACKET_COUNT
 /// 確認できれば十分で、具体的な保持フレーム数はアサートしない。
 const IGNORE_GATE_TEST_TRIM_AVS_CONTENT: &str = "Trim(10,109) ++ Trim(370,469)";
 
-fn dtvi_path() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/sample.dtvi")
-}
-
+/// `label` に `"auto-e2e-"` を付けて [`common::make_tmp_dir`] を呼ぶ薄いラッパ。
+/// 呼び出し側の見た目を変えないためだけに残す（実際のディレクトリ名は元と同じ
+/// `tachikaze-auto-e2e-<label>-<pid>`）。
 fn make_tmp_dir(label: &str) -> PathBuf {
-    let dir =
-        std::env::temp_dir().join(format!("tachikaze-auto-e2e-{label}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("一時ディレクトリを作れること");
-    dir
-}
-
-#[cfg(unix)]
-fn write_executable_script(path: &Path, script: &str) {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::write(path, script).expect("スクリプトを書けること");
-    let mut perms = std::fs::metadata(path).unwrap().permissions();
-    perms.set_mode(0o755);
-    std::fs::set_permissions(path, perms).expect("実行権限を付与できること");
+    common::make_tmp_dir(&format!("auto-e2e-{label}"))
 }
 
 /// `dtvindex` / `chapter_exe` / `join_logo_scp` の偽ツール一式を、`make install`
 /// と同じ配置（`$PREFIX/bin/join_logo_scp` + `$PREFIX/share/join_logo_scp/JL/`、
 /// `docs/toolchain-macos.md`「ビルド後の配置とインストール」節）で用意する。
-/// 戻り値は `PATH` に前置するビンディレクトリ（呼び出し側が [`prepend_path`] で
+/// 戻り値は `PATH` に前置するビンディレクトリ（呼び出し側が [`common::prepend_path`] で
 /// 使う）。
 ///
 /// - `dtvindex`: `-o` の次の引数へ、本物のフィクスチャ用に実測済みの
@@ -113,8 +99,8 @@ fn setup_fake_analyze_tools(tmp_dir: &Path) -> PathBuf {
     let bin_dir = tmp_dir.join("tools").join("bin");
     std::fs::create_dir_all(&bin_dir).expect("bin_dir を作れること");
 
-    let dtvi_src = dtvi_path();
-    write_executable_script(
+    let dtvi_src = common::dtvi_path();
+    common::write_executable_script(
         &bin_dir.join("dtvindex"),
         &format!(
             "#!/bin/sh\nprev=\"\"\nfor a in \"$@\"; do\n  if [ \"$prev\" = \"-o\" ]; then\n    cp \"{}\" \"$a\"\n  fi\n  prev=\"$a\"\ndone\nexit 0\n",
@@ -122,14 +108,14 @@ fn setup_fake_analyze_tools(tmp_dir: &Path) -> PathBuf {
         ),
     );
 
-    write_executable_script(
+    common::write_executable_script(
         &bin_dir.join("chapter_exe"),
         "#!/bin/sh\nprev=\"\"\nfor a in \"$@\"; do\n  if [ \"$prev\" = \"-o\" ]; then\n    printf 'scp placeholder\\n' > \"$a\"\n  fi\n  prev=\"$a\"\ndone\nexit 0\n",
     );
 
     // ヘッダ行 + 総フレームを覆う単一の `:L` 行（`:CM` 無し）。
     let detail_jls = "開始 終了 秒数 誤差 ロゴ秒 ラベル\n0 598 20 0 0 :L\n";
-    write_executable_script(
+    common::write_executable_script(
         &bin_dir.join("join_logo_scp"),
         &format!(
             "#!/bin/sh\nprev=\"\"\nfor a in \"$@\"; do\n  case \"$prev\" in\n    -o) printf '{}' > \"$a\" ;;\n    -oscp) printf '{}' > \"$a\" ;;\n  esac\n  prev=\"$a\"\ndone\nexit 0\n",
@@ -146,18 +132,6 @@ fn setup_fake_analyze_tools(tmp_dir: &Path) -> PathBuf {
     std::fs::write(jl_dir.join("JL_標準.txt"), "placeholder\n").expect("JLファイルを書けること");
 
     bin_dir
-}
-
-/// `dir` を既存の `PATH` の先頭に前置した文字列を返す（子プロセスの `PATH` に
-/// 偽ツールを注入するためのヘルパ。`--tool-dir` が無くなったため、外部ツール
-/// の解決先を差し替える唯一の手段になった）。
-fn prepend_path(dir: &Path) -> std::ffi::OsString {
-    let mut value = dir.as_os_str().to_os_string();
-    if let Some(existing) = std::env::var_os("PATH") {
-        value.push(":");
-        value.push(existing);
-    }
-    value
 }
 
 /// `path` の映像ストリームのフレーム数を ffprobe で数える。
@@ -237,7 +211,7 @@ fn auto_completes_full_pipeline_with_fake_tools() {
         .arg(&out_path)
         .arg("--cm-output")
         .arg(&cm_path)
-        .env("PATH", prepend_path(&bin_dir))
+        .env("PATH", common::prepend_path(&bin_dir))
         .output()
         .expect("tachikaze auto の起動に失敗した");
 
@@ -303,19 +277,19 @@ fn auto_ignore_gate_overrides_gate_stop_but_gate_alone_stops_without_it() {
 
         let bin_dir = tmp_dir.join("tools").join("bin");
         std::fs::create_dir_all(&bin_dir).expect("bin_dir を作れること");
-        let dtvi_src = dtvi_path();
-        write_executable_script(
+        let dtvi_src = common::dtvi_path();
+        common::write_executable_script(
             &bin_dir.join("dtvindex"),
             &format!(
                 "#!/bin/sh\nprev=\"\"\nfor a in \"$@\"; do\n  if [ \"$prev\" = \"-o\" ]; then\n    cp \"{}\" \"$a\"\n  fi\n  prev=\"$a\"\ndone\nexit 0\n",
                 dtvi_src.display()
             ),
         );
-        write_executable_script(
+        common::write_executable_script(
             &bin_dir.join("chapter_exe"),
             "#!/bin/sh\nprev=\"\"\nfor a in \"$@\"; do\n  if [ \"$prev\" = \"-o\" ]; then\n    printf 'scp placeholder\\n' > \"$a\"\n  fi\n  prev=\"$a\"\ndone\nexit 0\n",
         );
-        write_executable_script(
+        common::write_executable_script(
             &bin_dir.join("join_logo_scp"),
             &format!(
                 "#!/bin/sh\nprev=\"\"\nfor a in \"$@\"; do\n  case \"$prev\" in\n    -o) printf '{}' > \"$a\" ;;\n    -oscp) printf '{}' > \"$a\" ;;\n  esac\n  prev=\"$a\"\ndone\nexit 0\n",
@@ -342,7 +316,7 @@ fn auto_ignore_gate_overrides_gate_stop_but_gate_alone_stops_without_it() {
             .arg(&input)
             .arg("-o")
             .arg(&out_path)
-            .env("PATH", prepend_path(&bin_dir));
+            .env("PATH", common::prepend_path(&bin_dir));
         if ignore_gate {
             cmd.arg("--ignore-gate");
         }
@@ -419,7 +393,7 @@ fn analyze_and_cut_support_dash_for_stdout_and_stdin() {
         .arg(&input)
         .arg("-o")
         .arg("-")
-        .env("PATH", prepend_path(&bin_dir))
+        .env("PATH", common::prepend_path(&bin_dir))
         .output()
         .expect("tachikaze analyze -o - の起動に失敗した");
     assert!(
@@ -444,7 +418,7 @@ fn analyze_and_cut_support_dash_for_stdout_and_stdin() {
         .arg(&input)
         .arg("-o")
         .arg(&explicit_path)
-        .env("PATH", prepend_path(&bin_dir))
+        .env("PATH", common::prepend_path(&bin_dir))
         .output()
         .expect("tachikaze analyze -o PATH の起動に失敗した");
     assert!(
@@ -468,7 +442,7 @@ fn analyze_and_cut_support_dash_for_stdout_and_stdin() {
         .arg("--trim")
         .arg("-")
         .arg("--dtvi")
-        .arg(dtvi_path())
+        .arg(common::dtvi_path())
         .arg("-o")
         .arg(&out_path)
         .stdin(Stdio::piped())

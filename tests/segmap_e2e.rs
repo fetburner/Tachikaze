@@ -16,31 +16,10 @@ use std::process::Command;
 /// `[10,110)` は `[0,120)` へ、`[370,470)` は `[360,480)` へ広がる。
 const TRIM_AVS_CONTENT: &str = "Trim(10,109) ++ Trim(370,469)";
 
-fn dtvi_path() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/sample.dtvi")
-}
-
-fn tools_available() -> bool {
-    for bin in ["ffmpeg", "ffprobe"] {
-        match Command::new(bin).arg("-version").output() {
-            Ok(output) if output.status.success() => {}
-            _ => {
-                eprintln!("{bin} が無いためスキップします。");
-                return false;
-            }
-        }
-    }
-    true
-}
-
+/// `label` に `"segmap-e2e-"` を付けて [`common::make_tmp_dir`] を呼ぶ薄いラッパ
+/// （ディレクトリ名は元と同じ `tachikaze-segmap-e2e-<label>-<pid>`）。
 fn make_tmp_dir(label: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "tachikaze-segmap-e2e-{label}-{}",
-        std::process::id()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("一時ディレクトリを作れること");
-    dir
+    common::make_tmp_dir(&format!("segmap-e2e-{label}"))
 }
 
 /// `path` の映像ストリームの表示順(pts昇順)の `pts`(整数、timebase単位)を取得する。
@@ -178,13 +157,18 @@ fn segment_map_output_start_matches_ffprobe_frame_boundaries() {
     if common::skip_if_fixture_missing() {
         return;
     }
-    if !tools_available() {
+    if !common::tools_available() {
         return;
     }
 
     let cache_root = make_tmp_dir("happy-cache");
-    let (tmp_dir, out_path, segmap_path, output) =
-        run_cut("happy", TRIM_AVS_CONTENT, &dtvi_path(), &cache_root, true);
+    let (tmp_dir, out_path, segmap_path, output) = run_cut(
+        "happy",
+        TRIM_AVS_CONTENT,
+        &common::dtvi_path(),
+        &cache_root,
+        true,
+    );
     let segmap_path = segmap_path.expect("with_segment_map=true のはず");
 
     assert!(
@@ -264,7 +248,7 @@ fn segment_map_is_written_to_default_cache_without_explicit_flag() {
     if common::skip_if_fixture_missing() {
         return;
     }
-    if !tools_available() {
+    if !common::tools_available() {
         return;
     }
 
@@ -272,7 +256,7 @@ fn segment_map_is_written_to_default_cache_without_explicit_flag() {
     let (tmp_dir, _out_path, _segmap_path, output) = run_cut(
         "default-cache-run",
         TRIM_AVS_CONTENT,
-        &dtvi_path(),
+        &common::dtvi_path(),
         &cache_root,
         false,
     );
@@ -327,7 +311,7 @@ fn find_file_recursively(dir: &Path, file_name: &str) -> Option<PathBuf> {
 /// させる必要がある。1個を範囲外の値にすると parse 自体が落ちてしまうため、2行の
 /// sample_number を入れ替える（順列としては妥当なまま、値だけが実際の mp4 と食い違う）。
 fn corrupted_dtvi_content() -> String {
-    let original = std::fs::read_to_string(dtvi_path()).expect("sample.dtvi を読めること");
+    let original = std::fs::read_to_string(common::dtvi_path()).expect("sample.dtvi を読めること");
     let lines: Vec<&str> = original.lines().collect();
     let frames_idx = lines
         .iter()
@@ -365,7 +349,7 @@ fn segment_map_is_not_written_when_self_verification_fails() {
     if common::skip_if_fixture_missing() {
         return;
     }
-    if !tools_available() {
+    if !common::tools_available() {
         return;
     }
 
@@ -419,7 +403,7 @@ fn stale_segment_map_is_removed_after_a_later_failed_cut() {
     if common::skip_if_fixture_missing() {
         return;
     }
-    if !tools_available() {
+    if !common::tools_available() {
         return;
     }
 
@@ -429,7 +413,7 @@ fn stale_segment_map_is_removed_after_a_later_failed_cut() {
     let (tmp_dir1, _out_path1, _segmap_path1, output1) = run_cut(
         "stale-map-first",
         TRIM_AVS_CONTENT,
-        &dtvi_path(),
+        &common::dtvi_path(),
         &cache_root,
         false,
     );
@@ -480,7 +464,7 @@ fn segment_map_with_cm_output_only_covers_kept_side() {
     if common::skip_if_fixture_missing() {
         return;
     }
-    if !tools_available() {
+    if !common::tools_available() {
         return;
     }
 
@@ -504,7 +488,7 @@ fn segment_map_with_cm_output_only_covers_kept_side() {
         .arg("-o")
         .arg(&out_path)
         .arg("--dtvi")
-        .arg(dtvi_path())
+        .arg(common::dtvi_path())
         .arg("--cm-output")
         .arg(&cm_path)
         .arg("--segment-map")
@@ -559,7 +543,7 @@ fn find_all_files_recursively(dir: &Path, suffix: &str) -> Vec<PathBuf> {
 /// フィクスチャ/ツールが無い環境でもテストの意図が読めるようにするプレースホルダ。
 #[test]
 fn segmap_e2e_module_compiles_and_helpers_are_reachable() {
-    let _ = tools_available;
+    let _ = common::tools_available;
     let _ = json_numbers;
     let _ = json_number;
     let _ = json_string;

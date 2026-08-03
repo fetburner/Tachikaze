@@ -16,12 +16,12 @@
 //!    `std::fs::rename` で `output_path` へ移動する。
 //!
 //! ffprobe によるパケット単位 CRC32 の一致確認（`--verify` 指定時、CLAUDE.md の罠2）は
-//! [`verify_with_ffprobe`] / [`cut_verify_and_ffprobe_check`] が担当する（#37）。
+//! [`verify_with_ffprobe`] / [`cut_verify_and_ffprobe_check`] が担当する。
 //! `cut_and_verify` が `output_path` へ rename した**後**に、ffprobe を使って元ファイルと
 //! 出力ファイルのパケットを突き合わせる。映像は `video_keep`（元ファイルのデコード順
 //! `DecodeIdx` 列、出力に含める順そのもの）から期待される CRC32 列を組み立てて1対1で
-//! 比較し（`-ss` によるタイムスタンプベースの抽出より単純で確実）、音声は `#35` と同じ
-//! 集合比較 + dts 単調増加の assert で補う。不一致なら `output_path` を削除する。
+//! 比較し（`-ss` によるタイムスタンプベースの抽出より単純で確実）、音声は集合比較 +
+//! dts 単調増加の assert で補う。不一致なら `output_path` を削除する。
 //!
 //! ## 設計判断1: 検査4は「出力」ではなく「元ファイル」を `.dtvi` と突き合わせる
 //!
@@ -33,9 +33,9 @@
 //! 方法は存在しない。
 //!
 //! 代わりに、cut のこの最終段でも「元ファイルの `SampleInfo` から自前導出した
-//! `DisplayDecodeMap` が `.dtvi` の全行と一致すること」（`#27` の
-//! [`crate::mp4io::order_map::verify_against_dtvi`]）をもう一度確認する
-//! （[`verify_dtvi_consistency`]）。`#27` の検証と論理的には重複するが、cut パイプライン
+//! `DisplayDecodeMap` が `.dtvi` の全行と一致すること」
+//! （[`crate::mp4io::order_map::verify_against_dtvi`]）をもう一度確認する
+//! （[`verify_dtvi_consistency`]）。既存の検証と論理的には重複するが、cut パイプライン
 //! 全体を1箇所で検証する「最後の関門」として、表示順とデコード順の混同（CLAUDE.md の
 //! 罠3、唯一の重大バグ源）を実行時にもう一度確認する意味がある。
 //!
@@ -789,7 +789,7 @@ fn video_packet_crc32_in_decode_order(
     crate::ffprobe::csv_rows(ffprobe_path, path, "v:0", "packet=size,data_hash", true)
 }
 
-/// 音声ストリームの全パケットの CRC32 集合を取得する（`#35` と同じ集合比較のため）。
+/// 音声ストリームの全パケットの CRC32 集合を取得する（集合比較のため）。
 fn audio_packet_crc32_set(ffprobe_path: &Path, path: &Path) -> anyhow::Result<HashSet<String>> {
     Ok(
         crate::ffprobe::csv_rows(ffprobe_path, path, "a:0", "packet=data_hash", true)?
@@ -862,8 +862,8 @@ fn verify_video_packets_with_ffprobe(
     Ok(())
 }
 
-/// 音声: 出力の全パケットが元ファイルのパケット集合に含まれるか（`#35` と同じ集合
-/// 比較）を確認し、加えて出力の音声パケットの dts が単調増加であることを assert する
+/// 音声: 出力の全パケットが元ファイルのパケット集合に含まれるか（集合比較）を確認し、
+/// 加えて出力の音声パケットの dts が単調増加であることを assert する
 /// （集合比較では順序や重複を検出できないため）。
 fn verify_audio_packets_with_ffprobe(
     ffprobe_path: &Path,
@@ -908,7 +908,7 @@ fn verify_audio_packets_with_ffprobe(
 /// - 映像: `video_keep` から期待される CRC32 列を組み立て、出力の実際の CRC32 列と
 ///   1対1で比較する。
 /// - 音声: `has_audio` が真の場合、出力の全パケットが元ファイルのパケット集合に
-///   含まれるか（`#35` と同じ集合比較）、および出力の音声パケットの dts が単調増加で
+///   含まれるか（集合比較）、および出力の音声パケットの dts が単調増加で
 ///   あるかを確認する。
 ///
 /// `ffprobe_path` は呼び出し側が [`crate::tools::resolve_tool`] で解決済みのものを渡す
@@ -1719,7 +1719,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------
-    // ffprobe によるパケット単位 CRC32 の一致確認（#37）。
+    // ffprobe によるパケット単位 CRC32 の一致確認。
     // ---------------------------------------------------------------
 
     /// フィクスチャ/ffmpeg/ffprobe に加え、この一連のテストが必要とする ffprobe を

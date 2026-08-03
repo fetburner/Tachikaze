@@ -235,7 +235,7 @@ mod tests {
     use super::*;
 
     /// フィクスチャ: H.264 (Avc1) + Opus, GOP 120, 30000/1001fps の mp4。
-    /// `tests/fixtures/gen.sh`（issue #15）で生成する。無ければスキップする。
+    /// `tests/fixtures/gen.sh` で生成する。無ければスキップする。
     // cwd 非依存にする（`external::tests` がプロセスの cwd を一時的に変えるため）。
     const FIXTURE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/sample.mp4");
 
@@ -288,7 +288,7 @@ mod tests {
         assert!(find_audio_track(&moov).is_none());
     }
 
-    // --- #43: 音声 Codec 判定の一般化 ---
+    // --- 音声 Codec 判定の一般化 ---
 
     /// サンプルエントリ共通の `Audio` ヘッダ（値は判定に影響しないダミー）。
     fn dummy_audio() -> mp4_atom::Audio {
@@ -314,7 +314,7 @@ mod tests {
 
     /// `mp4-atom` 0.14 が認識する音声系 Codec を 1 つずつ構築して返す。
     ///
-    /// #42 の対象一覧（圧縮 6 種 + 非圧縮/QT 系 10 種）と 1:1 で対応させ、
+    /// 対象一覧（圧縮 6 種 + 非圧縮/QT 系 10 種）と 1:1 で対応させ、
     /// 一覧の増減にテストが追従するようにしている。
     fn all_audio_codecs() -> Vec<Codec> {
         use mp4_atom::esds::{DecoderConfig, DecoderSpecific, EsDescriptor, SLConfig};
@@ -470,7 +470,7 @@ mod tests {
         assert!(find_audio_track(&moov).is_some());
     }
 
-    // --- #26: サンプル表の復元 ---
+    // --- サンプル表の復元 ---
 
     fn skip_if_ffprobe_missing() -> bool {
         match std::process::Command::new("ffprobe")

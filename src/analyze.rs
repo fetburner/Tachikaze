@@ -159,9 +159,7 @@ fn run_pipeline(
     }
 
     let jl_file = match &config.jl_file {
-        Some(path) => {
-            fs::canonicalize(path).path_ctx("JL コマンドファイルの絶対パス解決", path)?
-        }
+        Some(path) => fs::canonicalize(path).path_ctx("JL コマンドファイルの絶対パス解決", path)?,
         None => tools::default_jl_command_file(join_logo_scp_path)?,
     };
 
@@ -183,8 +181,10 @@ fn run_pipeline(
     // work 内の trim.avs を先に読む。`-o` が work の trim.avs と同じ
     // パスだと `fs::copy(src, src)` が空ファイルを生む（macOS で実測。前回の
     // 手動実行で hit した）。同一パスならコピーを省略する。
-    let output_content = fs::read_to_string(&trim_avs_path)
-        .path_ctx("join_logo_scp が生成した trim.avs の読み込み", &trim_avs_path)?;
+    let output_content = fs::read_to_string(&trim_avs_path).path_ctx(
+        "join_logo_scp が生成した trim.avs の読み込み",
+        &trim_avs_path,
+    )?;
     let trim = TrimList::parse(&output_content)
         .map_err(|err| anyhow!("生成された trim.avs のパースに失敗しました: {err}"))?;
 
@@ -199,8 +199,10 @@ fn run_pipeline(
     let dtvi = dtvi::parse(&dtvi_content)
         .map_err(|err| anyhow!("生成された .dtvi のパースに失敗しました: {err}"))?;
 
-    let jls_content = fs::read_to_string(&detail_jls_path)
-        .path_ctx("join_logo_scp が生成した detail.jls の読み込み", &detail_jls_path)?;
+    let jls_content = fs::read_to_string(&detail_jls_path).path_ctx(
+        "join_logo_scp が生成した detail.jls の読み込み",
+        &detail_jls_path,
+    )?;
     let jls_entries = jls::parse(&jls_content)
         .map_err(|err| anyhow!("生成された detail.jls のパースに失敗しました: {err}"))?;
 
@@ -285,8 +287,8 @@ mod tests {
     // `PATH` を書き換えるロックは `tools::tests` と共有する（`resolve_tool` が
     // `PATH` しか見ないため、ツール解決の成功/失敗を作り分けるには `PATH` の
     // 書き換えが唯一の手段になった。`crate::tools::test_support` の doc
-    // comment参照）。E12-2 でキャッシュの根は `--cache-dir`（引数）に一本化した
-    // ため、このモジュールはキャッシュ関連の環境変数を一切読み書きしない
+    // comment参照）。キャッシュの根は `--cache-dir`（引数）に一本化したため、
+    // このモジュールはキャッシュ関連の環境変数を一切読み書きしない
     // （`workdir::test_support` は削除済み）。
     use crate::tools::test_support::{
         EnvVarGuard as ToolPathEnvGuard, ENV_LOCK as TOOL_PATH_ENV_LOCK,
@@ -543,7 +545,7 @@ mod tests {
 
     #[test]
     fn run_writes_trim_avs_to_cache_and_optionally_to_explicit_path() {
-        // 完了条件(issue #72): `-o` 省略時（`output: None`）はキャッシュにだけ書き、
+        // 完了条件: `-o` 省略時（`output: None`）はキャッシュにだけ書き、
         // `AnalyzeOutput::cache_trim_path` でその場所が分かる。`output: Some(path)`
         // 指定時は従来どおりそのパスにも書く。どちらでも `raw_trim` は
         // join_logo_scp が書いた内容と一致する（CLI の `-o -` がこれをそのまま

@@ -428,16 +428,6 @@ mod pure_logic_tests {
 
 // --- ffprobe ラッパ（実行には ffprobe が必要） ---
 
-fn skip_if_missing(bin: &str) -> bool {
-    match Command::new(bin).arg("-version").output() {
-        Ok(output) if output.status.success() => false,
-        _ => {
-            eprintln!("{bin} が無いためスキップします。");
-            true
-        }
-    }
-}
-
 /// 音声ストリームの全パケットの CRC32 集合を ffprobe で取得する。
 fn ffprobe_audio_crc_set(path: &Path) -> HashSet<String> {
     tachikaze::ffprobe::csv_rows(Path::new("ffprobe"), path, "a:0", "packet=data_hash", true)
@@ -589,7 +579,7 @@ fn ffprobe_scalar_stream_entry(path: &Path, stream_selector: &str, entry: &str) 
 /// 自動でスキップする。`tests/fixtures/gen.sh` を参照）。
 #[test]
 fn ffprobe_wrapper_round_trips_on_real_fixture() {
-    if common::skip_if_fixture_missing() || skip_if_missing("ffprobe") {
+    if common::skip_if_fixture_missing() || common::skip_if_missing("ffprobe") {
         return;
     }
 
@@ -648,12 +638,6 @@ const SNAPPED_FRAMES_PER_SEGMENT: [u64; 2] = [120, 120];
 /// インデックスであり、`ffprobe_video_pts` の同じ添字でそのままソース時刻が引ける。
 const SNAPPED_START_DISPLAY_FRAMES: [usize; 2] = [0, 360];
 
-/// `cut` に渡す `.dtvi`。実 `dtvindex` 出力の抜粋（`src/mp4io/order_map.rs` の
-/// テストが同じものをフィクスチャとの全行一致検証に使っている）。
-fn dtvi_path() -> std::path::PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/sample.dtvi")
-}
-
 /// 指定したフィクスチャに対して `tachikaze cut` を実行し、
 /// `(一時ディレクトリ, 出力パス)` を返す。
 fn run_cut_with_fixture(fixture: &Path, label: &str) -> (std::path::PathBuf, std::path::PathBuf) {
@@ -674,7 +658,7 @@ fn run_cut_with_fixture(fixture: &Path, label: &str) -> (std::path::PathBuf, std
         .arg("-o")
         .arg(&out_path)
         .arg("--dtvi")
-        .arg(dtvi_path())
+        .arg(common::dtvi_path())
         .arg("--verify")
         .output()
         .expect("tachikaze cut の起動に失敗した");
@@ -770,7 +754,9 @@ fn expected_video_segments(fixture: &Path) -> (Vec<u64>, Vec<u64>, u32) {
 #[test]
 #[ignore = "tests/fixtures/sample.mp4 と ffmpeg/ffprobe が必要。tests/fixtures/gen.sh を先に実行すること"]
 fn cut_audio_is_bitwise_copy_and_matches_expected_count() {
-    if common::skip_if_fixture_missing() || skip_if_missing("ffmpeg") || skip_if_missing("ffprobe")
+    if common::skip_if_fixture_missing()
+        || common::skip_if_missing("ffmpeg")
+        || common::skip_if_missing("ffprobe")
     {
         return;
     }
@@ -844,7 +830,9 @@ fn cut_audio_is_bitwise_copy_and_matches_expected_count() {
 #[test]
 #[ignore = "tests/fixtures/sample.mp4 と ffmpeg/ffprobe が必要。tests/fixtures/gen.sh を先に実行すること"]
 fn cut_audio_segments_start_from_correct_source_position() {
-    if common::skip_if_fixture_missing() || skip_if_missing("ffmpeg") || skip_if_missing("ffprobe")
+    if common::skip_if_fixture_missing()
+        || common::skip_if_missing("ffmpeg")
+        || common::skip_if_missing("ffprobe")
     {
         return;
     }
@@ -931,7 +919,9 @@ fn cut_audio_segments_start_from_correct_source_position() {
 #[test]
 #[ignore = "tests/fixtures/sample.mp4 と ffmpeg/ffprobe が必要。tests/fixtures/gen.sh を先に実行すること"]
 fn output_video_and_audio_first_packet_stay_in_av_sync_with_source() {
-    if common::skip_if_fixture_missing() || skip_if_missing("ffmpeg") || skip_if_missing("ffprobe")
+    if common::skip_if_fixture_missing()
+        || common::skip_if_missing("ffmpeg")
+        || common::skip_if_missing("ffprobe")
     {
         return;
     }
@@ -1017,8 +1007,8 @@ fn output_video_and_audio_first_packet_stay_in_av_sync_with_source() {
 fn aac_cut_is_bitwise_copy_and_preserves_segment_positions_and_av_sync() {
     let fixture = common::aac_fixture_path();
     if common::skip_if_fixture_missing_at(&fixture)
-        || skip_if_missing("ffmpeg")
-        || skip_if_missing("ffprobe")
+        || common::skip_if_missing("ffmpeg")
+        || common::skip_if_missing("ffprobe")
     {
         return;
     }
@@ -1119,8 +1109,8 @@ fn aac_cut_is_bitwise_copy_and_preserves_segment_positions_and_av_sync() {
 fn flac_cut_smoke_is_bitwise_copy() {
     let fixture = common::fixture_path_named("sample_flac.mp4");
     if common::skip_if_fixture_missing_at(&fixture)
-        || skip_if_missing("ffmpeg")
-        || skip_if_missing("ffprobe")
+        || common::skip_if_missing("ffmpeg")
+        || common::skip_if_missing("ffprobe")
     {
         return;
     }
@@ -1157,7 +1147,9 @@ fn flac_cut_smoke_is_bitwise_copy() {
 #[test]
 #[ignore = "tests/fixtures/sample.mp4 と ffmpeg/ffprobe が必要。tests/fixtures/gen.sh を先に実行すること"]
 fn corrupted_audio_packet_is_detected_by_set_comparison() {
-    if common::skip_if_fixture_missing() || skip_if_missing("ffmpeg") || skip_if_missing("ffprobe")
+    if common::skip_if_fixture_missing()
+        || common::skip_if_missing("ffmpeg")
+        || common::skip_if_missing("ffprobe")
     {
         return;
     }

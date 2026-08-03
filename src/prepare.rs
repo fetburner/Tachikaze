@@ -2,13 +2,10 @@
 //!
 //! `cut` は elst 付き入力と字幕トラック付き入力を明示エラーで拒否する
 //! (`mp4io::support::check_no_edit_list` / `check_track_counts`、#41 の調査結果。
-//! この方針は変えない)。回避策の前処理はこれまで `scripts/tachikaze-cmcut` の
-//! `prepare_input`(bash + python3)にあったが、字幕は抽出されずに `-map` 省略の
-//! 既定選択で1本引き継がれ、結局 `check_track_counts` に弾かれていた。`auto`
-//! (#62、実装済み、`src/auto.rs`)とラッパーが別々に前処理を持つと elst の扱いと
+//! この方針は変えない)。`auto`(`src/auto.rs`)と前処理を別々に持つと elst の扱いと
 //! 字幕の抽出元が必ずずれるため、同じコードをここ1か所に置く。
 //!
-//! # 複数トラックの扱い(レビュー指摘: 黙って1本目だけを残さない)
+//! # 複数トラックの扱い(黙って1本目だけを残さない)
 //!
 //! `run()` が実際に ffmpeg へ渡すコマンドは `-map 0:v:0 -map 0:a:0` 固定であり、
 //! 映像2本以上・音声2本以上の入力(二重音声放送など)でも黙って1本目だけを
@@ -499,7 +496,7 @@ mod tests {
         assert_eq!(inspection.subtitle_track_count, 0);
     }
 
-    // --- レビュー指摘#1: 複数トラックを黙って1本目だけ残さない ---
+    // --- 複数トラックを黙って1本目だけ残さない ---
 
     #[test]
     fn reject_multiple_video_or_audio_tracks_accepts_single_video_and_audio() {

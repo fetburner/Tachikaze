@@ -67,19 +67,6 @@ use trim::TrimList;
 /// 「比較対象を作るための ffmpeg -ss」の精度を上げるためだけに使う。
 const SEEK_EPSILON_SECS: f64 = 0.005;
 
-fn tools_available() -> bool {
-    for bin in ["ffmpeg", "ffprobe"] {
-        match Command::new(bin).arg("-version").output() {
-            Ok(output) if output.status.success() => {}
-            _ => {
-                eprintln!("{bin} が無いためスキップします。");
-                return false;
-            }
-        }
-    }
-    true
-}
-
 /// `path` の映像ストリームのパケット CRC32 一覧をファイル(=デコード)順に取得する。
 ///
 /// CLAUDE.md の罠2 / docs/lossless-cut.md「無劣化の検証に md5 を使ってはいけない」節:
@@ -272,7 +259,7 @@ fn video_only_cut_matches_source_packets_by_crc32() {
     if common::skip_if_fixture_missing() {
         return;
     }
-    if !tools_available() {
+    if !common::tools_available() {
         return;
     }
 
@@ -439,7 +426,7 @@ fn video_only_cut_matches_source_packets_by_crc32() {
 #[test]
 fn video_e2e_module_compiles_and_helpers_are_reachable() {
     // ヘルパ関数・型が到達可能であることのコンパイル時チェックを兼ねる。
-    let _ = tools_available;
+    let _ = common::tools_available;
     let _ = video_packet_crc32;
     let _ = video_packet_pts_time_and_flags;
     let _ = frame_pts_in_display_order;
@@ -466,19 +453,10 @@ fn video_e2e_module_compiles_and_helpers_are_reachable() {
 const CM_OUTPUT_TRIM_AVS_CONTENT: &str = "Trim(10,109) ++ Trim(370,469)";
 
 /// `cut` に渡す `.dtvi`（`tests/audio_e2e.rs::dtvi_path` と同じファイル）。
-fn cm_output_dtvi_path() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/sample.dtvi")
-}
-
-/// `label` ごとに独立した一時ディレクトリを作る。
+/// `label` に `"video-e2e-cm-"` を付けて [`common::make_tmp_dir`] を呼ぶ薄いラッパ
+/// （ディレクトリ名は元と同じ `tachikaze-video-e2e-cm-<label>-<pid>`）。
 fn make_cm_output_tmp_dir(label: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "tachikaze-video-e2e-cm-{label}-{}",
-        std::process::id()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("一時ディレクトリを作れること");
-    dir
+    common::make_tmp_dir(&format!("video-e2e-cm-{label}"))
 }
 
 /// フィクスチャに対して `tachikaze cut --cm-output` を実行する。
@@ -505,7 +483,7 @@ fn run_cut_with_cm_output(
         .arg("-o")
         .arg(&out_path)
         .arg("--dtvi")
-        .arg(cm_output_dtvi_path())
+        .arg(common::dtvi_path())
         .arg("--snap")
         .arg(snap)
         .arg("--cm-output")
@@ -526,7 +504,7 @@ fn cm_output_packet_counts_sum_to_input_total_and_sets_are_disjoint() {
     if common::skip_if_fixture_missing() {
         return;
     }
-    if !tools_available() {
+    if !common::tools_available() {
         return;
     }
 
@@ -597,7 +575,7 @@ fn snap_inward_with_cm_output_is_rejected() {
     if common::skip_if_fixture_missing() {
         return;
     }
-    if !tools_available() {
+    if !common::tools_available() {
         return;
     }
 
