@@ -46,6 +46,9 @@ pub enum Commands {
     /// `trim.avs` のパスと「直して `cut` する」コマンド例を表示する（`--force` で
     /// 無視できるが、無視できるのは gate の判定だけで、自己検証や `.dtvi` 必須は
     /// 変わらない）。exit code は 0=完了 / 1=エラー / 2=判定で停止 の3種類のみ。
+    /// 1プロセスにつき入力は1本（複数ファイルはシェルのループに任せる）。
+    #[command(after_help = "複数ファイルを処理するときはシェルでループする:\n\
+        \n    for f in *.mp4; do tachikaze auto \"$f\"; done\n")]
     Auto(AutoArgs),
 }
 
@@ -152,18 +155,16 @@ pub struct RemapSubsArgs {
 /// `auto` サブコマンドの引数。
 #[derive(Debug, Args)]
 pub struct AutoArgs {
-    /// 処理する入力 mp4。複数指定するとバッチ処理になり、その場合
-    /// `-o` / `--cm-output` は指定できない（各入力の隣に既定の名前で出力する。
-    /// `--cache-dir` はキャッシュの根なので複数入力でも共通のまま使える。
-    /// 入力ごとのサブディレクトリは常にハッシュから決まる）。
-    pub inputs: Vec<PathBuf>,
+    /// 処理する入力 mp4。1プロセスにつき1本
+    /// （複数ファイルを回すときはシェルのループに任せる、`--help` の使用例参照）。
+    pub input: PathBuf,
 
-    /// 本編の出力先。既定は入力の隣の `<stem>_CMcut.mp4`。複数入力時は指定できない。
+    /// 本編の出力先。既定は入力の隣の `<stem>_CMcut.mp4`。
     #[arg(short, long)]
     pub output: Option<PathBuf>,
 
     /// CM 側（保持区間の補集合）の出力先。既定は入力の隣の `<stem>_CM.mp4`。
-    /// `--no-cm` とは併用できない。複数入力時は指定できない。
+    /// `--no-cm` とは併用できない。
     #[arg(long = "cm-output")]
     pub cm_output: Option<PathBuf>,
 
@@ -177,8 +178,8 @@ pub struct AutoArgs {
     pub force: bool,
 
     /// 既存の出力（本編・CM側・字幕サイドカーのいずれか）があっても上書きする。
-    /// 未指定では、既存の出力があるファイルはそのバッチ実行をスキップする
-    /// （バッチの再実行で成果物を黙って潰さないため）。
+    /// 未指定では、既存の出力があるファイルはその実行をスキップする
+    /// （再実行で成果物を黙って潰さないため）。
     #[arg(long)]
     pub overwrite: bool,
 

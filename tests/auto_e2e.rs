@@ -24,8 +24,8 @@
 //!    `auto` はそれらの関数（`prepare::run` / `subtitle::remap_ass` /
 //!    `subtitle::remap_srt`）をそのまま呼ぶだけなので重複しては確認しない。
 //! 2. **`analyze` に到達する前/到達した直後の配線ロジックを、外部ツール無しで
-//!    確認するテスト**（複数入力の隔離・`--overwrite`・静的な引数検証・
-//!    exit code）。`analyze` 自体は `dtvindex` が無いため必ず失敗するが、
+//!    確認するテスト**（`--overwrite`・静的な引数検証・exit code）。
+//!    `analyze` 自体は `dtvindex` が無いため必ず失敗するが、
 //!    それは想定どおりの「失敗」として exit code 1 に現れることを確認する
 //!    （gate 停止＝exit code 2 に実際に到達する経路は 1 のテストが担う）。
 
@@ -241,8 +241,8 @@ fn auto_completes_full_pipeline_with_fake_tools() {
     );
     assert_eq!(output.status.code(), Some(0), "exit code は 0 のはず");
     assert!(
-        stdout.contains("完了 1 / 判定で停止 0 / 失敗 0 / 既存出力のためスキップ 0（計 1 件）"),
-        "内訳の表示が期待どおりでない: {stdout}"
+        stdout.contains("[auto] 完了:"),
+        "完了の表示が期待どおりでない: {stdout}"
     );
 
     let out_path = tmp_dir.join("IN_CMcut.mp4");
@@ -359,8 +359,8 @@ fn auto_force_overrides_gate_stop_but_gate_alone_stops_without_it() {
                 "gate が止めた場合は exit code 2 のはず: stdout={stdout}"
             );
             assert!(
-                stdout.contains("判定で停止"),
-                "内訳に判定停止が出ていない: {stdout}"
+                stdout.contains("gate が疑わしいと判定したため、cut を実行せず停止します"),
+                "gate 停止の旨が出ていない: {stdout}"
             );
             assert!(
                 stdout.contains("tachikaze cut"),
@@ -378,7 +378,7 @@ fn auto_force_overrides_gate_stop_but_gate_alone_stops_without_it() {
 
 // ---------------------------------------------------------------------
 // 2. 外部ツール無しで確認できる配線ロジック（静的な引数検証・スキップ・
-//    バッチの失敗隔離・exit code 1）
+//    exit code 1）
 // ---------------------------------------------------------------------
 
 fn run_auto(args: &[&str], cache_root: &Path) -> std::process::Output {
@@ -415,20 +415,19 @@ fn run_auto_without_tools(args: &[&str], cache_root: &Path) -> std::process::Out
         .expect("tachikaze auto の起動に失敗した")
 }
 
-/// 完了条件: 複数入力時に `-o` を受け付けない（`--cm-output` も同じ検証ロジックを
-/// 通るので代表して1つだけ個別のテストにする。`src/auto.rs` の単体テストで
-/// 網羅済み。`--cache-dir` はキャッシュの根だけを指すため複数入力でも拒否しない
-/// ことも同じテストで確認している）。
+/// 完了条件: `auto` は1入力しか取らないため、複数のファイルを渡すと clap の
+/// usage error（exit code 2）になる（issue #70「1本1プロセス」。繰り返しは
+/// シェルのループに任せる）。
 #[test]
-fn auto_rejects_multiple_inputs_with_explicit_output() {
-    let tmp_dir = make_tmp_dir("reject-multi-output");
-    let output = run_auto(
-        &["-o", "out.mp4", "/no/such/a.mp4", "/no/such/b.mp4"],
-        &tmp_dir,
-    );
-    assert_eq!(output.status.code(), Some(1));
+fn auto_rejects_multiple_inputs_as_usage_error() {
+    let tmp_dir = make_tmp_dir("reject-multi-input");
+    let output = run_auto(&["/no/such/a.mp4", "/no/such/b.mp4"], &tmp_dir);
+    assert_eq!(output.status.code(), Some(2), "clap の usage error のはず");
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("-o"), "stderr={stderr}");
+    assert!(
+        stderr.contains("unexpected argument"),
+        "clap の usage error であることを確認する: stderr={stderr}"
+    );
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }
 
@@ -448,8 +447,7 @@ fn auto_rejects_snap_inward_with_default_cm_output() {
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }
 
-/// 完了条件: 1本の入力が無ければエラーとして exit code 1 になり、内訳にも
-/// 「失敗 1」と出る。
+/// 完了条件: 1本の入力が無ければエラーとして exit code 1 になる。
 #[test]
 fn auto_fails_for_missing_input_with_exit_code_1() {
     let tmp_dir = make_tmp_dir("missing-input");
@@ -461,14 +459,13 @@ fn auto_fails_for_missing_input_with_exit_code_1() {
         Some(1),
         "stdout={stdout}\nstderr={stderr}"
     );
-    assert!(stdout.contains("失敗 1"), "stdout={stdout}");
     assert!(stderr.contains("入力がありません"), "stderr={stderr}");
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }
 
 /// 完了条件: 既存の出力（本編）があるときは既定でスキップし、exit code は 0
 /// （スキップは失敗でも判定停止でもない、`src/auto.rs` の doc comment参照）。
-/// 罠: バッチの再実行で成果物を黙って潰さない — 既存ファイルの中身が変わって
+/// 罠: 再実行で成果物を黙って潰さない — 既存ファイルの中身が変わって
 /// いないことも確認する。
 #[test]
 fn auto_skips_existing_output_without_overwrite() {
@@ -491,10 +488,6 @@ fn auto_skips_existing_output_without_overwrite() {
     );
     assert_eq!(output.status.code(), Some(0));
     assert!(stdout.contains("既存の出力があるためスキップ"), "{stdout}");
-    assert!(
-        stdout.contains("完了 0 / 判定で停止 0 / 失敗 0 / 既存出力のためスキップ 1（計 1 件）"),
-        "{stdout}"
-    );
     assert_eq!(
         std::fs::read(&existing_out).expect("既存出力を読めること"),
         b"stale placeholder",
@@ -538,49 +531,12 @@ fn auto_overwrite_bypasses_skip_and_reaches_analyze() {
         "--overwrite 指定時はスキップしないはず: {stdout}"
     );
     assert!(
-        stdout.contains("失敗 1 / 既存出力のためスキップ 0（計 1 件）"),
-        "内訳のスキップ件数は0のはず: {stdout}"
-    );
-    assert!(
         stdout.contains("[auto] prepare"),
         "--overwrite 指定時は prepare まで進むはず: {stdout}"
     );
     assert!(
         stderr.contains("analyze に失敗しました") || stdout.contains("analyze に失敗しました"),
         "analyze で失敗した旨が出ていない: stdout={stdout}\nstderr={stderr}"
-    );
-
-    let _ = std::fs::remove_dir_all(&tmp_dir);
-}
-
-/// 完了条件: 複数入力で1本が失敗しても残りが処理され、最後に内訳が出る
-/// （1本の失敗で `die` する `scripts/tachikaze-cmcut` と異なる挙動）。
-/// ここでは「存在しない入力(失敗)」と「既存出力ありの入力(スキップ)」を
-/// 組み合わせ、どちらも `dtvindex` を必要としない経路で確認する。
-#[test]
-fn auto_batch_isolates_failures_and_reports_tally() {
-    if common::skip_if_fixture_missing() {
-        return;
-    }
-
-    let tmp_dir = make_tmp_dir("batch-isolation");
-    let missing_input = tmp_dir.join("MISSING.mp4");
-    let ok_input = tmp_dir.join("OK.mp4");
-    std::fs::copy(common::fixture_path(), &ok_input).expect("フィクスチャをコピーできること");
-    std::fs::write(tmp_dir.join("OK_CMcut.mp4"), b"stale").expect("既存出力を書けること");
-
-    let output = run_auto(
-        &[missing_input.to_str().unwrap(), ok_input.to_str().unwrap()],
-        &tmp_dir.join("cache"),
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-
-    // 失敗が1本でもあるので exit code は 1（`ExitOutcome` の優先順位、
-    // `commands::exit_outcome_for_tally` の doc comment参照）。
-    assert_eq!(output.status.code(), Some(1), "stdout={stdout}");
-    assert!(
-        stdout.contains("完了 0 / 判定で停止 0 / 失敗 1 / 既存出力のためスキップ 1（計 2 件）"),
-        "内訳が期待どおりでない: {stdout}"
     );
 
     let _ = std::fs::remove_dir_all(&tmp_dir);
