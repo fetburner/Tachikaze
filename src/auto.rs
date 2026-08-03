@@ -112,6 +112,17 @@ pub enum InputStatus {
 /// 始める前に検出してすぐ `Err` を返す（重い処理が走ってから初めて設定ミスが
 /// 分かる事態を避ける）。
 pub fn run(config: &AutoConfig, input: &Path) -> anyhow::Result<InputStatus> {
+    // mp4 は seek が要るため標準出力には出せない（`commands::reject_dash_output`
+    // の doc comment参照）。`execute_cut` も同じ検証をするが、`prepare`/`analyze`
+    // という重い処理が走ってから初めて設定ミスが分かる事態を避けるため、ここでも
+    // 事前に検証する。
+    if let Some(path) = &config.output {
+        commands::reject_dash_output(path, "-o/--output")?;
+    }
+    if let Some(path) = &config.cm_output {
+        commands::reject_dash_output(path, "--cm-output")?;
+    }
+
     anyhow::ensure!(
         !(config.no_cm && config.cm_output.is_some()),
         "--no-cm と --cm-output は併用できません"
@@ -195,13 +206,13 @@ fn process_one(
         !config.no_subtitles && subs_existing.is_empty() && input_has_subtitle_track(input);
 
     if subs_missing_but_expected {
-        println!(
+        eprintln!(
             "[auto] 本編/CM側の出力はありますが、字幕サイドカーが見つかりません\
              （前回 remap-subs が失敗した可能性があります）。スキップせず再試行します: {}",
             input.display()
         );
     } else if !existing.is_empty() && !config.overwrite {
-        println!(
+        eprintln!(
             "[auto] 既存の出力があるためスキップします（--overwrite で上書き）: {}",
             existing
                 .iter()
@@ -214,18 +225,18 @@ fn process_one(
 
     // 1. prepare（elst 除去・字幕抽出。#58）。`auto` は外部字幕（--subs 相当）を
     // 受け付けない（issue #62 の CLI 一覧に無い）ため常に `None`。
-    println!("[auto] prepare: {}", input.display());
+    eprintln!("[auto] prepare: {}", input.display());
     let prepare_outcome = prepare::run(input, config.cache_dir.as_deref(), None)
         .with_context(|| format!("prepare に失敗しました: {}", input.display()))?;
     let media_path = prepare_outcome.media_path.clone();
     if prepare_outcome.ran_ffmpeg {
-        println!(
+        eprintln!(
             "[auto] prepare 完了（elst除去={}）: {}",
             prepare_outcome.had_edit_list,
             media_path.display()
         );
     } else {
-        println!("[auto] prepare 不要: 入力をそのまま使います");
+        eprintln!("[auto] prepare 不要: 入力をそのまま使います");
     }
 
     // 中間ファイル（.dtvi / trim.avs）の置き場所を、analyze を呼ぶ前に確定させる。
@@ -241,21 +252,25 @@ fn process_one(
                 media_path.display()
             )
         })?;
-    let trim_path = work_probe.trim_path();
     let dtvi_path = work_probe.dtvi_path();
 
     // 2. analyze（キャッシュを短絡せず必ず呼ぶ。本モジュール冒頭の doc comment参照）。
+    // `output: None`（キャッシュにだけ書く）: 以降で使う trim.avs のパスは
+    // `work_probe.trim_path()` を先読みするのではなく、`analyze::run` が返す
+    // `AnalyzeOutput::cache_trim_path` を使う（実際に書いた場所を返り値から
+    // 直接受け取ることで、パス導出が食い違う可能性を構造的に排除する）。
     let analyze_config = analyze::AnalyzeConfig {
         input: media_path.clone(),
-        output: trim_path.clone(),
+        output: None,
         cache_dir: config.cache_dir.clone(),
         jls_set: jls_set.to_vec(),
         jl_file: config.jl_file.clone(),
     };
-    println!("[auto] analyze: {}", media_path.display());
+    eprintln!("[auto] analyze: {}", media_path.display());
     let analyze_output = analyze::run(&analyze_config)
         .with_context(|| format!("analyze に失敗しました: {}", media_path.display()))?;
-    println!("trim.avs を書き出しました: {}", trim_path.display());
+    let trim_path = analyze_output.cache_trim_path.clone();
+    eprintln!("trim.avs を書き出しました: {}", trim_path.display());
 
     // 3. gate 判定（#61）。`analyze --report` と同じ情報を表示する
     // （gate.rs の doc comment「auto を使わない人間も同じ情報を見られるよう」）。
@@ -263,9 +278,9 @@ fn process_one(
     let missed =
         report::missed::find_missed_candidates(&analyze_output.trim, &analyze_output.jls_entries);
     if !missed.is_empty() {
-        println!("見逃し候補の警告:");
+        eprintln!("見逃し候補の警告:");
         for candidate in &missed {
-            println!("{}", report::missed::format_warning(candidate, fps));
+            eprintln!("{}", report::missed::format_warning(candidate, fps));
         }
     }
     let verdict = gate::evaluate(
@@ -273,7 +288,7 @@ fn process_one(
         &analyze_output.jls_entries,
         &analyze_output.dtvi,
     );
-    println!("{}", gate::format_gate_report(&verdict));
+    eprintln!("{}", gate::format_gate_report(&verdict));
 
     let cut_hint = || {
         let cm_flag = cm_out_path
@@ -290,13 +305,13 @@ fn process_one(
     };
 
     if config.analyze_only {
-        println!(
+        eprintln!(
             "[auto] --analyze-only のため、ここで停止します（cut / remap-subs は実行しません）。"
         );
-        println!("  trim: {}", trim_path.display());
-        println!("  dtvi: {}", dtvi_path.display());
-        println!("  続きは次のコマンドで cut できます:");
-        println!("    {}", cut_hint());
+        eprintln!("  trim: {}", trim_path.display());
+        eprintln!("  dtvi: {}", dtvi_path.display());
+        eprintln!("  続きは次のコマンドで cut できます:");
+        eprintln!("    {}", cut_hint());
         return Ok(if verdict.stop {
             InputStatus::GateStopped
         } else {
@@ -306,21 +321,21 @@ fn process_one(
 
     if verdict.stop {
         if config.force {
-            println!("[auto] --force が指定されているため、gate の停止判定を無視して続行します。");
+            eprintln!("[auto] --force が指定されているため、gate の停止判定を無視して続行します。");
         } else {
-            println!("[auto] gate が疑わしいと判定したため、cut を実行せず停止します。");
-            println!("  trim: {}", trim_path.display());
-            println!(
+            eprintln!("[auto] gate が疑わしいと判定したため、cut を実行せず停止します。");
+            eprintln!("  trim: {}", trim_path.display());
+            eprintln!(
                 "  内容を確認し、必要なら trim.avs を直してから次のコマンドで cut してください:"
             );
-            println!("    {}", cut_hint());
+            eprintln!("    {}", cut_hint());
             return Ok(InputStatus::GateStopped);
         }
     }
 
     // 4. cut（区間マップ込み、#57）。`commands::execute_cut` をそのまま呼ぶ
     // （本モジュール冒頭の doc comment「cut のロジックを複製しない」）。
-    println!(
+    eprintln!(
         "[auto] cut: {} -> {}",
         media_path.display(),
         out_path.display()
@@ -353,7 +368,7 @@ fn process_one(
     // （issue #62「やること」7: 本編だけ出して字幕を黙って落とさない）。
     // `--no-subtitles` のときは抽出済みの字幕サイドカーがあっても張り替えない。
     if config.no_subtitles {
-        println!("[auto] --no-subtitles のため字幕の張り替えは行いません。");
+        eprintln!("[auto] --no-subtitles のため字幕の張り替えは行いません。");
     } else if let Some(subs_input) = &prepare_outcome.subtitle_path {
         if let Err(err) =
             remap_subtitles(config.cache_dir.as_deref(), &media_path, subs_input, input)
@@ -373,19 +388,19 @@ fn process_one(
                 .with_context(|| format!("字幕の張り替えに失敗しました: {}", input.display()));
         }
     } else {
-        println!("[auto] 字幕トラックが無いため remap-subs は行いません。");
+        eprintln!("[auto] 字幕トラックが無いため remap-subs は行いません。");
     }
 
     log_disk_usage(&prepare_outcome, &out_path, cm_out_path.as_deref());
 
-    println!("[auto] 完了: {}", out_path.display());
+    eprintln!("[auto] 完了: {}", out_path.display());
     if let Some(cm) = &cm_out_path {
-        println!(
+        eprintln!(
             "[auto] CM側: {}（本編が混ざっていないか目視推奨）",
             cm.display()
         );
     }
-    println!(
+    eprintln!(
         "[auto] 注意: gate が止めなかったことは検出が完全に当たっている保証ではありません \
          （見逃し候補ヒューリスティックの限界、gate.rs の doc comment参照）。"
     );
@@ -451,7 +466,7 @@ fn remap_subtitles(
         .with_context(|| format!("字幕の書き出しに失敗しました: {}", subs_out.display()))?;
 
     let stats = &remap_output.stats;
-    println!(
+    eprintln!(
         "[auto] remap-subs 完了: {}（シフト {} 件 / 破棄 {} 件 / クリップ {} 件）",
         subs_out.display(),
         stats.shifted,
@@ -501,7 +516,7 @@ fn log_disk_usage(
     out_path: &Path,
     cm_out_path: Option<&Path>,
 ) {
-    println!("[auto] ディスク使用量:");
+    eprintln!("[auto] ディスク使用量:");
     if prepare_outcome.ran_ffmpeg {
         log_file_size(
             "  prepare 済み中間物（キャッシュ、自動削除しません）",
@@ -518,9 +533,9 @@ fn log_file_size(label: &str, path: &Path) {
     match fs::metadata(path) {
         Ok(meta) => {
             let mb = meta.len() as f64 / 1_048_576.0;
-            println!("{label}: {} ({mb:.1} MB)", path.display());
+            eprintln!("{label}: {} ({mb:.1} MB)", path.display());
         }
-        Err(err) => println!("{label}: {} (サイズ取得失敗: {err})", path.display()),
+        Err(err) => eprintln!("{label}: {} (サイズ取得失敗: {err})", path.display()),
     }
 }
 

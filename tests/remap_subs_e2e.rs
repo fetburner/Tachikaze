@@ -274,12 +274,12 @@ Dialogue: 0,{},{},Default,,0,0,0,,clip (tail boundary)\r\n",
         "tachikaze remap-subs が失敗した: stderr={}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stdout.contains("シフト 2 件")
-            && stdout.contains("破棄 1 件")
-            && stdout.contains("クリップ 1 件"),
-        "件数のログが出ているはず: {stdout}"
+        stderr.contains("シフト 2 件")
+            && stderr.contains("破棄 1 件")
+            && stderr.contains("クリップ 1 件"),
+        "件数のログが出ているはず: {stderr}"
     );
 
     let result = std::fs::read_to_string(&out_ass_path).expect("結果を読めること");
@@ -411,12 +411,12 @@ fn remap_subs_srt_matches_ass_result_for_same_events() {
         "tachikaze remap-subs (SRT) が失敗した: stderr={}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stdout.contains("シフト 2 件")
-            && stdout.contains("破棄 1 件")
-            && stdout.contains("クリップ 1 件"),
-        "件数のログが出ているはず: {stdout}"
+        stderr.contains("シフト 2 件")
+            && stderr.contains("破棄 1 件")
+            && stderr.contains("クリップ 1 件"),
+        "件数のログが出ているはず: {stderr}"
     );
 
     let result = std::fs::read_to_string(&out_srt_path).expect("結果を読めること");

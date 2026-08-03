@@ -57,8 +57,11 @@ pub enum Commands {
 pub struct AnalyzeArgs {
     pub input: PathBuf,
 
+    /// `trim.avs` の出力先。`-` で標準出力に書く。省略するとキャッシュにだけ書き、
+    /// その場所を stderr へ出す（`cut --trim` から辿れる。`cut --trim -` で
+    /// 標準入力から読ませることもできる）。
     #[arg(short, long)]
-    pub output: PathBuf,
+    pub output: Option<PathBuf>,
 
     #[arg(long)]
     pub report: bool,
@@ -77,6 +80,7 @@ pub struct AnalyzeArgs {
 pub struct CutArgs {
     pub input: PathBuf,
 
+    /// Trim リスト。`-` で標準入力から読む（`analyze -o -` の出力をそのまま渡せる）。
     #[arg(long)]
     pub trim: PathBuf,
 
