@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 #[derive(Debug, Parser)]
-#[command(name = "tachikaze")]
+#[command(name = "tachikaze", version)]
 pub struct Cli {
     /// キャッシュ（`.dtvi` / `trim.avs` / `detail.jls` / 前処理済み入力 / 字幕
     /// サイドカーなど、再生成できる中間物）の置き場所の根。未指定なら
@@ -42,11 +42,12 @@ pub enum Commands {
     /// を対話なしで合成する。
     ///
     /// アルゴリズムは持たない（`analyze` / `cut` を複製せず呼ぶだけ）。対話プロンプトは
-    /// 出さない: gate が疑わしいと判定したら cut を実行せず exit code 2 で停止し、
+    /// 出さない: gate が疑わしいと判定したら cut を実行せず exit code 3 で停止し、
     /// `trim.avs` のパスと「直して `cut` する」コマンド例を表示する（`--force` で
     /// 無視できるが、無視できるのは gate の判定だけで、自己検証や `.dtvi` 必須は
-    /// 変わらない）。exit code は 0=完了 / 1=エラー / 2=判定で停止 の3種類のみ。
-    /// 1プロセスにつき入力は1本（複数ファイルはシェルのループに任せる）。
+    /// 変わらない）。exit code は 0=完了 / 1=エラー / 2=引数の誤り（clap 既定） /
+    /// 3=判定で停止 の4種類のみ。1プロセスにつき入力は1本
+    /// （複数ファイルはシェルのループに任せる）。
     #[command(after_help = "複数ファイルを処理するときはシェルでループする:\n\
         \n    for f in *.mp4; do tachikaze auto \"$f\"; done\n")]
     Auto(AutoArgs),

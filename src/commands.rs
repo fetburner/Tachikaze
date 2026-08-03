@@ -22,7 +22,8 @@ use crate::{
 /// `main.rs` が終了コードを決めるための、サブコマンド実行結果。
 ///
 /// - [`ExitOutcome::Success`]: 0 で終了する。
-/// - [`ExitOutcome::GateStopped`]: 2 で終了する。
+/// - [`ExitOutcome::GateStopped`]: 3 で終了する（2 は clap が引数の誤り
+///   （usage error）に使うため、`main.rs` の doc comment参照）。
 ///
 /// `auto`（#62）の gate が疑わしいと判定して cut を実行せず止まった場合にだけ
 /// [`ExitOutcome::GateStopped`] を返す。`analyze` / `cut` / `prepare` / `remap-subs`
