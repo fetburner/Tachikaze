@@ -27,7 +27,7 @@
 //!    確認するテスト**（`--overwrite`・静的な引数検証・exit code）。
 //!    `analyze` 自体は `dtvindex` が無いため必ず失敗するが、
 //!    それは想定どおりの「失敗」として exit code 1 に現れることを確認する
-//!    （gate 停止＝exit code 2 に実際に到達する経路は 1 のテストが担う）。
+//!    （gate 停止＝exit code 3 に実際に到達する経路は 1 のテストが担う）。
 
 mod common;
 
@@ -353,10 +353,11 @@ fn auto_force_overrides_gate_stop_but_gate_alone_stops_without_it() {
             );
             assert!(out_path.is_file(), "--force 指定時は cut まで進むはず");
         } else {
+            let stderr = String::from_utf8_lossy(&output.stderr);
             assert_eq!(
                 output.status.code(),
-                Some(2),
-                "gate が止めた場合は exit code 2 のはず: stdout={stdout}"
+                Some(3),
+                "gate が止めた場合は exit code 3 のはず: stdout={stdout}"
             );
             assert!(
                 stdout.contains("gate が疑わしいと判定したため、cut を実行せず停止します"),
@@ -365,6 +366,10 @@ fn auto_force_overrides_gate_stop_but_gate_alone_stops_without_it() {
             assert!(
                 stdout.contains("tachikaze cut"),
                 "直して cut するコマンド例が出ていない: {stdout}"
+            );
+            assert!(
+                stderr.contains("exit code 3"),
+                "exit code 3 で停止した旨が出ていない: {stderr}"
             );
             assert!(
                 !out_path.is_file(),
@@ -422,6 +427,23 @@ fn run_auto_without_tools(args: &[&str], cache_root: &Path) -> std::process::Out
 fn auto_rejects_multiple_inputs_as_usage_error() {
     let tmp_dir = make_tmp_dir("reject-multi-input");
     let output = run_auto(&["/no/such/a.mp4", "/no/such/b.mp4"], &tmp_dir);
+    assert_eq!(output.status.code(), Some(2), "clap の usage error のはず");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("unexpected argument"),
+        "clap の usage error であることを確認する: stderr={stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+/// 完了条件（issue #71）: 存在しないオプションを渡すと clap の usage error で
+/// exit code 2 になり、gate 停止の exit code 3
+/// （[`auto_force_overrides_gate_stop_but_gate_alone_stops_without_it`]）と
+/// 区別できる。
+#[test]
+fn auto_unknown_option_is_usage_error_exit_code_2() {
+    let tmp_dir = make_tmp_dir("unknown-option");
+    let output = run_auto(&["--no-such-option", "/no/such/a.mp4"], &tmp_dir);
     assert_eq!(output.status.code(), Some(2), "clap の usage error のはず");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
