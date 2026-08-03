@@ -440,55 +440,17 @@ fn skip_if_missing(bin: &str) -> bool {
 
 /// 音声ストリームの全パケットの CRC32 集合を ffprobe で取得する。
 fn ffprobe_audio_crc_set(path: &Path) -> HashSet<String> {
-    let output = Command::new("ffprobe")
-        .args([
-            "-v",
-            "error",
-            "-select_streams",
-            "a:0",
-            "-show_entries",
-            "packet=data_hash",
-            "-show_data_hash",
-            "CRC32",
-            "-of",
-            "csv=p=0",
-        ])
-        .arg(path)
-        .output()
-        .expect("ffprobe の起動に失敗した（PATH を確認）");
-    assert!(
-        output.status.success(),
-        "ffprobe が失敗した: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    parse_crc_set(&String::from_utf8_lossy(&output.stdout))
+    tachikaze::ffprobe::csv_rows(Path::new("ffprobe"), path, "a:0", "packet=data_hash", true)
+        .expect("ffprobe の起動に失敗した（PATH を確認）")
+        .into_iter()
+        .collect()
 }
 
 /// 音声ストリームの全パケットの dts を格納順に取得する。
 fn ffprobe_audio_dts(path: &Path) -> Vec<i64> {
-    let output = Command::new("ffprobe")
-        .args([
-            "-v",
-            "error",
-            "-select_streams",
-            "a:0",
-            "-show_entries",
-            "packet=dts",
-            "-of",
-            "csv=p=0",
-        ])
-        .arg(path)
-        .output()
-        .expect("ffprobe の起動に失敗した");
-    assert!(
-        output.status.success(),
-        "ffprobe が失敗した: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
+    tachikaze::ffprobe::csv_rows(Path::new("ffprobe"), path, "a:0", "packet=dts", false)
+        .expect("ffprobe の起動に失敗した")
+        .into_iter()
         .map(|line| {
             line.parse::<i64>()
                 .unwrap_or_else(|_| panic!("dts が整数としてパースできない: {line:?}"))
@@ -516,33 +478,8 @@ fn ffprobe_audio_packet_durations(path: &Path) -> Vec<u64> {
 /// 「区間の先頭パケットが元ファイルの正しい位置のパケットと一致するか」という
 /// **位置**の検査には、集合ではなく列としての値が要る。
 fn ffprobe_audio_crc_ordered(path: &Path) -> Vec<String> {
-    let output = Command::new("ffprobe")
-        .args([
-            "-v",
-            "error",
-            "-select_streams",
-            "a:0",
-            "-show_entries",
-            "packet=data_hash",
-            "-show_data_hash",
-            "CRC32",
-            "-of",
-            "csv=p=0",
-        ])
-        .arg(path)
-        .output()
-        .expect("ffprobe の起動に失敗した（PATH を確認）");
-    assert!(
-        output.status.success(),
-        "ffprobe が失敗した: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(str::to_string)
-        .collect()
+    tachikaze::ffprobe::csv_rows(Path::new("ffprobe"), path, "a:0", "packet=data_hash", true)
+        .expect("ffprobe の起動に失敗した（PATH を確認）")
 }
 
 /// 映像ストリームの全パケットの pts（timescale 単位、格納順 = デコード順）を取得する。
@@ -636,54 +573,13 @@ fn ffprobe_audio_packet_positions(path: &Path) -> Vec<(u64, u64)> {
 
 /// `ffprobe ... -of csv=p=0` の出力を空行を除いた行の列として返す。
 fn ffprobe_csv_column(path: &Path, stream_selector: &str, entry: &str) -> Vec<String> {
-    let output = Command::new("ffprobe")
-        .args([
-            "-v",
-            "error",
-            "-select_streams",
-            stream_selector,
-            "-show_entries",
-            entry,
-            "-of",
-            "csv=p=0",
-        ])
-        .arg(path)
-        .output()
-        .expect("ffprobe の起動に失敗した");
-    assert!(
-        output.status.success(),
-        "ffprobe が失敗した: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(str::to_string)
-        .collect()
+    tachikaze::ffprobe::csv_rows(Path::new("ffprobe"), path, stream_selector, entry, false)
+        .expect("ffprobe の起動に失敗した")
 }
 
 fn ffprobe_scalar_stream_entry(path: &Path, stream_selector: &str, entry: &str) -> String {
-    let output = Command::new("ffprobe")
-        .args([
-            "-v",
-            "error",
-            "-select_streams",
-            stream_selector,
-            "-show_entries",
-            entry,
-            "-of",
-            "default=nk=1:nw=1",
-        ])
-        .arg(path)
-        .output()
-        .expect("ffprobe の起動に失敗した");
-    assert!(
-        output.status.success(),
-        "ffprobe が失敗した: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    String::from_utf8_lossy(&output.stdout).trim().to_string()
+    tachikaze::ffprobe::scalar_entry(Path::new("ffprobe"), path, stream_selector, entry)
+        .expect("ffprobe の起動に失敗した")
 }
 
 /// `IN.mp4` に対して ffprobe の CRC32 ラッパと集合比較ロジックが実際に動くことを、

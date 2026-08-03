@@ -177,6 +177,8 @@ tachikaze auto IN.mp4 -o OUT.mp4 [--cm-output CM.mp4] [--ignore-gate]
 | `auto.rs` | `auto` コマンドの組み立て（`prepare`→`analyze`→gate→`cut`→`remap-subs`、アルゴリズムは持たない） | 上記「コマンド構成」手順16〜19 |
 | `tools.rs` | 外部ツールと JL ファイルの探索 | 上記「パス解決」節、[toolchain-macos.md](toolchain-macos.md) |
 | `external.rs` | 外部プロセスの起動と出力の回収 | [pipeline.md](pipeline.md) |
+| `ffprobe.rs` | ffprobe への CSV クエリ（`-show_entries` / `-show_data_hash CRC32`）の1か所集約。`verify.rs` と `tests/audio_e2e.rs` の両方から使う | 罠2（md5 ではなくパケット単位の CRC32）、[lossless-cut.md](lossless-cut.md) |
+| `errctx.rs` | 「〜に失敗しました: <パス>」というエラー文脈の付与を1行で書くための拡張トレイト（`path_ctx`） | — |
 | `workdir.rs` | 作業ディレクトリ（既定は入力ごとのキャッシュ）と symlink | 上記「パス解決」節 |
 | `order.rs` | `DisplayIdx` / `DecodeIdx` | 下記「型設計の要点」 |
 | `trim.rs` | `Trim(a,b)++…` のパース / 生成（半開区間 `[s, e+1)` に正規化） | — |

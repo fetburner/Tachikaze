@@ -13,6 +13,7 @@ use mp4_atom::{Codec, Moov};
 
 use crate::cli::{AnalyzeArgs, AutoArgs, Cli, Commands, CutArgs, PrepareArgs, RemapSubsArgs};
 use crate::dtvi::Dtvi;
+use crate::errctx::PathContext;
 use crate::mp4io::read::SampleInfo;
 use crate::order::{DecodeIdx, DisplayIdx, OrderMap};
 use crate::{
@@ -130,22 +131,14 @@ fn run_remap_subs(cache_dir: Option<PathBuf>, args: RemapSubsArgs) -> anyhow::Re
     }
     let segment_map_path =
         resolve_segment_map_path(segment_map_path, cache_dir.as_deref(), &input)?;
-    let segment_map_json = fs::read_to_string(&segment_map_path).with_context(|| {
-        format!(
-            "区間マップの読み込みに失敗しました: {}",
-            segment_map_path.display()
-        )
-    })?;
+    let segment_map_json =
+        fs::read_to_string(&segment_map_path).path_ctx("区間マップの読み込み", &segment_map_path)?;
     let segment_map = segmap::SegmentMap::from_json(&segment_map_json)
         .map_err(|err| anyhow!("区間マップのパースに失敗しました: {err}"))?;
 
     let (subs_input_path, format) = resolve_subs_path(subs_path_arg, cache_dir.as_deref(), &input)?;
-    let subs_content = fs::read_to_string(&subs_input_path).with_context(|| {
-        format!(
-            "字幕サイドカーの読み込みに失敗しました: {}",
-            subs_input_path.display()
-        )
-    })?;
+    let subs_content =
+        fs::read_to_string(&subs_input_path).path_ctx("字幕サイドカーの読み込み", &subs_input_path)?;
 
     let remap_output = match format {
         subtitle::SubsFormat::Ass => subtitle::remap_ass(
@@ -163,8 +156,7 @@ fn run_remap_subs(cache_dir: Option<PathBuf>, args: RemapSubsArgs) -> anyhow::Re
 
     let output =
         output.unwrap_or_else(|| default_remap_subs_output_path(&input, format.extension()));
-    fs::write(&output, &remap_output.content)
-        .with_context(|| format!("字幕の書き出しに失敗しました: {}", output.display()))?;
+    fs::write(&output, &remap_output.content).path_ctx("字幕の書き出し", &output)?;
 
     let stats = &remap_output.stats;
     eprintln!(
@@ -200,7 +192,7 @@ fn resolve_segment_map_path(
     }
 
     let cached = workdir::cached_segment_map_path(cache_dir, input)
-        .with_context(|| format!("区間マップの自動解決に失敗しました: {}", input.display()))?;
+        .path_ctx("区間マップの自動解決", input)?;
     if cached.is_file() {
         return Ok(cached);
     }
@@ -233,13 +225,8 @@ fn resolve_subs_path(
     }
 
     for format in [subtitle::SubsFormat::Ass, subtitle::SubsFormat::Srt] {
-        let candidate =
-            workdir::subs_path(cache_dir, input, format.extension()).with_context(|| {
-                format!(
-                    "字幕サイドカーのキャッシュパスの解決に失敗しました: {}",
-                    input.display()
-                )
-            })?;
+        let candidate = workdir::subs_path(cache_dir, input, format.extension())
+            .path_ctx("字幕サイドカーのキャッシュパスの解決", input)?;
         if candidate.is_file() {
             return Ok((candidate, format));
         }
@@ -523,14 +510,12 @@ pub(crate) fn execute_cut(params: CutParams) -> anyhow::Result<CutOutcome> {
         );
     }
 
-    let moov = mp4io::read::read_moov(&input)
-        .with_context(|| format!("入力 mp4 の読み込みに失敗しました: {}", input.display()))?;
+    let moov = mp4io::read::read_moov(&input).path_ctx("入力 mp4 の読み込み", &input)?;
 
     let dtvi_path = resolve_dtvi_path(dtvi_path, cache_dir.as_deref(), &input)?;
     let dtvi_data = match &dtvi_path {
         Some(path) => {
-            let content = fs::read_to_string(path)
-                .with_context(|| format!(".dtvi の読み込みに失敗しました: {}", path.display()))?;
+            let content = fs::read_to_string(path).path_ctx(".dtvi の読み込み", path)?;
             Some(
                 dtvi::parse(&content)
                     .map_err(|err| anyhow!(".dtvi のパースに失敗しました: {err}"))?,
@@ -559,12 +544,7 @@ pub(crate) fn execute_cut(params: CutParams) -> anyhow::Result<CutOutcome> {
             .context("trim の標準入力からの読み込みに失敗しました")?;
         buf
     } else {
-        fs::read_to_string(&trim_path).with_context(|| {
-            format!(
-                "trim ファイルの読み込みに失敗しました: {}",
-                trim_path.display()
-            )
-        })?
+        fs::read_to_string(&trim_path).path_ctx("trim ファイルの読み込み", &trim_path)?
     };
     let trim = trim::TrimList::parse(&trim_content)
         .map_err(|err| anyhow!("trim ファイルのパースに失敗しました: {err}"))?;
@@ -719,8 +699,8 @@ fn resolve_dtvi_path(
         return Ok(dtvi_path);
     }
 
-    let cached = workdir::cached_dtvi_path(cache_dir, input)
-        .with_context(|| format!("`.dtvi` の自動解決に失敗しました: {}", input.display()))?;
+    let cached =
+        workdir::cached_dtvi_path(cache_dir, input).path_ctx("`.dtvi` の自動解決", input)?;
     if cached.is_file() {
         return Ok(Some(cached));
     }

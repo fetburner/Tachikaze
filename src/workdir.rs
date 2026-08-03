@@ -36,6 +36,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
+use crate::errctx::PathContext;
+
 const WORK_FILE_NAME: &str = "work.mp4";
 const DTVI_FILE_NAME: &str = "work.mp4.dtvi";
 const SCP_FILE_NAME: &str = "scp.txt";
@@ -72,21 +74,11 @@ impl WorkDir {
     ///   ハッシュからディレクトリ名を決める（[`cache_dir_for_input`]）。
     pub fn new(cache_dir: Option<&Path>, input: &Path) -> Result<Self> {
         let path = cache_dir_for_input(cache_dir, input)?;
-        fs::create_dir_all(&path).with_context(|| {
-            format!(
-                "キャッシュディレクトリの作成に失敗しました: {}",
-                path.display()
-            )
-        })?;
+        fs::create_dir_all(&path).path_ctx("キャッシュディレクトリの作成", &path)?;
         // 相対パスのまま保持すると、`external::run` が `current_dir` を
         // このディレクトリに切り替えたあと、引数の `work/work.mp4` などが
         // 二重にネストして解決される。作成直後に絶対化しておく。
-        let path = fs::canonicalize(&path).with_context(|| {
-            format!(
-                "キャッシュディレクトリの絶対パス解決に失敗しました: {}",
-                path.display()
-            )
-        })?;
+        let path = fs::canonicalize(&path).path_ctx("キャッシュディレクトリの絶対パス解決", &path)?;
         Ok(Self { path })
     }
 
@@ -101,12 +93,8 @@ impl WorkDir {
     /// カレントディレクトリが変わっても壊れない。入力自体が symlink でも、
     /// その解決先へ張るので問題なく動く。既に `work.mp4` がある場合は張り替える。
     pub fn link_input(&self, input: &Path) -> Result<PathBuf> {
-        let absolute_input = fs::canonicalize(input).with_context(|| {
-            format!(
-                "入力ファイルの絶対パス解決に失敗しました: {}",
-                input.display()
-            )
-        })?;
+        let absolute_input =
+            fs::canonicalize(input).path_ctx("入力ファイルの絶対パス解決", input)?;
 
         let work_path = self.work_path();
 
@@ -323,12 +311,7 @@ fn fnv1a_hex(bytes: &[u8]) -> String {
 /// ハッシュだけでなく stem も併記するのは、万が一ハッシュが衝突しても別入力が
 /// 同じディレクトリを共有しないようにするため（人間が見て区別しやすくもなる）。
 fn cache_dir_for_input(cache_dir: Option<&Path>, input: &Path) -> Result<PathBuf> {
-    let absolute = fs::canonicalize(input).with_context(|| {
-        format!(
-            "入力ファイルの絶対パス解決に失敗しました: {}",
-            input.display()
-        )
-    })?;
+    let absolute = fs::canonicalize(input).path_ctx("入力ファイルの絶対パス解決", input)?;
     let hash = fnv1a_hex(absolute.as_os_str().as_bytes());
     let stem = absolute
         .file_stem()

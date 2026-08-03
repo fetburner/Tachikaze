@@ -54,7 +54,6 @@ use std::collections::HashSet;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::Instant;
 
 use anyhow::Context;
@@ -779,30 +778,6 @@ fn log_audio_drift(
 // ffprobe によるパケット単位 CRC32 の一致確認（`--verify` 指定時、CLAUDE.md の罠2）。
 // ---------------------------------------------------------------------
 
-/// `ffprobe_path` を使って `path` に対して `args` を実行し、標準出力を文字列で返す。
-/// 終了コードが 0 以外、または起動自体に失敗した場合はエラーを返す。
-fn run_ffprobe_lines(ffprobe_path: &Path, path: &Path, args: &[&str]) -> anyhow::Result<String> {
-    let output = Command::new(ffprobe_path)
-        .args(args)
-        .arg(path)
-        .output()
-        .with_context(|| {
-            format!(
-                "ffprobe({}) の起動に失敗しました(対象: {})",
-                ffprobe_path.display(),
-                path.display()
-            )
-        })?;
-    anyhow::ensure!(
-        output.status.success(),
-        "ffprobe({}) が失敗しました(対象: {}): {}",
-        ffprobe_path.display(),
-        path.display(),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    String::from_utf8(output.stdout).context("ffprobe の出力が utf-8 ではありません")
-}
-
 /// 映像ストリームの全パケットの CRC32 を、コンテナの格納順
 /// （= デコード順、[`crate::mp4io::read::samples`] が返す `SampleInfo` と同じ順序）で
 /// 取得する。`video_keep`（元ファイルのデコード順 `DecodeIdx` 列）のインデックスと
@@ -811,73 +786,23 @@ fn video_packet_crc32_in_decode_order(
     ffprobe_path: &Path,
     path: &Path,
 ) -> anyhow::Result<Vec<String>> {
-    let text = run_ffprobe_lines(
-        ffprobe_path,
-        path,
-        &[
-            "-v",
-            "error",
-            "-select_streams",
-            "v:0",
-            "-show_entries",
-            "packet=size,data_hash",
-            "-show_data_hash",
-            "CRC32",
-            "-of",
-            "csv=p=0",
-        ],
-    )?;
-    Ok(text
-        .lines()
-        .filter(|line| !line.is_empty())
-        .map(str::to_string)
-        .collect())
+    crate::ffprobe::csv_rows(ffprobe_path, path, "v:0", "packet=size,data_hash", true)
 }
 
 /// 音声ストリームの全パケットの CRC32 集合を取得する（`#35` と同じ集合比較のため）。
 fn audio_packet_crc32_set(ffprobe_path: &Path, path: &Path) -> anyhow::Result<HashSet<String>> {
-    let text = run_ffprobe_lines(
-        ffprobe_path,
-        path,
-        &[
-            "-v",
-            "error",
-            "-select_streams",
-            "a:0",
-            "-show_entries",
-            "packet=data_hash",
-            "-show_data_hash",
-            "CRC32",
-            "-of",
-            "csv=p=0",
-        ],
-    )?;
-    Ok(text
-        .lines()
-        .filter(|line| !line.is_empty())
-        .map(str::to_string)
-        .collect())
+    Ok(
+        crate::ffprobe::csv_rows(ffprobe_path, path, "a:0", "packet=data_hash", true)?
+            .into_iter()
+            .collect(),
+    )
 }
 
 /// 音声ストリームの全パケットの dts を格納順に取得する（順序検証用。集合比較では
 /// 順序や重複を検出できないため、これで補う）。
 fn audio_packet_dts(ffprobe_path: &Path, path: &Path) -> anyhow::Result<Vec<i64>> {
-    let text = run_ffprobe_lines(
-        ffprobe_path,
-        path,
-        &[
-            "-v",
-            "error",
-            "-select_streams",
-            "a:0",
-            "-show_entries",
-            "packet=dts",
-            "-of",
-            "csv=p=0",
-        ],
-    )?;
-    text.lines()
-        .filter(|line| !line.is_empty())
+    crate::ffprobe::csv_rows(ffprobe_path, path, "a:0", "packet=dts", false)?
+        .into_iter()
         .map(|line| {
             line.parse::<i64>().with_context(|| {
                 format!("音声パケットの dts が整数としてパースできません: {line:?}")

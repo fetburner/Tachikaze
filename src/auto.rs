@@ -75,6 +75,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context};
 
+use crate::errctx::PathContext;
 use crate::{analyze, cli, commands, gate, mp4io, prepare, report, segmap, subtitle, workdir};
 
 /// `auto` サブコマンドの設定（`src/cli.rs::Commands::Auto` の CLI 引数と1対1）。
@@ -226,13 +227,8 @@ fn process_one(
     // 同じキャッシュディレクトリを返す。冪等）、ここで一度作っても競合しない。
     // `commands::resolve_dtvi_path` はキャッシュの既定パスしか見ないため、
     // ここで確定させたパスを cut にも明示的に渡す。
-    let work_probe =
-        workdir::WorkDir::new(config.cache_dir.as_deref(), &media_path).with_context(|| {
-            format!(
-                "作業ディレクトリの解決に失敗しました: {}",
-                media_path.display()
-            )
-        })?;
+    let work_probe = workdir::WorkDir::new(config.cache_dir.as_deref(), &media_path)
+        .path_ctx("作業ディレクトリの解決", &media_path)?;
     let dtvi_path = work_probe.dtvi_path();
 
     // 2. analyze（キャッシュを短絡せず必ず呼ぶ。本モジュール冒頭の doc comment参照）。
@@ -370,8 +366,7 @@ fn process_one(
                 if cm_out_path.is_some() { "/CM側" } else { "" },
                 input.display()
             );
-            return Err(err)
-                .with_context(|| format!("字幕の張り替えに失敗しました: {}", input.display()));
+            return Err(err).path_ctx("字幕の張り替え", input);
         }
     } else {
         eprintln!("[auto] 字幕トラックが無いため remap-subs は行いません。");
@@ -426,12 +421,8 @@ fn remap_subtitles(
             subs_input.display()
         )
     })?;
-    let subs_content = fs::read_to_string(subs_input).with_context(|| {
-        format!(
-            "字幕サイドカーの読み込みに失敗しました: {}",
-            subs_input.display()
-        )
-    })?;
+    let subs_content =
+        fs::read_to_string(subs_input).path_ctx("字幕サイドカーの読み込み", subs_input)?;
 
     let remap_output = match format {
         subtitle::SubsFormat::Ass => subtitle::remap_ass(
@@ -448,8 +439,7 @@ fn remap_subtitles(
     .map_err(|err| anyhow!("{err}"))?;
 
     let subs_out = subs_sidecar_path(out_path, format.extension());
-    fs::write(&subs_out, &remap_output.content)
-        .with_context(|| format!("字幕の書き出しに失敗しました: {}", subs_out.display()))?;
+    fs::write(&subs_out, &remap_output.content).path_ctx("字幕の書き出し", &subs_out)?;
 
     let stats = &remap_output.stats;
     eprintln!(

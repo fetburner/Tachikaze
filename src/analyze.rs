@@ -15,12 +15,14 @@
 //! ロゴ検出は原理的に使えない。省略すると join_logo_scp は全フレームをロゴ
 //! 表示中とみなす。
 
+use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 
 use crate::dtvi::{self, Dtvi};
+use crate::errctx::PathContext;
 use crate::external;
 use crate::jls::{self, JlsEntry};
 use crate::tools::{self, CHAPTER_EXE, DTVINDEX, JOIN_LOGO_SCP};
@@ -123,23 +125,23 @@ fn run_pipeline(
     // （包むと `anyhow::Error` の `Display`（`to_string()`）が外側のメッセージ
     // だけを返し、肝心の stderr が隠れてしまう）。
     external::run(
-        require_utf8(dtvindex_path)?,
+        dtvindex_path,
         &[
-            "build",
-            require_utf8(&work_mp4)?,
-            "-o",
-            require_utf8(&dtvi_path)?,
+            OsStr::new("build"),
+            work_mp4.as_os_str(),
+            OsStr::new("-o"),
+            dtvi_path.as_os_str(),
         ],
         work.path(),
     )?;
 
     let chapter_exe_output = external::run(
-        require_utf8(chapter_exe_path)?,
+        chapter_exe_path,
         &[
-            "-v",
-            require_utf8(&work_mp4)?,
-            "-o",
-            require_utf8(&scp_path)?,
+            OsStr::new("-v"),
+            work_mp4.as_os_str(),
+            OsStr::new("-o"),
+            scp_path.as_os_str(),
         ],
         work.path(),
     )?;
@@ -157,69 +159,48 @@ fn run_pipeline(
     }
 
     let jl_file = match &config.jl_file {
-        Some(path) => fs::canonicalize(path).with_context(|| {
-            format!(
-                "JL コマンドファイルの絶対パス解決に失敗しました: {}",
-                path.display()
-            )
-        })?,
+        Some(path) => {
+            fs::canonicalize(path).path_ctx("JL コマンドファイルの絶対パス解決", path)?
+        }
         None => tools::default_jl_command_file(join_logo_scp_path)?,
     };
 
     let set_args = build_jls_set_args(DEFAULT_JLS_SET, &config.jls_set);
-    let mut join_logo_scp_args: Vec<&str> = vec![
-        "-inscp",
-        require_utf8(&scp_path)?,
-        "-incmd",
-        require_utf8(&jl_file)?,
-        "-o",
-        require_utf8(&trim_avs_path)?,
-        "-oscp",
-        require_utf8(&detail_jls_path)?,
+    let mut join_logo_scp_args: Vec<&OsStr> = vec![
+        OsStr::new("-inscp"),
+        scp_path.as_os_str(),
+        OsStr::new("-incmd"),
+        jl_file.as_os_str(),
+        OsStr::new("-o"),
+        trim_avs_path.as_os_str(),
+        OsStr::new("-oscp"),
+        detail_jls_path.as_os_str(),
     ];
-    join_logo_scp_args.extend(set_args.iter().map(String::as_str));
+    join_logo_scp_args.extend(set_args.iter().map(|s| OsStr::new(s.as_str())));
 
-    external::run(
-        require_utf8(join_logo_scp_path)?,
-        &join_logo_scp_args,
-        work.path(),
-    )?;
+    external::run(join_logo_scp_path, &join_logo_scp_args, work.path())?;
 
     // work 内の trim.avs を先に読む。`-o` が work の trim.avs と同じ
     // パスだと `fs::copy(src, src)` が空ファイルを生む（macOS で実測。前回の
     // 手動実行で hit した）。同一パスならコピーを省略する。
-    let output_content = fs::read_to_string(&trim_avs_path).with_context(|| {
-        format!(
-            "join_logo_scp が生成した trim.avs の読み込みに失敗しました: {}",
-            trim_avs_path.display()
-        )
-    })?;
+    let output_content = fs::read_to_string(&trim_avs_path)
+        .path_ctx("join_logo_scp が生成した trim.avs の読み込み", &trim_avs_path)?;
     let trim = TrimList::parse(&output_content)
         .map_err(|err| anyhow!("生成された trim.avs のパースに失敗しました: {err}"))?;
 
     if let Some(dest) = &config.output {
         if !same_path(&trim_avs_path, dest)? {
-            fs::write(dest, &output_content).with_context(|| {
-                format!("trim.avs の書き出しに失敗しました: {}", dest.display())
-            })?;
+            fs::write(dest, &output_content).path_ctx("trim.avs の書き出し", dest)?;
         }
     }
 
-    let dtvi_content = fs::read_to_string(&dtvi_path).with_context(|| {
-        format!(
-            "dtvindex が生成した .dtvi の読み込みに失敗しました: {}",
-            dtvi_path.display()
-        )
-    })?;
+    let dtvi_content = fs::read_to_string(&dtvi_path)
+        .path_ctx("dtvindex が生成した .dtvi の読み込み", &dtvi_path)?;
     let dtvi = dtvi::parse(&dtvi_content)
         .map_err(|err| anyhow!("生成された .dtvi のパースに失敗しました: {err}"))?;
 
-    let jls_content = fs::read_to_string(&detail_jls_path).with_context(|| {
-        format!(
-            "join_logo_scp が生成した detail.jls の読み込みに失敗しました: {}",
-            detail_jls_path.display()
-        )
-    })?;
+    let jls_content = fs::read_to_string(&detail_jls_path)
+        .path_ctx("join_logo_scp が生成した detail.jls の読み込み", &detail_jls_path)?;
     let jls_entries = jls::parse(&jls_content)
         .map_err(|err| anyhow!("生成された detail.jls のパースに失敗しました: {err}"))?;
 
@@ -230,12 +211,6 @@ fn run_pipeline(
         raw_trim: output_content,
         cache_trim_path: trim_avs_path,
     })
-}
-
-/// パスを `&str` として取り出す。UTF-8 でないパスは非対応として扱う。
-fn require_utf8(path: &Path) -> Result<&str> {
-    path.to_str()
-        .ok_or_else(|| anyhow!("パスが UTF-8 として扱えません: {}", path.display()))
 }
 
 /// 2 つのパスが同じファイルを指すか（親ディレクトリを canonicalize して比較）。
