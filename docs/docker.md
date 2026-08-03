@@ -2,7 +2,7 @@
 
 → 入口: [overview.md](overview.md)
 
-外部3ツール（chapter_exe / join_logo_scp / dtvindex）と ffmpeg を自分でビルド・配置したくない人向けに、`Dockerfile` を用意してある。**変えないもの**: 出力は入力の隣に書く。`analyze` はキャッシュに入力への symlink（`work.mp4`）を張って `chapter_exe` を走らせる。この2つはコンテナ内でも同じ（[architecture.md](architecture.md)「パス解決」節）。
+外部3ツール（chapter_exe / join_logo_scp / dtvindex）と ffmpeg を自分でビルド・配置したくない人向けに、`Dockerfile` を用意してある。**変えないもの**: `cut`/`auto` の出力先は `-o`（必須、#73）で明示指定し、`remap-subs` を単体実行したときだけ入力の隣に既定の出力名を置く。`analyze` はキャッシュに入力への symlink（`work.mp4`）を張って `chapter_exe` を走らせる。これらはコンテナ内でも同じ（[architecture.md](architecture.md)「パス解決」節）。
 
 Linux (arm64) で**実際に `docker build` / `docker run` を実行して確認済み**（2026 年 8 月時点。Apple Silicon 上の Colima、`docker` サーバは `linux/arm64`）。この文書はキャッシュの置き場所を `--cache-dir` 1本に統合した後（`src/workdir.rs` の E12-2）の CLI を前提に書いてある。
 
@@ -96,7 +96,7 @@ $ make docker-build          # docker build -t tachikaze . と同じ
 
 ## 実行
 
-**メディアディレクトリとキャッシュディレクトリの両方を rw でマウントする**（出力は入力の隣に書く方針のため、かつ `--cache-dir` で指定した先はコンテナ内のパスなので、マウントしていないと `--rm` でコンテナが消えると同時に中身も消える）。`--cache-dir` はグローバルオプションで、サブコマンドの前後どちらに置いても効く。
+**メディアディレクトリとキャッシュディレクトリの両方を rw でマウントする**（`-o` の出力先を通常メディアディレクトリ配下に指定するため、かつ `--cache-dir` で指定した先はコンテナ内のパスなので、マウントしていないと `--rm` でコンテナが消えると同時に中身も消える）。`--cache-dir` はグローバルオプションで、サブコマンドの前後どちらに置いても効く。
 
 ```console
 $ MEDIA_DIR=/path/to/recordings   # ホスト上の絶対パス
@@ -105,7 +105,7 @@ $ CACHE_DIR=/path/to/cache        # 同上
 $ docker run --rm \
     -v "$MEDIA_DIR":"$MEDIA_DIR" \
     -v "$CACHE_DIR":"$CACHE_DIR" \
-    tachikaze auto "$MEDIA_DIR/IN.mp4" --cache-dir "$CACHE_DIR" --verify
+    tachikaze auto "$MEDIA_DIR/IN.mp4" -o "$MEDIA_DIR/IN_CMcut.mp4" --cache-dir "$CACHE_DIR" --verify
 ```
 
 `analyze` / `cut` を個別に叩く場合も同様に、`-v "$MEDIA_DIR":"$MEDIA_DIR"` **と** `-v "$CACHE_DIR":"$CACHE_DIR"` の両方をマウントする。`--cache-dir "$CACHE_DIR"` はコンテナ内のパスなので、そのディレクトリをホストにもマウントしていないと `--rm` 付き `docker run` の終了と同時に `.dtvi` などの中間ファイルがコンテナの書き込み可能レイヤーごと消え、次の `cut` が `.dtvi` を読めずに失敗する（`analyze` 単体は `$CACHE_DIR` をマウントし忘れてもコンテナ内に自動でディレクトリを作ってしまうため、その場では一見成功して見える点に注意。実機でこの失敗を再現済み: `--dtvi` を省略した `cut` が「`--dtvi` が指定されておらず、キャッシュにも `.dtvi` が見つかりませんでした」（`先に次を実行してください: tachikaze analyze <input> -o trim.avs` を続けて表示）で停止する）。
@@ -129,7 +129,7 @@ $ docker run --rm -v "$MEDIA_DIR":"$MEDIA_DIR" -v "$CACHE_DIR":"$CACHE_DIR" tach
 
 ## 実行例で確認したこと（実測）
 
-`tests/fixtures/gen.sh` で作った `sample.mp4`（H.264 + Opus, 20秒, GOP 120 固定）を `$MEDIA_DIR` に置き、`auto --cache-dir $CACHE_DIR --verify --force --no-cm` を実行して確認した:
+`tests/fixtures/gen.sh` で作った `sample.mp4`（H.264 + Opus, 20秒, GOP 120 固定）を `$MEDIA_DIR` に置き、`auto --cache-dir $CACHE_DIR --verify --ignore-gate -o $MEDIA_DIR/sample_CMcut.mp4` を実行して確認した（コマンドは #73 のフラグ改名に合わせて更新。`--cm-output` を指定していないため CM 側は作られない。以下の実測結果自体はフラグ改名前に確認したもので、フラグの意味は変わっていない）:
 
 - `dtvindex build` → `chapter_exe -v` → `join_logo_scp` が3つとも正常終了する
 - `chapter_exe` がメディアファイルの隣ではなく `--cache-dir` 配下（`<hash>-sample/`）の `work.mp4`（symlink）の隣に `.dtvi` を作る（コンテナ内でもホスト同様、`analyze` の symlink 回避が効いている）。ディレクトリ名は実測で `c567f3179fe4d702-sample`（`<入力絶対パスのハッシュ>-<stem>`）
@@ -137,18 +137,18 @@ $ docker run --rm -v "$MEDIA_DIR":"$MEDIA_DIR" -v "$CACHE_DIR":"$CACHE_DIR" tach
 - `cut --dtvi` を省略しても、直前に `analyze` した同じ入力なら `--cache-dir` から `.dtvi` を自動解決できる（実測: `cut` を `--dtvi` 無しで実行して成功）
 - 出力（`sample_CMcut.mp4`）がホスト側のメディアディレクトリに書き戻される（rw マウントが機能している）
 
-**`--no-cm` を付けた理由**: `sample.mp4` は CM 検出テスト用ではなく単体テスト用の合成素材で、実際の CM ブロックを含まない。`join_logo_scp` はこの入力全体を保持区間と判定するため、`auto` が既定で付ける CM 側出力（`--no-cm` 未指定時の `*_CM.mp4`）の保持区間が空になり、`cut` が「出力に含まれるトラックが1本もありません」で失敗する。これは**この合成フィクスチャの内容に起因する既知の挙動**で、Docker 環境固有の問題ではない（ネイティブ実行でも同じ入力・同じオプションなら同じ結果になる）。実際の録画ファイル（CM を含む）であれば `--no-cm` は不要。
+**`--cm-output` を付けなかった理由**: `auto` は `--cm-output` を指定したときだけ CM 側を出す（#73。以前は既定で `*_CM.mp4` を出す仕様で、抑止用のフラグを別に用意していた）。`sample.mp4` は CM 検出テスト用ではなく単体テスト用の合成素材で、実際の CM ブロックを含まない。`join_logo_scp` はこの入力全体を保持区間と判定するため、CM 側を出そうとすると保持区間が空になり、`cut` が「出力に含まれるトラックが1本もありません」で失敗する。これは**この合成フィクスチャの内容に起因する既知の挙動**で、Docker 環境固有の問題ではない（ネイティブ実行でも同じ入力・同じオプションなら同じ結果になる）。実際の録画ファイル（CM を含む）であれば `--cm-output` を付けて構わない。
 
-`--force` を付けた理由: 同じ理由（検出対象の CM がそもそも無い合成素材）で gate が「除去フレーム数 0 → 疑わしいので止める」と判定するため、smoke test として最後まで通す目的で判定を無視した。実際の運用では gate の停止判定を無視せず、`trim.avs` を確認してから `--force` するか `cut` を直接叩くこと。
+`--ignore-gate` を付けた理由: 同じ理由（検出対象の CM がそもそも無い合成素材）で gate が「除去フレーム数 0 → 疑わしいので止める」と判定するため、smoke test として最後まで通す目的で判定を無視した。実際の運用では gate の停止判定を無視せず、`trim.avs` を確認してから `--ignore-gate` するか `cut` を直接叩くこと。
 
 ### キャッシュは再実行を省略しない（実測）
 
-同じ入力・同じ `--cache-dir`（ホストにマウント済み、内容も共有できる状態）で `auto --overwrite` を2回連続実行し、両回のログを比較した。**2回目も `dtvindex build` / `chapter_exe -v` / `join_logo_scp` が3つとも全く同じコマンドラインで再実行される。** これは Docker 固有の問題ではなく tachikaze 共通の挙動で、`analyze` に「既存の成果物があれば再実行をスキップする」判定が無いため（キャッシュは「`cut` が `.dtvi` を自動解決できるようにするための受け渡し場所」であって、再実行を省略する仕組みではない）。したがって「キャッシュを共有すれば2回目以降が速くなる」という期待は**外れる**。速くなるとしたら OS のページキャッシュ（同じファイルの再読み込みが速くなる）程度で、`dtvindex`/`chapter_exe`/`join_logo_scp` の実行自体は毎回フルで走る。
+同じ入力・同じ `--cache-dir`（ホストにマウント済み、内容も共有できる状態）で `auto` に `-f`（既存出力の上書き、#73）を付けて2回連続実行し、両回のログを比較した。**2回目も `dtvindex build` / `chapter_exe -v` / `join_logo_scp` が3つとも全く同じコマンドラインで再実行される。** これは Docker 固有の問題ではなく tachikaze 共通の挙動で、`analyze` に「既存の成果物があれば再実行をスキップする」判定が無いため（キャッシュは「`cut` が `.dtvi` を自動解決できるようにするための受け渡し場所」であって、再実行を省略する仕組みではない）。したがって「キャッシュを共有すれば2回目以降が速くなる」という期待は**外れる**。速くなるとしたら OS のページキャッシュ（同じファイルの再読み込みが速くなる）程度で、`dtvindex`/`chapter_exe`/`join_logo_scp` の実行自体は毎回フルで走る。
 
 ### CM 側出力・字幕サイドカーの確認（実測）
 
-- **CM 側出力（`--cm-output`）**: `sample.mp4` は前述の理由で `auto` の既定 CM 側出力が空になり検証できないため、`trim.avs` を手動で `Trim(0,300)`（保持区間を意図的に一部だけにする）へ書き換え、`cut --cm-output` を直接叩いて確認した。保持側（`PARTIAL.mp4`、映像パケット数360）・CM 側（`PARTIAL_CM.mp4`、映像パケット数239）の両方が生成され、両方で自己検証と `--verify` の CRC32 検証が通った
-- **字幕サイドカー**: `sample.mp4` に `mov_text` 字幕トラック（`tests/prepare_e2e.rs::make_subtitle_fixture` と同じ手順）を1本追加した `sample_subs.mp4` を作り、コンテナ内で `auto --cache-dir $CACHE_DIR --verify --force --no-cm` を実行した。`prepare` が字幕を抽出してキャッシュへ前処理済み入力を作り、`cut` 後に `remap-subs` が自動で走って `sample_subs_CMcut.srt`（シフト2件 / 破棄0件 / クリップ0件）をホスト側のメディアディレクトリに書き出すことを確認した
+- **CM 側出力（`--cm-output`）**: `sample.mp4` は前述の理由で `auto --cm-output` を付けると CM 側の保持区間が空になり検証できないため、`trim.avs` を手動で `Trim(0,300)`（保持区間を意図的に一部だけにする）へ書き換え、`cut --cm-output` を直接叩いて確認した。保持側（`PARTIAL.mp4`、映像パケット数360）・CM 側（`PARTIAL_CM.mp4`、映像パケット数239）の両方が生成され、両方で自己検証と `--verify` の CRC32 検証が通った
+- **字幕サイドカー**: `sample.mp4` に `mov_text` 字幕トラック（`tests/prepare_e2e.rs::make_subtitle_fixture` と同じ手順）を1本追加した `sample_subs.mp4` を作り、コンテナ内で `auto --cache-dir $CACHE_DIR --verify --ignore-gate -o $MEDIA_DIR/sample_subs_CMcut.mp4` を実行した。`prepare` が字幕を抽出してキャッシュへ前処理済み入力を作り、`cut` 後に `remap-subs` が自動で走って `sample_subs_CMcut.srt`（`-o` と同じ stem、シフト2件 / 破棄0件 / クリップ0件）をホスト側のメディアディレクトリに書き出すことを確認した
 
 ## 既知の制約
 

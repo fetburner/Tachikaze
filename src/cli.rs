@@ -48,8 +48,12 @@ pub enum Commands {
     /// 変わらない）。exit code は 0=完了 / 1=エラー / 2=引数の誤り（clap 既定） /
     /// 3=判定で停止 の4種類のみ。1プロセスにつき入力は1本
     /// （複数ファイルはシェルのループに任せる）。
-    #[command(after_help = "複数ファイルを処理するときはシェルでループする:\n\
-        \n    for f in *.mp4; do tachikaze auto \"$f\" -o \"${f%.mp4}_CMcut.mp4\"; done\n")]
+    #[command(
+        after_help = "複数ファイルを処理するときはシェルでループする（出力を\n\
+        _CMcut.mp4 サフィックス付きに固定し、case で前回の出力を glob に\n\
+        再度取り込まないようにする）:\n\
+        \n    for f in *.mp4; do case \"$f\" in *_CMcut.mp4) continue;; esac; tachikaze auto \"$f\" -o \"${f%.mp4}_CMcut.mp4\"; done\n"
+    )]
     Auto(AutoArgs),
 }
 
@@ -151,8 +155,9 @@ pub struct RemapSubsArgs {
     pub subs: Option<PathBuf>,
 
     /// 出力先。未指定なら入力の隣に `<入力のstem>_CMcut.<字幕の拡張子>`
-    /// を書く（`cut` の既定の出力名 `*_CMcut.mp4` と同じ stem にすることで、
-    /// プレイヤーが同名の字幕を自動で読み込める）。
+    /// を書く（`cut`/`auto` の `-o` は必須で既定名を持たないが、多くの場合
+    /// `*_CMcut.mp4` という stem を使う運用と揃えることで、プレイヤーが
+    /// 同名の字幕を自動で読み込める）。
     #[arg(short, long)]
     pub output: Option<PathBuf>,
 }
