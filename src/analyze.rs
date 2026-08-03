@@ -40,8 +40,11 @@ const DEFAULT_JLS_SET: &[(&str, &str)] = &[("autocm_sub", "11"), ("param_cuttr",
 pub struct AnalyzeConfig {
     /// 入力 mp4 ファイル。
     pub input: PathBuf,
-    /// 最終的な `trim.avs` の出力先。
-    pub output: PathBuf,
+    /// `trim.avs` をキャッシュ以外にも書き出すパス。`None` ならキャッシュ
+    /// （[`AnalyzeOutput::cache_trim_path`]）にだけ書く。標準出力へ書く場合
+    /// （CLI の `-o -`）はここに渡さず、呼び出し側が [`AnalyzeOutput::raw_trim`]
+    /// を使う（`-` という名前のファイルを作ってしまわないため、CLAUDE.md の罠）。
+    pub output: Option<PathBuf>,
     /// `--cache-dir`（キャッシュの根）。未指定なら既定値
     /// （`workdir::cache_root` の doc comment参照）。
     pub cache_dir: Option<PathBuf>,
@@ -64,6 +67,12 @@ pub struct AnalyzeOutput {
     pub dtvi: Dtvi,
     /// `join_logo_scp -oscp` が生成した `detail.jls` の内容。
     pub jls_entries: Vec<JlsEntry>,
+    /// `trim.avs` の生の内容（`join_logo_scp -o` が書いたバイト列そのまま）。
+    /// CLI の `-o -` で標準出力に書くときに使う（`trim.to_string()` で
+    /// 再構成すると、パース→再組み立てで元のバイト列と一致する保証が無いため）。
+    pub raw_trim: String,
+    /// `trim.avs` が書かれたキャッシュ内の実際のパス。`-o` 省略時に案内するため。
+    pub cache_trim_path: PathBuf,
 }
 
 /// analyze パイプラインを実行し、生成された `trim.avs` / `.dtvi` / `detail.jls` を
@@ -188,13 +197,12 @@ fn run_pipeline(
     let trim = TrimList::parse(&output_content)
         .map_err(|err| anyhow!("生成された trim.avs のパースに失敗しました: {err}"))?;
 
-    if !same_path(&trim_avs_path, &config.output)? {
-        fs::write(&config.output, &output_content).with_context(|| {
-            format!(
-                "trim.avs の書き出しに失敗しました: {}",
-                config.output.display()
-            )
-        })?;
+    if let Some(dest) = &config.output {
+        if !same_path(&trim_avs_path, dest)? {
+            fs::write(dest, &output_content).with_context(|| {
+                format!("trim.avs の書き出しに失敗しました: {}", dest.display())
+            })?;
+        }
     }
 
     let dtvi_content = fs::read_to_string(&dtvi_path).with_context(|| {
@@ -219,6 +227,8 @@ fn run_pipeline(
         trim,
         dtvi,
         jls_entries,
+        raw_trim: output_content,
+        cache_trim_path: trim_avs_path,
     })
 }
 
@@ -463,7 +473,7 @@ mod tests {
         let config = AnalyzeConfig {
             // ツール解決が入力の存在確認より前に走るため、実在しないパスでよい。
             input: PathBuf::from("/nonexistent/input-for-analyze-test.mp4"),
-            output,
+            output: Some(output),
             cache_dir: None,
             jls_set: vec![],
             jl_file: None,
@@ -529,7 +539,7 @@ mod tests {
 
         let config = AnalyzeConfig {
             input: input_path,
-            output: output_dir.join("trim.avs"),
+            output: Some(output_dir.join("trim.avs")),
             cache_dir: Some(cache_root.clone()),
             jls_set: vec![],
             jl_file: None,
@@ -553,6 +563,98 @@ mod tests {
         fs::remove_dir_all(&fake_tools_dir).ok();
         fs::remove_dir_all(&input_dir).ok();
         fs::remove_dir_all(&output_dir).ok();
+        fs::remove_dir_all(&cache_root).ok();
+    }
+
+    #[test]
+    fn run_writes_trim_avs_to_cache_and_optionally_to_explicit_path() {
+        // 完了条件(issue #72): `-o` 省略時（`output: None`）はキャッシュにだけ書き、
+        // `AnalyzeOutput::cache_trim_path` でその場所が分かる。`output: Some(path)`
+        // 指定時は従来どおりそのパスにも書く。どちらでも `raw_trim` は
+        // join_logo_scp が書いた内容と一致する（CLI の `-o -` がこれをそのまま
+        // 標準出力に書くため、パース→再構成に頼らず生の内容を保持する）。
+        let cache_root = unique_scratch_dir("cache-only-cache");
+
+        let _path_env_guard = TOOL_PATH_ENV_LOCK.lock().unwrap();
+        let fake_tools_prefix = unique_scratch_dir("cache-only-tools");
+        let bin_dir = fake_tools_prefix.join("bin");
+        fs::create_dir_all(&bin_dir).expect("bin_dir を作れること");
+        let input_dir = unique_scratch_dir("cache-only-input");
+        let input_path = input_dir.join("IN.mp4");
+        fs::write(&input_path, b"dummy mp4 content").expect("write dummy input");
+
+        let dtvi_src = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/sample.dtvi");
+        write_executable_script(
+            &bin_dir.join(DTVINDEX),
+            &format!(
+                "#!/bin/sh\nprev=\"\"\nfor a in \"$@\"; do\n  if [ \"$prev\" = \"-o\" ]; then\n    /bin/cp \"{}\" \"$a\"\n  fi\n  prev=\"$a\"\ndone\nexit 0\n",
+                dtvi_src.display()
+            ),
+        );
+        write_executable_script(
+            &bin_dir.join(CHAPTER_EXE),
+            "#!/bin/sh\nprev=\"\"\nfor a in \"$@\"; do\n  if [ \"$prev\" = \"-o\" ]; then\n    printf 'scp placeholder\\n' > \"$a\"\n  fi\n  prev=\"$a\"\ndone\nexit 0\n",
+        );
+        const TRIM_CONTENT: &str = "Trim(0,19)";
+        let detail_jls = "開始 終了 秒数 誤差 ロゴ秒 ラベル\n0 39 1 0 0 :L\n";
+        write_executable_script(
+            &bin_dir.join(JOIN_LOGO_SCP),
+            &format!(
+                "#!/bin/sh\nprev=\"\"\nfor a in \"$@\"; do\n  case \"$prev\" in\n    -o) printf '{}' > \"$a\" ;;\n    -oscp) printf '{}' > \"$a\" ;;\n  esac\n  prev=\"$a\"\ndone\nexit 0\n",
+                TRIM_CONTENT, detail_jls
+            ),
+        );
+        // `default_jl_command_file` は `join_logo_scp` の実体パスから
+        // `<親の親>/share/join_logo_scp/JL/JL_標準.txt` を導出する（`src/tools.rs`）。
+        let jl_dir = fake_tools_prefix
+            .join("share")
+            .join("join_logo_scp")
+            .join("JL");
+        fs::create_dir_all(&jl_dir).expect("jl_dir を作れること");
+        fs::write(jl_dir.join("JL_標準.txt"), "placeholder\n").expect("JLファイルを書けること");
+
+        let _path_env = ToolPathEnvGuard::set("PATH", &bin_dir);
+
+        // output: None -> キャッシュにだけ書く
+        let config_none = AnalyzeConfig {
+            input: input_path.clone(),
+            output: None,
+            cache_dir: Some(cache_root.clone()),
+            jls_set: vec![],
+            jl_file: None,
+        };
+        let out_none = run(&config_none).expect("output なしでも成功するはず");
+        assert_eq!(out_none.raw_trim, TRIM_CONTENT);
+        assert!(
+            out_none.cache_trim_path.is_file(),
+            "キャッシュに trim.avs が残っているはず"
+        );
+        assert_eq!(
+            fs::read_to_string(&out_none.cache_trim_path).unwrap(),
+            TRIM_CONTENT
+        );
+
+        // output: Some(path) -> キャッシュに加えて明示パスにも書く
+        let explicit_dir = unique_scratch_dir("cache-only-explicit");
+        let explicit_path = explicit_dir.join("trim.avs");
+        let config_some = AnalyzeConfig {
+            input: input_path.clone(),
+            output: Some(explicit_path.clone()),
+            cache_dir: Some(cache_root.clone()),
+            jls_set: vec![],
+            jl_file: None,
+        };
+        let out_some = run(&config_some).expect("明示パスでも成功するはず");
+        assert_eq!(out_some.raw_trim, TRIM_CONTENT);
+        assert_eq!(
+            fs::read_to_string(&explicit_path).unwrap(),
+            TRIM_CONTENT,
+            "明示パスにも書かれているはず"
+        );
+
+        fs::remove_dir_all(&fake_tools_prefix).ok();
+        fs::remove_dir_all(&input_dir).ok();
+        fs::remove_dir_all(&explicit_dir).ok();
         fs::remove_dir_all(&cache_root).ok();
     }
 
@@ -580,7 +682,7 @@ mod tests {
                 env!("CARGO_MANIFEST_DIR"),
                 "/tests/fixtures/sample.mp4"
             )),
-            output: output_dir.join("trim.avs"),
+            output: Some(output_dir.join("trim.avs")),
             cache_dir: Some(cache_root.clone()),
             jls_set: vec![],
             jl_file: None,

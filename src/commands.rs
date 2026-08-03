@@ -5,6 +5,7 @@
 
 use std::collections::HashSet;
 use std::fs;
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context};
@@ -97,18 +98,18 @@ fn run_prepare(cache_dir: Option<PathBuf>, args: PrepareArgs) -> anyhow::Result<
     let outcome = prepare::run(&input, cache_dir.as_deref(), subs.as_deref())?;
 
     if outcome.ran_ffmpeg {
-        println!("prepare 完了: {}", outcome.media_path.display());
+        eprintln!("prepare 完了: {}", outcome.media_path.display());
         if outcome.had_edit_list {
-            println!("  edit list (elst) を除去しました。");
+            eprintln!("  edit list (elst) を除去しました。");
         }
     } else {
-        println!(
+        eprintln!(
             "prepare 不要: 入力をそのまま使えます: {}",
             outcome.media_path.display()
         );
     }
     if let Some(subtitle_path) = &outcome.subtitle_path {
-        println!("字幕: {}", subtitle_path.display());
+        eprintln!("字幕: {}", subtitle_path.display());
     }
 
     Ok(())
@@ -126,6 +127,9 @@ fn run_remap_subs(cache_dir: Option<PathBuf>, args: RemapSubsArgs) -> anyhow::Re
         subs: subs_path_arg,
         output,
     } = args;
+    if let Some(path) = &output {
+        reject_dash_output(path, "-o/--output")?;
+    }
     let segment_map_path =
         resolve_segment_map_path(segment_map_path, cache_dir.as_deref(), &input)?;
     let segment_map_json = fs::read_to_string(&segment_map_path).with_context(|| {
@@ -165,7 +169,7 @@ fn run_remap_subs(cache_dir: Option<PathBuf>, args: RemapSubsArgs) -> anyhow::Re
         .with_context(|| format!("字幕の書き出しに失敗しました: {}", output.display()))?;
 
     let stats = &remap_output.stats;
-    println!(
+    eprintln!(
         "remap-subs 完了: {}（シフト {} 件 / 破棄 {} 件 / クリップ {} 件）",
         output.display(),
         stats.shifted,
@@ -251,6 +255,23 @@ fn resolve_subs_path(
     );
 }
 
+/// `-` を出力パスとして受け取ったときに拒否する。mp4・区間マップ・字幕サイドカーは
+/// いずれも seek や事後の rename を伴う書き込みで、標準出力には出せない。
+/// 拒否せずに `fs::write` / `File::create` へそのまま渡すと、`-` という名前の
+/// ファイルをカレントディレクトリに黙って作ってしまう（CLAUDE.md の罠。`analyze -o -`
+/// だけが標準出力を意味する特別扱いで、`commands::run_analyze` が別に処理する）。
+///
+/// `pub(crate)`: `auto::run`（#62）が `cut` と同じ出力先（`output` / `cm_output`）を
+/// 検証するため。
+pub(crate) fn reject_dash_output(path: &Path, flag: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        path != Path::new("-"),
+        "{flag} に `-`（標準出力）は指定できません: シーク可能なファイルとして書き込む\
+         必要があるため、実際のパスを指定してください"
+    );
+    Ok(())
+}
+
 /// `-o` 省略時の出力先。`cut` の既定の出力名 `*_CMcut.mp4`
 /// （かつて存在したシェルラッパー `scripts/tachikaze-cmcut` の `build_output_path`
 /// も同じ規則だった。`auto` の追加に伴い削除済み、`[E11-7]`）と同じ stem に
@@ -269,6 +290,12 @@ pub(crate) fn default_remap_subs_output_path(input: &Path, extension: &str) -> P
     dir.join(format!("{stem}_CMcut.{extension}"))
 }
 
+/// `analyze` サブコマンドの実行。`-o` の3通り（省略/明示パス/`-`）を
+/// [`analyze::AnalyzeConfig::output`] と [`analyze::AnalyzeOutput`] の
+/// 組み合わせで処理する: 省略はキャッシュのみ（`cache_trim_path` を stderr へ
+/// 案内）、明示パスは従来どおり、`-` は標準出力（`raw_trim` を直接書く。
+/// パース結果の `TrimList` を再シリアライズすると元のバイト列と一致する
+/// 保証が無いため使わない）。
 fn run_analyze(cache_dir: Option<PathBuf>, args: AnalyzeArgs) -> anyhow::Result<()> {
     let AnalyzeArgs {
         input,
@@ -283,35 +310,61 @@ fn run_analyze(cache_dir: Option<PathBuf>, args: AnalyzeArgs) -> anyhow::Result<
         .map(|raw| analyze::parse_jls_set_arg(raw))
         .collect::<anyhow::Result<Vec<_>>>()?;
 
+    // `-o -` は標準出力を意味するため、`-` という名前のファイルを作ってしまわない
+    // よう、`analyze::AnalyzeConfig::output` には渡さない（キャッシュにだけ書かせ、
+    // 生の内容は `AnalyzeOutput::raw_trim` から直接標準出力へ書く。CLAUDE.md の罠）。
+    let to_stdout = output.as_deref() == Some(Path::new("-"));
+    let explicit_output = if to_stdout { None } else { output.clone() };
+
     let config = analyze::AnalyzeConfig {
         input,
-        output: output.clone(),
+        output: explicit_output,
         cache_dir,
         jls_set,
         jl_file,
     };
 
     let result = analyze::run(&config)?;
-    println!("trim.avs を書き出しました: {}", output.display());
+
+    if to_stdout {
+        let mut stdout = io::stdout();
+        stdout
+            .write_all(result.raw_trim.as_bytes())
+            .context("trim.avs の標準出力への書き出しに失敗しました")?;
+        // `io::stdout()` は行バッファリングのため、`raw_trim` が改行で終わらない
+        // 場合はプロセス終了時の暗黙 flush 頼みになり、そこでの書き込みエラーが
+        // 黙って捨てられる（exit 0 になりうる）。明示的に flush してエラーを拾う。
+        stdout
+            .flush()
+            .context("trim.avs の標準出力への flush に失敗しました")?;
+        eprintln!("trim.avs を標準出力へ書き出しました。");
+    } else if let Some(path) = &output {
+        eprintln!("trim.avs を書き出しました: {}", path.display());
+    } else {
+        eprintln!(
+            "trim.avs をキャッシュへ書き出しました: {}",
+            result.cache_trim_path.display()
+        );
+    }
 
     if show_report {
         let fps = fps_from_dtvi(&result.dtvi);
 
-        println!(
+        eprintln!(
             "\n{}",
             report::format_report(&result.trim, &result.dtvi, &result.jls_entries, true)
         );
 
         let missed = report::missed::find_missed_candidates(&result.trim, &result.jls_entries);
         if !missed.is_empty() {
-            println!("見逃し候補の警告:");
+            eprintln!("見逃し候補の警告:");
             for candidate in &missed {
-                println!("{}", report::missed::format_warning(candidate, fps));
+                eprintln!("{}", report::missed::format_warning(candidate, fps));
             }
         }
 
         let verdict = gate::evaluate(&result.trim, &result.jls_entries, &result.dtvi);
-        println!("\n{}", gate::format_gate_report(&verdict));
+        eprintln!("\n{}", gate::format_gate_report(&verdict));
     }
 
     Ok(())
@@ -413,7 +466,10 @@ pub(crate) struct CutOutcome {
 
 /// `cut` パイプライン本体。`run_cut`（CLI ハンドラ）と `auto::run` の両方から呼ばれる
 /// （`auto` がこのロジックを複製しないための唯一の入口。上記 `run_cut` の doc comment
-/// 参照）。標準出力への `println!` は一切行わない（結果表示は呼び出し側の責務）。
+/// 参照）。コンソールへの出力は一切行わない（結果表示は呼び出し側の責務）。
+/// `params.trim_path` が `-` の場合、標準入力を最後まで読むまでブロックする
+/// （`auto::run` は常に実ファイルパスを渡すため、この経路は CLI の `cut` からのみ
+/// 到達する）。
 pub(crate) fn execute_cut(params: CutParams) -> anyhow::Result<CutOutcome> {
     let CutParams {
         cache_dir,
@@ -427,6 +483,17 @@ pub(crate) fn execute_cut(params: CutParams) -> anyhow::Result<CutOutcome> {
         cm_output,
         segment_map_path,
     } = params;
+
+    // mp4 / 区間マップは seek が要るため stdout には出せない。`-` を渡すと
+    // `-` という名前のファイルを黙って作ってしまう（CLAUDE.md の罠）ため、
+    // 出力になり得る全パスで明示的に拒否する。
+    reject_dash_output(&output, "-o/--output")?;
+    if let Some(path) = &cm_output {
+        reject_dash_output(path, "--cm-output")?;
+    }
+    if let Some(path) = &segment_map_path {
+        reject_dash_output(path, "--segment-map")?;
+    }
 
     // 自己検証を通って新しいマップを書けた場合だけ区間マップが残る、という状態に
     // するため、処理を始める前に既定キャッシュパスの古い区間マップを削除する
@@ -482,12 +549,21 @@ pub(crate) fn execute_cut(params: CutParams) -> anyhow::Result<CutOutcome> {
     let sync_display = map.sync_display_indices();
     let total_frames = video_samples.len() as u32;
 
-    let trim_content = fs::read_to_string(&trim_path).with_context(|| {
-        format!(
-            "trim ファイルの読み込みに失敗しました: {}",
-            trim_path.display()
-        )
-    })?;
+    // `--trim -` は標準入力を意味する（`analyze -o -` の出力をそのまま渡せる）。
+    let trim_content = if trim_path == Path::new("-") {
+        let mut buf = String::new();
+        io::stdin()
+            .read_to_string(&mut buf)
+            .context("trim の標準入力からの読み込みに失敗しました")?;
+        buf
+    } else {
+        fs::read_to_string(&trim_path).with_context(|| {
+            format!(
+                "trim ファイルの読み込みに失敗しました: {}",
+                trim_path.display()
+            )
+        })?
+    };
     let trim = trim::TrimList::parse(&trim_content)
         .map_err(|err| anyhow!("trim ファイルのパースに失敗しました: {err}"))?;
 
@@ -844,13 +920,13 @@ pub(crate) fn print_cut_report(
     output: &Path,
     report: &verify::VerifyReport,
 ) {
-    println!("{label}: {}", output.display());
-    println!(
+    eprintln!("{label}: {}", output.display());
+    eprintln!(
         "映像パケット数: {} / {range_label}: {}",
         report.video_packet_count, report.video_range_count
     );
     if let Some(av_sync) = &report.av_sync {
-        println!("{}", audio::format_av_sync_report(av_sync));
+        eprintln!("{}", audio::format_av_sync_report(av_sync));
     }
 }
 
@@ -1086,6 +1162,19 @@ mod tests {
     use std::env;
     use std::process;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn reject_dash_output_rejects_bare_dash() {
+        let err = reject_dash_output(Path::new("-"), "--cm-output").expect_err("拒否するはず");
+        assert!(err.to_string().contains("--cm-output"));
+    }
+
+    #[test]
+    fn reject_dash_output_allows_other_paths() {
+        reject_dash_output(Path::new("out.mp4"), "-o/--output").expect("通常のパスは通るはず");
+        reject_dash_output(Path::new("./-weird-but-not-bare-dash.mp4"), "-o/--output")
+            .expect("`-` で始まるだけの通常のファイル名は拒否しないはず");
+    }
 
     fn make_scratch_dir(label: &str) -> PathBuf {
         let base = env::temp_dir();

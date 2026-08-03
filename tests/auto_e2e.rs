@@ -31,8 +31,9 @@
 
 mod common;
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 /// `tests/data/sample.dtvi` は `dtvi.rs` の単体テスト向けに用意された固定
 /// フィクスチャで、**フレーム表（`FRAMES` セクション）が先頭40フレーム分しか無い**
@@ -241,8 +242,8 @@ fn auto_completes_full_pipeline_with_fake_tools() {
     );
     assert_eq!(output.status.code(), Some(0), "exit code は 0 のはず");
     assert!(
-        stdout.contains("[auto] 完了:"),
-        "完了の表示が期待どおりでない: {stdout}"
+        stderr.contains("[auto] 完了:"),
+        "完了の表示が期待どおりでない: {stderr}"
     );
 
     let out_path = tmp_dir.join("IN_CMcut.mp4");
@@ -338,34 +339,33 @@ fn auto_force_overrides_gate_stop_but_gate_alone_stops_without_it() {
             cmd.arg("--force");
         }
         let output = cmd.output().expect("tachikaze auto の起動に失敗した");
-        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
 
         let out_path = tmp_dir.join("IN_CMcut.mp4");
         if use_force {
             assert!(
                 output.status.success(),
-                "--force のため完走するはず: stdout={stdout}"
+                "--force のため完走するはず: stderr={stderr}"
             );
             assert_eq!(output.status.code(), Some(0));
             assert!(
-                stdout.contains("--force"),
-                "--force を使って続行した旨のログが無い: {stdout}"
+                stderr.contains("--force"),
+                "--force を使って続行した旨のログが無い: {stderr}"
             );
             assert!(out_path.is_file(), "--force 指定時は cut まで進むはず");
         } else {
-            let stderr = String::from_utf8_lossy(&output.stderr);
             assert_eq!(
                 output.status.code(),
                 Some(3),
-                "gate が止めた場合は exit code 3 のはず: stdout={stdout}"
+                "gate が止めた場合は exit code 3 のはず: stderr={stderr}"
             );
             assert!(
-                stdout.contains("gate が疑わしいと判定したため、cut を実行せず停止します"),
-                "gate 停止の旨が出ていない: {stdout}"
+                stderr.contains("gate が疑わしいと判定したため、cut を実行せず停止します"),
+                "gate 停止の旨が出ていない: {stderr}"
             );
             assert!(
-                stdout.contains("tachikaze cut"),
-                "直して cut するコマンド例が出ていない: {stdout}"
+                stderr.contains("tachikaze cut"),
+                "直して cut するコマンド例が出ていない: {stderr}"
             );
             assert!(
                 stderr.contains("exit code 3"),
@@ -379,6 +379,122 @@ fn auto_force_overrides_gate_stop_but_gate_alone_stops_without_it() {
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }
+}
+
+/// 完了条件(issue #72):
+/// - `analyze -o -` の出力が標準出力に出て、`-o PATH` と同じ内容になる
+/// - `cut --trim -` が標準入力から trim を読める
+/// - `auto` の標準出力は完全に空（診断はすべて stderr、CLAUDE.md の方針）
+#[test]
+#[ignore = "tests/fixtures/sample.mp4 と tests/data/sample.dtvi、ffprobe が必要。tests/fixtures/gen.sh を先に実行すること"]
+fn analyze_and_cut_support_dash_for_stdout_and_stdin() {
+    if common::skip_if_fixture_missing() {
+        return;
+    }
+    if !ffprobe_available() {
+        eprintln!("ffprobe が無いためスキップします。");
+        return;
+    }
+
+    let tmp_dir = make_tmp_dir("dash-stdio");
+    let input = tmp_dir.join("IN.mp4");
+    std::fs::copy(common::fixture_path(), &input).expect("フィクスチャをコピーできること");
+    let bin_dir = setup_fake_analyze_tools(&tmp_dir);
+
+    // `analyze -o -`: trim.avs を標準出力に書く。
+    let stdout_run = Command::new(env!("CARGO_BIN_EXE_tachikaze"))
+        .arg("--cache-dir")
+        .arg(tmp_dir.join("cache-stdout"))
+        .arg("analyze")
+        .arg(&input)
+        .arg("-o")
+        .arg("-")
+        .env("PATH", prepend_path(&bin_dir))
+        .output()
+        .expect("tachikaze analyze -o - の起動に失敗した");
+    assert!(
+        stdout_run.status.success(),
+        "analyze -o - が失敗した: stderr={}",
+        String::from_utf8_lossy(&stdout_run.stderr)
+    );
+    assert_eq!(
+        stdout_run.stdout,
+        FULL_SUCCESS_TRIM_AVS_CONTENT.as_bytes(),
+        "標準出力には trim.avs の中身だけが出るはず"
+    );
+
+    // `analyze -o PATH`: 別キャッシュで同じ入力を処理し、明示パスの中身が
+    // 標準出力と完全に一致することを確認する（`raw_trim` を経由するため
+    // パース→再構成に頼らずバイト一致するはず）。
+    let explicit_path = tmp_dir.join("trim_explicit.avs");
+    let explicit_run = Command::new(env!("CARGO_BIN_EXE_tachikaze"))
+        .arg("--cache-dir")
+        .arg(tmp_dir.join("cache-explicit"))
+        .arg("analyze")
+        .arg(&input)
+        .arg("-o")
+        .arg(&explicit_path)
+        .env("PATH", prepend_path(&bin_dir))
+        .output()
+        .expect("tachikaze analyze -o PATH の起動に失敗した");
+    assert!(
+        explicit_run.status.success(),
+        "analyze -o PATH が失敗した: stderr={}",
+        String::from_utf8_lossy(&explicit_run.stderr)
+    );
+    assert_eq!(
+        stdout_run.stdout,
+        std::fs::read(&explicit_path).expect("明示パスの trim.avs を読めること"),
+        "-o - と -o PATH の中身が一致しないはず"
+    );
+
+    // `cut --trim -`: 上の標準出力をそのまま標準入力へ渡す。
+    let out_path = tmp_dir.join("OUT.mp4");
+    let mut cut_child = Command::new(env!("CARGO_BIN_EXE_tachikaze"))
+        .arg("--cache-dir")
+        .arg(tmp_dir.join("cache-cut"))
+        .arg("cut")
+        .arg(&input)
+        .arg("--trim")
+        .arg("-")
+        .arg("--dtvi")
+        .arg(dtvi_path())
+        .arg("-o")
+        .arg(&out_path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("tachikaze cut --trim - の起動に失敗した");
+    cut_child
+        .stdin
+        .take()
+        .expect("子プロセスの標準入力を取得できること")
+        .write_all(&stdout_run.stdout)
+        .expect("trim を標準入力へ書き込めること");
+    let cut_output = cut_child
+        .wait_with_output()
+        .expect("tachikaze cut --trim - の終了を待てること");
+    assert!(
+        cut_output.status.success(),
+        "cut --trim - が失敗した: stderr={}",
+        String::from_utf8_lossy(&cut_output.stderr)
+    );
+    assert!(out_path.is_file(), "本編が出力されているはず");
+    assert_eq!(
+        video_frame_count(&out_path),
+        FULL_SUCCESS_KEPT_PACKET_COUNT,
+        "本編の映像フレーム数は120のはず"
+    );
+
+    // カレントディレクトリに `-` という名前のファイルが作られていないこと
+    // （CLAUDE.md の罠、issue #72「罠」2）。
+    assert!(
+        !tmp_dir.join("-").exists(),
+        "`-` という名前のファイルが作られてはいけない"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
 }
 
 // ---------------------------------------------------------------------
@@ -502,14 +618,14 @@ fn auto_skips_existing_output_without_overwrite() {
     std::fs::write(&existing_out, b"stale placeholder").expect("既存出力を書けること");
 
     let output = run_auto(&[input.to_str().unwrap()], &tmp_dir.join("cache"));
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
 
     assert!(
         output.status.success(),
-        "スキップは成功扱いのはず: {stdout}"
+        "スキップは成功扱いのはず: {stderr}"
     );
     assert_eq!(output.status.code(), Some(0));
-    assert!(stdout.contains("既存の出力があるためスキップ"), "{stdout}");
+    assert!(stderr.contains("既存の出力があるためスキップ"), "{stderr}");
     assert_eq!(
         std::fs::read(&existing_out).expect("既存出力を読めること"),
         b"stale placeholder",
@@ -539,26 +655,21 @@ fn auto_overwrite_bypasses_skip_and_reaches_analyze() {
         &["--overwrite", input.to_str().unwrap()],
         &tmp_dir.join("cache"),
     );
-    let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
     // 外部ツールを引けない子プロセスなので analyze で失敗する = exit code 1。
-    assert_eq!(
-        output.status.code(),
-        Some(1),
-        "stdout={stdout}\nstderr={stderr}"
+    assert_eq!(output.status.code(), Some(1), "stderr={stderr}");
+    assert!(
+        !stderr.contains("既存の出力があるためスキップします"),
+        "--overwrite 指定時はスキップしないはず: {stderr}"
     );
     assert!(
-        !stdout.contains("既存の出力があるためスキップします"),
-        "--overwrite 指定時はスキップしないはず: {stdout}"
+        stderr.contains("[auto] prepare"),
+        "--overwrite 指定時は prepare まで進むはず: {stderr}"
     );
     assert!(
-        stdout.contains("[auto] prepare"),
-        "--overwrite 指定時は prepare まで進むはず: {stdout}"
-    );
-    assert!(
-        stderr.contains("analyze に失敗しました") || stdout.contains("analyze に失敗しました"),
-        "analyze で失敗した旨が出ていない: stdout={stdout}\nstderr={stderr}"
+        stderr.contains("analyze に失敗しました"),
+        "analyze で失敗した旨が出ていない: stderr={stderr}"
     );
 
     let _ = std::fs::remove_dir_all(&tmp_dir);
@@ -585,25 +696,20 @@ fn auto_analyze_only_stops_before_cut() {
         &["--analyze-only", input.to_str().unwrap()],
         &tmp_dir.join("cache"),
     );
-    let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
-    assert_eq!(
-        output.status.code(),
-        Some(1),
-        "stdout={stdout}\nstderr={stderr}"
+    assert_eq!(output.status.code(), Some(1), "stderr={stderr}");
+    assert!(
+        stderr.contains("[auto] prepare"),
+        "prepare は実行されるはず: {stderr}"
     );
     assert!(
-        stdout.contains("[auto] prepare"),
-        "prepare は実行されるはず: {stdout}"
+        !stderr.contains("[auto] cut:"),
+        "--analyze-only では cut を実行しないはず: {stderr}"
     );
     assert!(
-        !stdout.contains("[auto] cut:"),
-        "--analyze-only では cut を実行しないはず: {stdout}"
-    );
-    assert!(
-        stderr.contains("analyze に失敗しました") || stdout.contains("analyze に失敗しました"),
-        "analyze の段階で失敗した旨が出ていない: stdout={stdout}\nstderr={stderr}"
+        stderr.contains("analyze に失敗しました"),
+        "analyze の段階で失敗した旨が出ていない: stderr={stderr}"
     );
 
     let _ = std::fs::remove_dir_all(&tmp_dir);
