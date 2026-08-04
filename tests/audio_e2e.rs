@@ -49,19 +49,6 @@ use std::process::Command;
 
 // --- 集合比較・パース・順序検証（ffprobe 不要、実ファイル不要） ---
 
-/// `ffprobe -show_entries packet=data_hash -show_data_hash CRC32 -of csv=p=0` の
-/// 出力（1行1パケット、`CRC32:xxxxxxxx` 形式）をパースして集合にする。
-///
-/// 空行は無視する。`sort -u` 相当（重複は `HashSet` で自然に畳み込まれる）。
-fn parse_crc_set(ffprobe_output: &str) -> HashSet<String> {
-    ffprobe_output
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(str::to_string)
-        .collect()
-}
-
 /// `comm -23 out.txt src.txt` 相当: `out` にあって `src` に無い要素を返す
 /// （＝出力にしか存在しないパケット。0件なら全パケットがビットコピー）。
 ///
@@ -190,21 +177,6 @@ fn reference_nearest_cumulative_index(cumulative: &[u64], target: f64) -> u64 {
 #[cfg(test)]
 mod pure_logic_tests {
     use super::*;
-
-    #[test]
-    fn parse_crc_set_dedupes_and_ignores_blank_lines() {
-        let output = "CRC32:aaaa0001\nCRC32:aaaa0002\nCRC32:aaaa0001\n\n";
-        let set = parse_crc_set(output);
-        assert_eq!(set.len(), 2);
-        assert!(set.contains("CRC32:aaaa0001"));
-        assert!(set.contains("CRC32:aaaa0002"));
-    }
-
-    #[test]
-    fn parse_crc_set_of_empty_input_is_empty() {
-        assert!(parse_crc_set("").is_empty());
-        assert!(parse_crc_set("\n\n   \n").is_empty());
-    }
 
     #[test]
     fn packets_only_in_output_is_empty_when_output_is_subset_of_source() {
@@ -430,7 +402,7 @@ mod pure_logic_tests {
 
 /// 音声ストリームの全パケットの CRC32 集合を ffprobe で取得する。
 fn ffprobe_audio_crc_set(path: &Path) -> HashSet<String> {
-    tachikaze::ffprobe::csv_rows(Path::new("ffprobe"), path, "a:0", "packet=data_hash", true)
+    tachikaze::ffprobe::csv_rows(Path::new("ffprobe"), path, "a:0", "packet=data_hash")
         .expect("ffprobe の起動に失敗した（PATH を確認）")
         .into_iter()
         .collect()
@@ -438,7 +410,7 @@ fn ffprobe_audio_crc_set(path: &Path) -> HashSet<String> {
 
 /// 音声ストリームの全パケットの dts を格納順に取得する。
 fn ffprobe_audio_dts(path: &Path) -> Vec<i64> {
-    tachikaze::ffprobe::csv_rows(Path::new("ffprobe"), path, "a:0", "packet=dts", false)
+    tachikaze::ffprobe::csv_rows(Path::new("ffprobe"), path, "a:0", "packet=dts")
         .expect("ffprobe の起動に失敗した")
         .into_iter()
         .map(|line| {
@@ -468,7 +440,7 @@ fn ffprobe_audio_packet_durations(path: &Path) -> Vec<u64> {
 /// 「区間の先頭パケットが元ファイルの正しい位置のパケットと一致するか」という
 /// **位置**の検査には、集合ではなく列としての値が要る。
 fn ffprobe_audio_crc_ordered(path: &Path) -> Vec<String> {
-    tachikaze::ffprobe::csv_rows(Path::new("ffprobe"), path, "a:0", "packet=data_hash", true)
+    tachikaze::ffprobe::csv_rows(Path::new("ffprobe"), path, "a:0", "packet=data_hash")
         .expect("ffprobe の起動に失敗した（PATH を確認）")
 }
 
@@ -497,7 +469,7 @@ fn ffprobe_video_pts(path: &Path) -> Vec<i64> {
 ///
 /// 区間のソース上の絶対開始時刻として使うべきなのは合成時刻（pts 相当）ではなく
 /// **DTS** である（`src/commands.rs::segment_video_source_starts` の doc comment、
-/// CLAUDE.md「静かに壊れる3つの罠」参照）。過去に `expected_video_segments`
+/// CLAUDE.md「静かに壊れる4つの罠」参照）。過去に `expected_video_segments`
 /// （このテストファイルのオラクル）が `ffprobe_video_pts`（合成時刻）をそのまま
 /// 区間開始時刻として使っており、実装本体（`src/commands.rs`）が合成時刻を使う
 /// バグと**同じ間違いを踏んでいた**ため、テストとバグが「合意」してしまい検出でき
@@ -563,7 +535,7 @@ fn ffprobe_audio_packet_positions(path: &Path) -> Vec<(u64, u64)> {
 
 /// `ffprobe ... -of csv=p=0` の出力を空行を除いた行の列として返す。
 fn ffprobe_csv_column(path: &Path, stream_selector: &str, entry: &str) -> Vec<String> {
-    tachikaze::ffprobe::csv_rows(Path::new("ffprobe"), path, stream_selector, entry, false)
+    tachikaze::ffprobe::csv_rows(Path::new("ffprobe"), path, stream_selector, entry)
         .expect("ffprobe の起動に失敗した")
 }
 
@@ -686,7 +658,7 @@ fn run_cut(label: &str) -> (std::path::PathBuf, std::path::PathBuf) {
 /// `video_segment_source_starts` は `SNAPPED_START_DISPLAY_FRAMES` の各表示フレームの
 /// 実測 **dts**（`ffprobe_video_dts`）を使う。合成時刻（pts）ではない
 /// （`src/commands.rs::segment_video_source_starts` の doc comment、CLAUDE.md
-/// 「静かに壊れる3つの罠」参照）。
+/// 「静かに壊れる4つの罠」参照）。
 ///
 /// 過去はここで `ffprobe_video_pts`（合成時刻）を使っており、実装本体
 /// （`src/commands.rs`）が合成時刻を区間開始時刻として使うバグと**まったく同じ

@@ -44,7 +44,7 @@
 //! 検査4（`.dtvi` との突き合わせ）が、表示順とデコード順の混同という唯一の重大バグ源
 //! （CLAUDE.md の罠3）に対する実効的な防御である。`.dtvi` が無いと検査4を一切実行でき
 //! ず、混同があってもエラーを出さずに間違った位置で切られたファイルが出力されてしまう
-//! （CLAUDE.md「静かに壊れる3つの罠」の通り、混同は例外を飛ばさない）。そのため
+//! （CLAUDE.md「静かに壊れる4つの罠」の通り、混同は例外を飛ばさない）。そのため
 //! [`cut_and_verify`] は `dtvi: None` を早期エラーにする。エラーメッセージには
 //! `tachikaze analyze` を先に実行するよう促す趣旨の文言を含める。`.dtvi` 無しでの実行を
 //! 許容するオプション（例: `--skip-dtvi-check`）は本 issue のスコープ外とし、将来
@@ -786,13 +786,13 @@ fn video_packet_crc32_in_decode_order(
     ffprobe_path: &Path,
     path: &Path,
 ) -> anyhow::Result<Vec<String>> {
-    crate::ffprobe::csv_rows(ffprobe_path, path, "v:0", "packet=size,data_hash", true)
+    crate::ffprobe::csv_rows(ffprobe_path, path, "v:0", "packet=size,data_hash")
 }
 
 /// 音声ストリームの全パケットの CRC32 集合を取得する（集合比較のため）。
 fn audio_packet_crc32_set(ffprobe_path: &Path, path: &Path) -> anyhow::Result<HashSet<String>> {
     Ok(
-        crate::ffprobe::csv_rows(ffprobe_path, path, "a:0", "packet=data_hash", true)?
+        crate::ffprobe::csv_rows(ffprobe_path, path, "a:0", "packet=data_hash")?
             .into_iter()
             .collect(),
     )
@@ -801,7 +801,7 @@ fn audio_packet_crc32_set(ffprobe_path: &Path, path: &Path) -> anyhow::Result<Ha
 /// 音声ストリームの全パケットの dts を格納順に取得する（順序検証用。集合比較では
 /// 順序や重複を検出できないため、これで補う）。
 fn audio_packet_dts(ffprobe_path: &Path, path: &Path) -> anyhow::Result<Vec<i64>> {
-    crate::ffprobe::csv_rows(ffprobe_path, path, "a:0", "packet=dts", false)?
+    crate::ffprobe::csv_rows(ffprobe_path, path, "a:0", "packet=dts")?
         .into_iter()
         .map(|line| {
             line.parse::<i64>().with_context(|| {

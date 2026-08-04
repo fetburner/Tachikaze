@@ -379,8 +379,13 @@ pub fn run(
     // この変数は下の match 式より外側（関数本体のスコープ）に置く。match の
     // アーム内で `let` してしまうと、アームのブロックを抜けた時点で drop され、
     // `args` に保持された借用より寿命が短くなってしまう。
-    let mut extracted_subtitle: Option<PathBuf> = None;
+    let extracted_subtitle: Option<PathBuf>;
 
+    // 字幕パスの決定はこの match 式1箇所に集約する。`(Some(format), None)`
+    // アームも他のアームと同じく、そのアームの結果そのものを返す(呼び出し元で
+    // `subtitle_path.or(extracted_subtitle)` のように2つの値を合成しない)。
+    // 決定が2箇所に分かれていると、将来どちらのアームも値を持つよう変更した際に
+    // 片方が黙って捨てられる恐れがあるため。
     let subtitle_path = match (inspection.subtitle, external_subs) {
         (Some(format), Some(external)) => {
             eprintln!(
@@ -396,20 +401,21 @@ pub fn run(
                 workdir::subs_path(cache_dir, input, format.extension())
                     .path_ctx("字幕サイドカーのキャッシュパスの解決", input)?,
             );
-            let subs_out = extracted_subtitle.as_ref().unwrap();
-            eprintln!(
-                "[prepare] 字幕トラック({})を検出しました。抽出します: {}",
-                format.label(),
-                subs_out.display()
-            );
-            args.extend([
-                OsStr::new("-map"),
-                OsStr::new("0:s:0"),
-                OsStr::new("-c:s"),
-                OsStr::new(format.ffmpeg_encoder()),
-                subs_out.as_os_str(),
-            ]);
-            None
+            if let Some(ref subs_out) = extracted_subtitle {
+                eprintln!(
+                    "[prepare] 字幕トラック({})を検出しました。抽出します: {}",
+                    format.label(),
+                    subs_out.display()
+                );
+                args.extend([
+                    OsStr::new("-map"),
+                    OsStr::new("0:s:0"),
+                    OsStr::new("-c:s"),
+                    OsStr::new(format.ffmpeg_encoder()),
+                    subs_out.as_os_str(),
+                ]);
+            }
+            extracted_subtitle.clone()
         }
         (None, Some(external)) => {
             eprintln!(
@@ -430,7 +436,7 @@ pub fn run(
 
     Ok(PrepareOutcome {
         media_path: prepared_path,
-        subtitle_path: subtitle_path.or(extracted_subtitle),
+        subtitle_path,
         ran_ffmpeg: true,
         had_edit_list: inspection.has_edit_list,
     })

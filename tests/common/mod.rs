@@ -83,7 +83,10 @@ pub fn dtvi_path() -> PathBuf {
 // 2種類を用意する。目的が違うので1つに統合しないこと:
 // - `make_tmp_dir`: 同じ名前を再実行のたびに使い回す前提で、前回の残骸
 //   （異常終了などで消し忘れたディレクトリ）を確実に消してから作り直す。
-// - `make_scratch_dir`: nanos とリトライで毎回一意な名前を選び、既存を消さない。
+// - `make_scratch_dir`: nanos で毎回一意な名前を選び、既存を消さない。一意性は
+//   nanos だけが担保する（`create_dir_all` は既存ディレクトリでも `Ok` を返す
+//   ため、衝突検出には使えない。`create_dir` を使うことで、万一 nanos が衝突
+//   しても `AlreadyExists` になり、attempt のリトライが実際に機能する）。
 //   カレントディレクトリを切り替えるテスト（`prepare_e2e.rs` の
 //   `prepare_strips_edit_list_with_relative_input_and_relative_cache_dir`）など、
 //   ディレクトリの削除タイミングに依存したくない場合に使う。
@@ -117,7 +120,7 @@ pub fn make_scratch_dir(label: &str) -> PathBuf {
             .map(|d| d.as_nanos())
             .unwrap_or(0);
         let candidate = base.join(format!("tachikaze-{label}-{pid}-{nanos}-{attempt}"));
-        if std::fs::create_dir_all(&candidate).is_ok() {
+        if std::fs::create_dir(&candidate).is_ok() {
             return candidate;
         }
     }
@@ -172,7 +175,8 @@ pub fn write_executable_script(path: &Path, script: &str) {
     std::fs::set_permissions(path, perms).expect("実行権限を付与できること");
 }
 
-/// `dir` を既存の `PATH` の先頭に前置した文字列を返す（子プロセスの `PATH` に
+/// `dir` を既存の `PATH` の先頭に前置した文字列を返す（外部ツールの解決先を
+/// 差し替える唯一の手段が `PATH` の書き換えであるため、子プロセスの `PATH` に
 /// 偽ツールを注入するためのヘルパ）。
 #[allow(dead_code)]
 pub fn prepend_path(dir: &Path) -> std::ffi::OsString {

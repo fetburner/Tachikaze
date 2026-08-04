@@ -244,7 +244,8 @@ fn absolutize_cache_dir(dir: &Path) -> Result<PathBuf> {
 /// ## `HOME` が未設定でも、たいていエラーにはならない
 ///
 /// `home` は呼び出し元（[`cache_root`]）が `std::env::home_dir()` の戻り値を
-/// そのまま渡す。rustc 1.97.1 時点では非推奨警告が出ず、Unix では
+/// そのまま渡す。`std::env::home_dir()` はかつて非推奨扱いだった時期があるが、
+/// rustc 1.97.1 時点では非推奨警告が出ないことを実測で確認済みで、Unix では
 /// `$HOME` 環境変数が unset でも `getpwuid` 経由でホームディレクトリを引ける
 /// （実測済み）。つまりこの関数が実際に `None` を受け取る（＝エラーになる）のは
 /// 「`$HOME` が無い」だけでは足りず、「呼び出しユーザーの passwd エントリすら
@@ -317,19 +318,23 @@ fn cache_dir_for_input(cache_dir: Option<&Path>, input: &Path) -> Result<PathBuf
 /// [`subs_path`]）はいずれも [`cache_dir_for_input`] 1か所にキャッシュパス規則を
 /// 集約する。呼び出し側ごとにパス規則がずれると、無関係な入力の対応ファイルを
 /// 指してしまいかねないため。ディレクトリの作成はいずれも行わない
-/// （ファイルの存在確認・作成は呼び出し側の責務とする）。
+/// （ファイルの存在確認・作成は呼び出し側の責務とする。`.dtvi` が無いのに
+/// 検証を省略してはいけないため、呼び出し側で明示的に判断させる）。
 pub fn cached_dtvi_path(cache_dir: Option<&Path>, input: &Path) -> Result<PathBuf> {
     Ok(cache_dir_for_input(cache_dir, input)?.join(DTVI_FILE_NAME))
 }
 
 /// `cut` が既定で書き出す区間マップ（`work.mp4.segmap.json`）のキャッシュパスを返す。
+///
+/// パス規則とディレクトリ作成の契約は [`cached_dtvi_path`] 参照。
 pub fn cached_segment_map_path(cache_dir: Option<&Path>, input: &Path) -> Result<PathBuf> {
     Ok(cache_dir_for_input(cache_dir, input)?.join(SEGMENT_MAP_FILE_NAME))
 }
 
 /// `prepare` が elst 除去・字幕トラック除去後のメディアを書き出すキャッシュパスを返す。
 ///
-/// `analyze` / `cut` / `prepare` がすべて同じ入力に対して同じキャッシュディレクトリを
+/// パス規則とディレクトリ作成の契約は [`cached_dtvi_path`] 参照。`analyze` /
+/// `cut` / `prepare` がすべて同じ入力に対して同じキャッシュディレクトリを
 /// 使うため、`cut` が `prepare` の出力を暗黙に見つけられる余地を残す(現時点では
 /// `cut` はこのパスを自動探索しない。呼び出し側が明示的に `prepare` の出力パスを
 /// `cut` の入力として渡す)。
@@ -339,7 +344,8 @@ pub fn prepared_input_path(cache_dir: Option<&Path>, input: &Path) -> Result<Pat
 
 /// `prepare` が字幕サイドカーを書き出すキャッシュパスを返す。
 ///
-/// `extension` には `"ass"` / `"srt"` など、`.` を含まない拡張子を渡す
+/// パス規則とディレクトリ作成の契約は [`cached_dtvi_path`] 参照。`extension`
+/// には `"ass"` / `"srt"` など、`.` を含まない拡張子を渡す
 /// (どちらを使うかは字幕トラックのコーデックから `prepare` が決める。
 /// `prepare::SubtitleFormat` 参照)。
 pub fn subs_path(cache_dir: Option<&Path>, input: &Path, extension: &str) -> Result<PathBuf> {
