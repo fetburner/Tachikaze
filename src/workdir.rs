@@ -244,7 +244,8 @@ fn absolutize_cache_dir(dir: &Path) -> Result<PathBuf> {
 /// ## `HOME` が未設定でも、たいていエラーにはならない
 ///
 /// `home` は呼び出し元（[`cache_root`]）が `std::env::home_dir()` の戻り値を
-/// そのまま渡す。`std::env::home_dir()` はかつて非推奨扱いだった時期があるが、
+/// そのまま渡す。`std::env::home_dir()` はかつて非推奨扱いだった時期があるが
+/// （非推奨の理由は Windows での挙動であり、本ツールは macOS 専用なので関係しない）、
 /// rustc 1.97.1 時点では非推奨警告が出ないことを実測で確認済みで、Unix では
 /// `$HOME` 環境変数が unset でも `getpwuid` 経由でホームディレクトリを引ける
 /// （実測済み）。つまりこの関数が実際に `None` を受け取る（＝エラーになる）のは
@@ -326,7 +327,8 @@ pub fn cached_dtvi_path(cache_dir: Option<&Path>, input: &Path) -> Result<PathBu
 
 /// `cut` が既定で書き出す区間マップ（`work.mp4.segmap.json`）のキャッシュパスを返す。
 ///
-/// パス規則とディレクトリ作成の契約は [`cached_dtvi_path`] 参照。
+/// パス規則とディレクトリ作成の契約は [`cached_dtvi_path`] 参照。ディレクトリの
+/// 作成は行わない（書き込み側で必要なら作る）。
 pub fn cached_segment_map_path(cache_dir: Option<&Path>, input: &Path) -> Result<PathBuf> {
     Ok(cache_dir_for_input(cache_dir, input)?.join(SEGMENT_MAP_FILE_NAME))
 }

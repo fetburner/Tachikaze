@@ -1,12 +1,16 @@
 //! ffprobe を起動して CSV 出力を読む処理の共通実装。
 //!
-//! `-v error -select_streams X -show_entries Y [-show_data_hash CRC32] -of csv=p=0`
-//! という引数列は、`src/verify.rs` の実装（映像/音声パケットの検証）と
-//! `tests/audio_e2e.rs` のテスト側オラクルの双方に、合計8個以上ほぼ同じ形で
-//! コピーされていた。呼び出しごとに微妙に引数の順序や有無が変わると
 //! CLAUDE.md の罠2（無劣化の検証に md5 を使わず、ffprobe の `-show_data_hash CRC32`
-//! でパケット単位に比較する）の実効性が静かに損なわれるため、引数列の組み立てを
-//! [`csv_rows`] の1箇所に集約する。
+//! でパケット単位に比較する）に関わる `-v error -select_streams X -show_entries Y
+//! -show_data_hash CRC32 -of csv=p=0` という CRC32 クエリの引数列は、無劣化検証を
+//! 行う複数の呼び出し元にほぼ同じ形でコピーされていた。呼び出しごとに微妙に
+//! 引数の順序や有無が変わると罠2の実効性が静かに損なわれるため、
+//! `-show_data_hash` を付ける組み立ては [`csv_rows`] の1か所に集約している
+//! （`args.push("-show_data_hash")` を呼ぶのはリポジトリ全体でここだけ）。
+//!
+//! ただし `-show_data_hash` を伴わない一般の CSV クエリ（例: `frame=pts`）まで
+//! すべてここに集約したわけではない。罠2に関わらないため、`tests/` 側の手書きの
+//! 呼び出しがそのまま残っている箇所がある。
 //!
 //! [`csv_rows`] は `-of csv=p=0` 系のクエリを、[`scalar_entry`] は
 //! `-of default=nk=1:nw=1` で単一のスカラー値を取るクエリをそれぞれ担う。
@@ -21,26 +25,40 @@ use anyhow::Context;
 /// `-show_data_hash CRC32` を付けるかどうかは、独立した `bool` 引数ではなく
 /// `entries` に `"data_hash"` が含まれるかどうかから導出する。
 ///
-/// # なぜ独立した `bool` 引数にしないか（実測済みの静かな失敗）
+/// # なぜ独立した `bool` 引数にしないか
 ///
 /// 以前は `csv_rows(ffprobe, target, stream, entries, data_hash: bool)` のように
 /// `entries` と `data_hash` が別々の引数だった。呼び出し側が `entries` に
 /// `"data_hash"` を含めつつ `data_hash: false` を渡す（またはその逆）というズレを
-/// 起こしても、コンパイラは検出できない。そして実際に `data_hash: false` を渡すと
-/// `-show_data_hash CRC32` が付かないだけでなく、`entries=packet=data_hash` は
-/// **ffprobe が終了コード0のまま出力0行を返す**（実測済み）:
+/// 起こしても、コンパイラは検出できない。
+///
+/// ## 実測: `-show_data_hash CRC32` を落として `entries=packet=data_hash` だけを渡すと何が起きるか
 ///
 /// ```console
-/// $ ffprobe -v error -select_streams a:0 -show_entries packet=data_hash -of csv=p=0 IN.mp4
-/// （終了コード 0、出力 0 行、stderr 空）
+/// $ ffprobe -v error -select_streams a:0 -show_entries packet=data_hash -of csv=p=0 tests/fixtures/sample.mp4 > out.txt
+/// exit=0   バイト数=1000   改行数=1000   非空行数=0   stderr=0バイト
+/// 先頭5バイト: \n \n \n \n \n   （すべて改行のみ）
+/// 同じファイルの音声パケット総数=1000
 /// ```
 ///
-/// この結果、[`crate::verify::audio_packet_crc32_set`]（当時の実装）が空集合を
-/// 返し、`--verify` の音声パケット集合比較（`HashSet::difference`）も dts の
-/// 単調増加チェック（`windows(2)`）も、どちらも空集合・空列に対して常に成功する
-/// ため、検証が**エラーを出さずに黙って無効化される**。これは CLAUDE.md の罠2
-/// （無劣化の検証を実効的に行う）の実装そのものが機能しなくなる問題であり、
-/// `entries` から導出する形にすることでこのズレ自体を表現不可能にする。
+/// ffprobe は終了コード0・stderr 空のまま、**音声パケット1つにつき空行1本**を
+/// 返す（1000パケットで1000行。「出力0行」ではない）。`csv_rows` は各行を trim
+/// して空行を除くため、この1000行はすべて畳まれて最終的に `Ok(vec![])` になる
+/// （結論自体は変わらないが、途中で何行返ってきているかは別の観測値）。
+///
+/// ## 構造的な危険（実際に起きたわけではない）
+///
+/// `entries` の文字列と `data_hash: bool` が独立した引数だったことは、上の
+/// ズレをコンパイラが検出できない構造だった。もしズレていれば `csv_rows` の
+/// 戻り値が空になり、`verify_audio_packets_with_ffprobe` の集合比較
+/// （`HashSet::difference` が空集合同士）も dts の単調増加チェック
+/// （`windows(2)` が空列に対して常に真）も両方素通りするため、検証が
+/// エラーを出さずに黙って無効化されていたはずだった。
+///
+/// **ただし** この修正の時点で `csv_rows` を呼んでいた7箇所はすべて `entries` と
+/// `data_hash` が正しく揃っており、このズレが実際に起きたことは無い。
+/// `entries` から導出する形にしたのは、起きた事故を直すためではなく、この危険を
+/// 型で表現不可能にするため。
 fn build_csv_args<'a>(stream: &'a str, entries: &'a str) -> Vec<&'a str> {
     let mut args: Vec<&str> = vec![
         "-v",
@@ -81,7 +99,7 @@ fn build_scalar_args<'a>(stream: &'a str, entries: &'a str) -> Vec<&'a str> {
 /// - `stream` はストリーム指定（`"v:0"` / `"a:0"`）。
 /// - `entries` は `-show_entries` にそのまま渡す値（例: `"packet=dts"`、
 ///   `"packet=data_hash"`）。`entries` に `"data_hash"` が含まれるときだけ
-///   `-show_data_hash CRC32` を付ける（[`build_csv_args`] の doc comment参照。
+///   `-show_data_hash CRC32` を付ける（`build_csv_args` の doc comment参照。
 ///   独立した `bool` 引数にしない理由もそちらに書いてある）。
 ///
 /// 行の順序は ffprobe の格納順（映像はデコード順、音声もコンテナ格納順）のまま返す。
@@ -192,11 +210,25 @@ mod tests {
 
     #[test]
     fn build_csv_args_includes_show_data_hash_when_entries_combines_size_and_data_hash() {
-        // src/verify.rs::video_packet_crc32_in_decode_order が実際に使う形
-        // (`"packet=size,data_hash"`)。部分文字列判定で正しく検出できることを確認する。
+        // src/verify.rs::video_packet_crc32_in_decode_order と src/mp4io/write.rs が
+        // 実際に使う形 (`"packet=size,data_hash"`)。部分文字列判定で正しく検出できる
+        // ことを確認する。
         let args = build_csv_args("v:0", "packet=size,data_hash");
-        assert!(args.contains(&"-show_data_hash"));
-        assert!(args.contains(&"CRC32"));
+        assert_eq!(
+            args,
+            vec![
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "packet=size,data_hash",
+                "-show_data_hash",
+                "CRC32",
+                "-of",
+                "csv=p=0",
+            ]
+        );
     }
 
     #[test]

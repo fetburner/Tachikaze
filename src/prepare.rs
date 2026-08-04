@@ -98,7 +98,7 @@
 //! しており、この場合 mp4 内蔵の字幕トラックの抽出(ffmpeg呼び出し)は行わない
 //! (ただし elst 除去や、mp4 内蔵字幕トラック自体の除去は引き続き行う)。
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -354,32 +354,25 @@ pub fn run(
     // 再現した）。
     let absolute_input = fs::canonicalize(input).path_ctx("入力ファイルの絶対パス解決", input)?;
 
-    let mut args: Vec<&OsStr> = vec![
-        OsStr::new("-hide_banner"),
-        OsStr::new("-loglevel"),
-        OsStr::new("error"),
-        OsStr::new("-y"),
-        OsStr::new("-i"),
-        absolute_input.as_os_str(),
-        OsStr::new("-map"),
-        OsStr::new("0:v:0"),
-        OsStr::new("-map"),
-        OsStr::new("0:a:0"),
-        OsStr::new("-c"),
-        OsStr::new("copy"),
-        OsStr::new("-use_editlist"),
-        OsStr::new("0"),
-        OsStr::new("-movflags"),
-        OsStr::new("+faststart"),
-        prepared_path.as_os_str(),
+    let mut args: Vec<OsString> = vec![
+        OsString::from("-hide_banner"),
+        OsString::from("-loglevel"),
+        OsString::from("error"),
+        OsString::from("-y"),
+        OsString::from("-i"),
+        absolute_input.into_os_string(),
+        OsString::from("-map"),
+        OsString::from("0:v:0"),
+        OsString::from("-map"),
+        OsString::from("0:a:0"),
+        OsString::from("-c"),
+        OsString::from("copy"),
+        OsString::from("-use_editlist"),
+        OsString::from("0"),
+        OsString::from("-movflags"),
+        OsString::from("+faststart"),
+        prepared_path.clone().into_os_string(),
     ];
-
-    // mp4 内蔵の字幕トラックを抽出する場合、そのパスは `args`（`&OsStr` の借用の
-    // 集まり）に借用されたまま `external::run` まで生き続ける必要があるため、
-    // この変数は下の match 式より外側（関数本体のスコープ）に置く。match の
-    // アーム内で `let` してしまうと、アームのブロックを抜けた時点で drop され、
-    // `args` に保持された借用より寿命が短くなってしまう。
-    let extracted_subtitle: Option<PathBuf>;
 
     // 字幕パスの決定はこの match 式1箇所に集約する。`(Some(format), None)`
     // アームも他のアームと同じく、そのアームの結果そのものを返す(呼び出し元で
@@ -397,25 +390,21 @@ pub fn run(
             Some(external.to_path_buf())
         }
         (Some(format), None) => {
-            extracted_subtitle = Some(
-                workdir::subs_path(cache_dir, input, format.extension())
-                    .path_ctx("字幕サイドカーのキャッシュパスの解決", input)?,
+            let subs_out = workdir::subs_path(cache_dir, input, format.extension())
+                .path_ctx("字幕サイドカーのキャッシュパスの解決", input)?;
+            eprintln!(
+                "[prepare] 字幕トラック({})を検出しました。抽出します: {}",
+                format.label(),
+                subs_out.display()
             );
-            if let Some(ref subs_out) = extracted_subtitle {
-                eprintln!(
-                    "[prepare] 字幕トラック({})を検出しました。抽出します: {}",
-                    format.label(),
-                    subs_out.display()
-                );
-                args.extend([
-                    OsStr::new("-map"),
-                    OsStr::new("0:s:0"),
-                    OsStr::new("-c:s"),
-                    OsStr::new(format.ffmpeg_encoder()),
-                    subs_out.as_os_str(),
-                ]);
-            }
-            extracted_subtitle.clone()
+            args.extend([
+                OsString::from("-map"),
+                OsString::from("0:s:0"),
+                OsString::from("-c:s"),
+                OsString::from(format.ffmpeg_encoder()),
+                subs_out.clone().into_os_string(),
+            ]);
+            Some(subs_out)
         }
         (None, Some(external)) => {
             eprintln!(
@@ -427,7 +416,8 @@ pub fn run(
         (None, None) => None,
     };
 
-    external::run(&ffmpeg_path, &args, &ffmpeg_cwd)?;
+    let args_ref: Vec<&OsStr> = args.iter().map(AsRef::as_ref).collect();
+    external::run(&ffmpeg_path, &args_ref, &ffmpeg_cwd)?;
 
     eprintln!(
         "[prepare] 前処理済みファイルはキャッシュに残ります(自動削除しません): {}",

@@ -8,8 +8,9 @@
 //!
 //! `Cargo.toml` に `[lib]` ターゲットがある(#11)ため、`tests/` から
 //! `tachikaze::prepare` / `tachikaze::mp4io` を直接呼べる(他の `*_e2e.rs` が使う
-//! `#[path]` インクルードや `CARGO_BIN_EXE_tachikaze` 起動は、lib ターゲットが
-//! 無かった頃の回避策)。
+//! `CARGO_BIN_EXE_tachikaze` 起動でバイナリを1本立ち上げるのは、CLI 経由の
+//! 挙動そのものを確認したい場合の手段であって、lib ターゲットが無いからでは
+//! ない)。
 
 mod common;
 
