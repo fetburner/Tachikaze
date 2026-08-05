@@ -80,6 +80,8 @@ $ ffprobe ... OUT.mp4 | sort -u > out.txt
 $ comm -23 out.txt src.txt | wc -l      # 0 なら全パケットがビットコピー
 ```
 
+**`src.txt` / `out.txt` が空でないことを先に確かめること。** 両方が空でも `comm` は 0 を返すため、ffprobe がパケットを1つも返していない（引数を間違えた等）ときに「全パケットがビットコピー」と区別がつかない。`src/verify.rs::verify_audio_packets_with_ffprobe` は同じ理由で0件を明示エラーにしている。
+
 ## 音声の扱い
 
 ### 連結自体は可能（再エンコード不要）

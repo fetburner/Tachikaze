@@ -865,6 +865,19 @@ fn verify_video_packets_with_ffprobe(
 /// 音声: 出力の全パケットが元ファイルのパケット集合に含まれるか（集合比較）を確認し、
 /// 加えて出力の音声パケットの dts が単調増加であることを assert する
 /// （集合比較では順序や重複を検出できないため）。
+///
+/// # 0件を先に弾く理由
+///
+/// この関数の検査は**どちらも「0件」を素通りさせる**。集合比較は
+/// `HashSet::difference` が空集合同士で空を返し、dts の単調増加チェックは
+/// `windows(2)` が空列に対して1回も回らない。つまり ffprobe が何らかの理由で
+/// パケットを1つも返さなかった場合、`--verify` の音声側検査は**エラーを出さずに
+/// 黙って無効化される**（`src/ffprobe.rs::build_csv_args` の doc comment に、
+/// ffprobe が終了コード0・stderr 空のまま空行だけを返す実測例がある）。
+///
+/// 呼び出し元（[`verify_with_ffprobe`]）は `has_audio` が真のときだけここへ来るので、
+/// 3つの ffprobe クエリはいずれも1件以上返るはずであり、0件は入力の性質ではなく
+/// クエリ側の異常である。検査の前に明示エラーにする。
 fn verify_audio_packets_with_ffprobe(
     ffprobe_path: &Path,
     input_path: &Path,
@@ -874,6 +887,19 @@ fn verify_audio_packets_with_ffprobe(
         .context("元ファイルの音声パケットCRC32の取得に失敗しました")?;
     let out_set = audio_packet_crc32_set(ffprobe_path, output_path)
         .context("出力ファイルの音声パケットCRC32の取得に失敗しました")?;
+
+    anyhow::ensure!(
+        !src_set.is_empty(),
+        "元ファイルの音声パケットCRC32が0件です(対象: {})。音声トラックがあるはずの \
+         入力に対して ffprobe が1件も返していないため、集合比較が素通りする状態です",
+        input_path.display()
+    );
+    anyhow::ensure!(
+        !out_set.is_empty(),
+        "出力ファイルの音声パケットCRC32が0件です(対象: {})。音声トラックがあるはずの \
+         出力に対して ffprobe が1件も返していないため、集合比較が素通りする状態です",
+        output_path.display()
+    );
 
     let mut diff: Vec<&String> = out_set.difference(&src_set).collect();
     diff.sort();
@@ -887,6 +913,12 @@ fn verify_audio_packets_with_ffprobe(
 
     let dts = audio_packet_dts(ffprobe_path, output_path)
         .context("出力の音声パケットのdts取得に失敗しました")?;
+    anyhow::ensure!(
+        !dts.is_empty(),
+        "出力ファイルの音声パケットのdtsが0件です(対象: {})。CRC32 は取得できている \
+         のに dts が0件のため、dts の単調増加チェックが素通りする状態です",
+        output_path.display()
+    );
     for (i, w) in dts.windows(2).enumerate() {
         anyhow::ensure!(
             w[1] > w[0],
@@ -1732,6 +1764,46 @@ mod tests {
                 None
             }
         }
+    }
+
+    /// ffprobe が終了コード0のまま空行だけを返す状況で、音声側の検査が素通りせず
+    /// 明示エラーになることを確認する（[`verify_audio_packets_with_ffprobe`] の
+    /// doc comment「0件を先に弾く理由」）。
+    ///
+    /// 実測でこの出力になるのは `-show_data_hash CRC32` を落として
+    /// `packet=data_hash` を要求した場合（`src/ffprobe.rs::build_csv_args` の doc
+    /// comment）。ここでは本物の ffprobe を使わず、その出力だけを真似た偽 ffprobe
+    /// （音声パケット数ぶんの空行を返すシェルスクリプト）を置いて条件を作る。
+    /// 本物の ffprobe を使うと、現在のコードは正しい引数列を渡すので0件を再現できない。
+    #[cfg(unix)]
+    #[test]
+    fn audio_verification_rejects_ffprobe_returning_only_blank_lines() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp_dir = make_tmp_dir("ffprobe-blank-lines");
+        let fake_ffprobe = tmp_dir.join("ffprobe");
+        // 実測と同じ形（終了コード0・stderr 空・空行のみ）を返す。
+        std::fs::write(&fake_ffprobe, "#!/bin/sh\nprintf '\\n\\n\\n'\nexit 0\n")
+            .expect("偽 ffprobe を書けること");
+        let mut perms = std::fs::metadata(&fake_ffprobe).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&fake_ffprobe, perms).expect("実行権限を付与できること");
+
+        // 偽 ffprobe は引数を見ないので、入力/出力は実在しなくてよい。
+        let err = verify_audio_packets_with_ffprobe(
+            &fake_ffprobe,
+            &tmp_dir.join("in.mp4"),
+            &tmp_dir.join("out.mp4"),
+        )
+        .expect_err("音声パケットが0件なら検査を素通りさせずエラーにするはず");
+
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("0件"),
+            "0件であることを述べたエラーになるはず: {message}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 
     /// 完了条件1: フィクスチャで `cut --verify` 相当の処理（`cut_and_verify` →
