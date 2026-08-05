@@ -825,34 +825,17 @@ mod tests {
     /// (`h264_mp4toannexb` が IDR ごとに SPS/PPS を再挿入しバイト数一致でも
     /// ハッシュがずれるため)。ここでは mp4 コンテナのパケットをそのまま
     /// 比較するので、この罠には該当しない(そもそも再エンコードしていない)。
+    ///
+    /// 引数列の組み立ては `crate::ffprobe::csv_rows` に委譲する(`src/ffprobe.rs`
+    /// のdoc comment「1か所に集約」を参照。以前はここに同じ引数列がベタ書きされていた)。
     fn ffprobe_packet_hashes(path: &Path, stream_selector: &str) -> Vec<String> {
-        let output = std::process::Command::new("ffprobe")
-            .args([
-                "-v",
-                "error",
-                "-select_streams",
-                stream_selector,
-                "-show_entries",
-                "packet=size,data_hash",
-                "-show_data_hash",
-                "CRC32",
-                "-of",
-                "csv=p=0",
-            ])
-            .arg(path)
-            .output()
-            .expect("ffprobe を起動できること");
-        assert!(
-            output.status.success(),
-            "ffprobe が失敗した: {:?}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        String::from_utf8(output.stdout)
-            .expect("ffprobe の出力が utf-8 であること")
-            .lines()
-            .filter(|line| !line.is_empty())
-            .map(str::to_string)
-            .collect()
+        crate::ffprobe::csv_rows(
+            Path::new("ffprobe"),
+            path,
+            stream_selector,
+            "packet=size,data_hash",
+        )
+        .expect("ffprobe を起動できること")
     }
 
     #[test]
@@ -1108,7 +1091,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 
-    // --- #39: チャンクのインターリーブ ---
+    // --- チャンクのインターリーブ ---
 
     /// 指定パスの指定範囲を読んでバイト列を返す(往復テスト用の生読み出し)。
     fn read_bytes_at(path: &Path, offset: u64, size: u32) -> Vec<u8> {
@@ -1123,7 +1106,7 @@ mod tests {
     /// `mdat` へ書き込んだ内容と一致することを確認する(往復テスト)。
     ///
     /// 完了条件: 「各サンプルの file_offset が stsc/stco から正しく
-    /// 再構成できることを、#26 の読み込み器(samples())で自分の出力を
+    /// 再構成できることを、読み込み器(samples())で自分の出力を
     /// 読み直して確認する」。ここでは keep リストが全サンプルかつ元の順序
     /// なので、出力側で読み直したサンプル `i` のバイト列が入力ファイル側の
     /// サンプル `i` のバイト列とまったく同じであることまで検証する

@@ -177,6 +177,8 @@ tachikaze auto IN.mp4 -o OUT.mp4 [--cm-output CM.mp4] [--ignore-gate]
 | `auto.rs` | `auto` コマンドの組み立て（`prepare`→`analyze`→gate→`cut`→`remap-subs`、アルゴリズムは持たない） | 上記「コマンド構成」手順16〜19 |
 | `tools.rs` | 外部ツールと JL ファイルの探索 | 上記「パス解決」節、[toolchain-macos.md](toolchain-macos.md) |
 | `external.rs` | 外部プロセスの起動と出力の回収 | [pipeline.md](pipeline.md) |
+| `ffprobe.rs` | ffprobe への問い合わせ（CSV 行を返す `csv_rows` / 単一スカラー値を返す `scalar_entry`。`-show_entries` / `-show_data_hash CRC32`）を1か所に集約する責務 | 罠2（md5 ではなくパケット単位の CRC32）、[lossless-cut.md](lossless-cut.md) |
+| `errctx.rs` | 「〜に失敗しました: <パス>」というエラー文脈の付与を1行で書くための拡張トレイト（`path_ctx`） | — |
 | `workdir.rs` | 作業ディレクトリ（既定は入力ごとのキャッシュ）と symlink | 上記「パス解決」節 |
 | `order.rs` | `DisplayIdx` / `DecodeIdx` | 下記「型設計の要点」 |
 | `trim.rs` | `Trim(a,b)++…` のパース / 生成（半開区間 `[s, e+1)` に正規化） | — |
@@ -249,6 +251,8 @@ struct DecodeIdx(u32);    // デコード順（mp4 のサンプル番号 / .dtvi
 | 継ぎ目の MDCT 過渡（クリックノイズ） | **許容する方針で決定済み。** 継ぎ目は残存 CM マージンの内側に来る（[lossless-cut.md](lossless-cut.md)） |
 | `prepare` の elst 除去による AAC の残存ずれ | **許容する方針で決定済み（#60 実測）。** elst 除去により、保持した最初の区間がソースの先頭フレームから始まる場合に限り、音声の priming 分（実測 21.333ms、他エンコーダでは見積もりで最大43ms程度）がそのまま音声として残る。ファイルにつき高々1回・1フレーム未満・非累積のずれで、`prepare`/`auto` は elst を自動除去してよいと判断している（[measurements.md](measurements.md)「elst 除去と A/V 相対時刻」）。Opus は `dOps` がコーデックレベルで pre-skip を伝えるため影響なし |
 | `--snap inward` と `--cm-output` の併用 | **拒否する。** inward では保持区間が退化（`end < start`）しうるため補集合の順序も壊れる |
+| `mp4io::read` のテストが並列実行で稀に落ちる | **未対応。** `src/mp4io/read.rs::tests::ffprobe_packets` が ffprobe の**起動失敗**を `.expect("ffprobe を起動できること")` で panic させる。多数の ffprobe を同時に起動すると稀に起動に失敗し、テストが落ちる（master で8回中4回再現）。同モジュールには起動できない場合をスキップ扱いにする `skip_if_ffprobe_missing` があるので、`ffprobe_packets` の起動失敗も同じ扱いにすれば直る。テストだけの問題で、製品コードには影響しない |
+| `analyze` のテストが `--include-ignored` で競合する | **未対応。** `src/analyze.rs::tests::analyze_run_produces_trim_list_with_real_tools` は `TOOL_PATH_ENV_LOCK` を取らずに実 `PATH` からツールを解決する一方、同モジュールの他3テストはそのロックの下でプロセス全体の `PATH` を差し替える。並列に走ると前者が差し替え後の `PATH` を読んで落ちうる。`--ignored` 単独では他3テストが走らないため出ず、`--include-ignored` でのみ再現する。前者にも同じロックを取らせれば直る |
 | キャッシュ鍵の弱さ | `<キャッシュの根>/<入力ごと>/`（既定 `~/.cache/tachikaze`、`--cache-dir` で変更可）のディレクトリ名は入力の**絶対パスのハッシュのみ**から決まる（`workdir::cache_dir_for_input`、FNV-1a）。同じパスに別内容のファイルが後から置かれても（録画ファイルの上書き・再利用）区別できず、古い `.dtvi` / `trim.avs` / `input_prepared.mp4` を新しい入力に対して誤って再利用しうる。`auto` は `analyze`/`prepare` を毎回作り直すことでこの穴を避けているが（`src/auto.rs` の doc comment）、`cut --dtvi` を省略してキャッシュから自動解決する経路には対策が無い。size + mtime の突き合わせなどの対策は、要求されていない現時点では追加しないと判断している（理由は `src/auto.rs` の doc comment参照） |
 
 ## 方針として作らないもの

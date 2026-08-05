@@ -1,65 +1,36 @@
 //! [E5-4] 映像パスの E2E: `cut --video-only` 相当の処理を実行し、出力の映像パケットが
 //! 元ファイルとビット一致することを CRC32 で確認する。
 //!
-//! ## この統合テストが `src/` の関数を直接呼んでいる理由・呼び方
+//! ## この統合テストが `src` の関数を直接呼んでいる理由・呼び方
 //!
-//! `main.rs` の `cut` サブコマンドはまだ `unimplemented!()`（CLI 配線は別 issue）なので、
-//! `tachikaze cut` プロセスを起動する形の E2E にはできない。issue の指示どおり、cut
-//! パイプラインを組み立てる `src/` の関数（`mp4io::read`, `mp4io::order_map`, `plan`,
-//! `mp4io::write`）を直接呼び出して同じ処理を再現する。
+//! `video_only_cut_matches_source_packets_by_crc32` は `tachikaze cut` プロセスを
+//! 起動するのではなく、cut パイプラインを組み立てる関数（`mp4io::read`,
+//! `mp4io::order_map`, `plan`, `mp4io::write`）を直接呼び出して同じ処理を再現する。
+//! スナップ後の区間やキーフレームに丸めた保持パケット数など、CLI の出力だけでは
+//! 見えない中間状態も併せて検証したいため。
 //!
-//! ただし `Cargo.toml` に `[lib]` ターゲットが無く（`src/main.rs` のみのバイナリ
-//! クレート）、`tests/` 配下は別クレートとしてコンパイルされるため、バイナリクレートの
-//! `pub` 関数を `tests/` から `crate::...` で参照することはできない（Rust の制約）。
+//! これらは `tachikaze::`（`src/lib.rs` のライブラリクレート）経由で `pub` な項目
+//! として参照する。`ffprobe::csv_rows` も同じ経由で参照する（`src/ffprobe.rs` の
+//! doc comment「1か所に集約」参照）。
 //!
-//! そのため、issue が示す対処のうち最もシンプルなもの（`#[path]` で `src/` のファイルを
-//! このテストバイナリ自身のモジュールとして直接インクルードする）を採用した。
-//! `src/` のファイルは一切書き換えていない。`#[path]` はコンパイラに「このモジュールの
-//! 内容はここにあるファイルを使え」と伝えるだけで、内容はそのまま（バイト単位で同一の
-//! ソース）読み込まれる。
-//!
-//! 巻き込む必要があったモジュールは、cut の映像パスが依存するものだけ
-//! （`order`, `dtvi`, `trim`, `cli`, `plan`, `mp4io::read`, `mp4io::order_map`,
-//! `mp4io::write`）。`analyze` / `external` / `workdir` / `tools` / `report` /
-//! `audio` / `mp4io::support` はこの E2E では使わないため含めていない
-//! （`grep -rn "^use crate::" src/` で依存関係を確認済み）。
-//!
-//! 副作用として、インクルードした各ファイルの `#[cfg(test)]` 内部テストも
-//! （`cargo test` がこのファイルを `--test` としてコンパイルする際に `cfg(test)` が
-//! 有効になるため）このテストバイナリの一部として一緒に実行される。これは `src/` 側の
-//! 既存ユニットテストの重複実行であり無害だが、意図した挙動として明記しておく。
+//! `--cm-output` を検証する後半のテスト群は事情が異なる。CLI オプションそのものの
+//! 検証（未指定時の挙動・`--snap inward` との併用エラー）も必要なため、
+//! `tests/audio_e2e.rs` に倣い実際の `tachikaze` バイナリを起動する（下の
+//! 「`--cm-output`」節を参照）。
 
 mod common;
-
-#[path = "../src/cli.rs"]
-mod cli;
-#[path = "../src/dtvi.rs"]
-mod dtvi;
-#[path = "../src/order.rs"]
-mod order;
-#[path = "../src/plan.rs"]
-mod plan;
-#[path = "../src/trim.rs"]
-mod trim;
-// `mp4io/mod.rs` はディレクトリオーナー(`mod.rs`)なので、これ経由で読み込めば
-// `pub mod read;` 等の子モジュール宣言はそのファイル自身の場所(`src/mp4io/`)を
-// 基準に解決される。個々のファイルに `#[path]` を付け直す必要が無いぶんこちらが単純
-// (`mp4io` をインラインモジュールとして書き、子ごとに `#[path = "../../src/..."]`
-// を付ける方法も試したが、インラインモジュールの子の `#[path]` は
-// `tests/mp4io/` という実在しないディレクトリを基準に解決されるため失敗した)。
-#[path = "../src/mp4io/mod.rs"]
-mod mp4io;
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use cli::Snap;
-use mp4io::order_map::DisplayDecodeMap;
-use mp4io::read::{find_video_track, read_moov, samples};
-use mp4io::write::write_mp4;
-use order::DecodeIdx;
-use trim::TrimList;
+use tachikaze::cli::Snap;
+use tachikaze::mp4io::order_map::DisplayDecodeMap;
+use tachikaze::mp4io::read::{find_video_track, read_moov, samples};
+use tachikaze::mp4io::write::write_mp4;
+use tachikaze::order::DecodeIdx;
+use tachikaze::plan;
+use tachikaze::trim::TrimList;
 
 /// `-ss` によるキーフレーム seek が浮動小数点誤差で1フレーム手前に落ちるのを防ぐための
 /// 補正値。docs/lossless-cut.md「参考: 検証で通した手順」と同じ値（1フレーム=33.4msに
@@ -67,53 +38,18 @@ use trim::TrimList;
 /// 「比較対象を作るための ffmpeg -ss」の精度を上げるためだけに使う。
 const SEEK_EPSILON_SECS: f64 = 0.005;
 
-fn tools_available() -> bool {
-    for bin in ["ffmpeg", "ffprobe"] {
-        match Command::new(bin).arg("-version").output() {
-            Ok(output) if output.status.success() => {}
-            _ => {
-                eprintln!("{bin} が無いためスキップします。");
-                return false;
-            }
-        }
-    }
-    true
-}
-
 /// `path` の映像ストリームのパケット CRC32 一覧をファイル(=デコード)順に取得する。
 ///
 /// CLAUDE.md の罠2 / docs/lossless-cut.md「無劣化の検証に md5 を使ってはいけない」節:
 /// Annex B 変換した ES の md5 比較は誤り（`h264_mp4toannexb` が IDR ごとに SPS/PPS を
 /// 再挿入するため）。ここでは mp4 コンテナのパケットをそのまま比較するので該当しないが、
 /// 念のため同じ `-show_data_hash CRC32` の手法を使う。
+///
+/// 引数列の組み立ては `tachikaze::ffprobe::csv_rows` に委譲する(`src/ffprobe.rs`
+/// のdoc comment「1か所に集約」を参照。以前はここに同じ引数列がベタ書きされていた)。
 fn video_packet_crc32(path: &Path) -> Vec<String> {
-    let output = Command::new("ffprobe")
-        .args([
-            "-v",
-            "error",
-            "-select_streams",
-            "v:0",
-            "-show_entries",
-            "packet=size,data_hash",
-            "-show_data_hash",
-            "CRC32",
-            "-of",
-            "csv=p=0",
-        ])
-        .arg(path)
-        .output()
-        .expect("ffprobe を起動できること");
-    assert!(
-        output.status.success(),
-        "ffprobe (CRC32) が失敗した: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    String::from_utf8(output.stdout)
-        .expect("ffprobe の出力が utf-8 であること")
-        .lines()
-        .filter(|line| !line.is_empty())
-        .map(str::to_string)
-        .collect()
+    tachikaze::ffprobe::csv_rows(Path::new("ffprobe"), path, "v:0", "packet=size,data_hash")
+        .expect("ffprobe を起動できること")
 }
 
 /// `path` の映像ストリームの `(pts_time, is_sync)` をファイル(=デコード)順に取得する。
@@ -272,7 +208,7 @@ fn video_only_cut_matches_source_packets_by_crc32() {
     if common::skip_if_fixture_missing() {
         return;
     }
-    if !tools_available() {
+    if !common::tools_available() {
         return;
     }
 
@@ -439,7 +375,7 @@ fn video_only_cut_matches_source_packets_by_crc32() {
 #[test]
 fn video_e2e_module_compiles_and_helpers_are_reachable() {
     // ヘルパ関数・型が到達可能であることのコンパイル時チェックを兼ねる。
-    let _ = tools_available;
+    let _ = common::tools_available;
     let _ = video_packet_crc32;
     let _ = video_packet_pts_time_and_flags;
     let _ = frame_pts_in_display_order;
@@ -451,12 +387,10 @@ fn video_e2e_module_compiles_and_helpers_are_reachable() {
 // =====================================================================
 // `--cm-output`（CM として除去した区間を別ファイルに出す）の E2E。
 //
-// 上の `video_only_cut_matches_source_packets_by_crc32` は `main.rs` の `cut` が
-// まだ配線されていなかった頃の名残で `#[path]` インクルードで `src/` を直接呼んでいるが、
-// `cut` サブコマンドは現在配線済み（`tests/audio_e2e.rs` の e2e テストが実際に
-// `CARGO_BIN_EXE_tachikaze` を起動している）。`--cm-output` は CLI オプションそのものの
-// 検証（未指定時の挙動・`--snap inward` との併用エラー）も必要なので、こちらは
-// `tests/audio_e2e.rs` に倣い実際の `tachikaze` バイナリを起動する。
+// 上の `video_only_cut_matches_source_packets_by_crc32` は cut パイプラインを
+// 組み立てる `tachikaze::` の関数を直接呼び出すが、`--cm-output` は CLI オプション
+// そのものの検証（未指定時の挙動・`--snap inward` との併用エラー）も必要なので、
+// こちらは `tests/audio_e2e.rs` に倣い実際の `tachikaze` バイナリを起動する。
 // =====================================================================
 
 /// フィクスチャ（GOP=120・599フレーム）に対する Trim リスト。他のテスト
@@ -465,20 +399,10 @@ fn video_e2e_module_compiles_and_helpers_are_reachable() {
 /// 広がる。捨てられる中間区間 `[120,360)` と末尾の `[480,599)` が CM 側の補集合になる。
 const CM_OUTPUT_TRIM_AVS_CONTENT: &str = "Trim(10,109) ++ Trim(370,469)";
 
-/// `cut` に渡す `.dtvi`（`tests/audio_e2e.rs::dtvi_path` と同じファイル）。
-fn cm_output_dtvi_path() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/sample.dtvi")
-}
-
-/// `label` ごとに独立した一時ディレクトリを作る。
+/// `label` に `"video-e2e-cm-"` を付けて [`common::make_tmp_dir`] を呼ぶ薄いラッパ
+/// （ディレクトリ名は元と同じ `tachikaze-video-e2e-cm-<label>-<pid>`）。
 fn make_cm_output_tmp_dir(label: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "tachikaze-video-e2e-cm-{label}-{}",
-        std::process::id()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("一時ディレクトリを作れること");
-    dir
+    common::make_tmp_dir(&format!("video-e2e-cm-{label}"))
 }
 
 /// フィクスチャに対して `tachikaze cut --cm-output` を実行する。
@@ -505,7 +429,7 @@ fn run_cut_with_cm_output(
         .arg("-o")
         .arg(&out_path)
         .arg("--dtvi")
-        .arg(cm_output_dtvi_path())
+        .arg(common::dtvi_path())
         .arg("--snap")
         .arg(snap)
         .arg("--cm-output")
@@ -526,7 +450,7 @@ fn cm_output_packet_counts_sum_to_input_total_and_sets_are_disjoint() {
     if common::skip_if_fixture_missing() {
         return;
     }
-    if !tools_available() {
+    if !common::tools_available() {
         return;
     }
 
@@ -597,7 +521,7 @@ fn snap_inward_with_cm_output_is_rejected() {
     if common::skip_if_fixture_missing() {
         return;
     }
-    if !tools_available() {
+    if !common::tools_available() {
         return;
     }
 

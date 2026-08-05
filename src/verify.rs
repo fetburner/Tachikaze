@@ -16,12 +16,12 @@
 //!    `std::fs::rename` で `output_path` へ移動する。
 //!
 //! ffprobe によるパケット単位 CRC32 の一致確認（`--verify` 指定時、CLAUDE.md の罠2）は
-//! [`verify_with_ffprobe`] / [`cut_verify_and_ffprobe_check`] が担当する（#37）。
+//! [`verify_with_ffprobe`] / [`cut_verify_and_ffprobe_check`] が担当する。
 //! `cut_and_verify` が `output_path` へ rename した**後**に、ffprobe を使って元ファイルと
 //! 出力ファイルのパケットを突き合わせる。映像は `video_keep`（元ファイルのデコード順
 //! `DecodeIdx` 列、出力に含める順そのもの）から期待される CRC32 列を組み立てて1対1で
-//! 比較し（`-ss` によるタイムスタンプベースの抽出より単純で確実）、音声は `#35` と同じ
-//! 集合比較 + dts 単調増加の assert で補う。不一致なら `output_path` を削除する。
+//! 比較し（`-ss` によるタイムスタンプベースの抽出より単純で確実）、音声は集合比較 +
+//! dts 単調増加の assert で補う。不一致なら `output_path` を削除する。
 //!
 //! ## 設計判断1: 検査4は「出力」ではなく「元ファイル」を `.dtvi` と突き合わせる
 //!
@@ -33,9 +33,9 @@
 //! 方法は存在しない。
 //!
 //! 代わりに、cut のこの最終段でも「元ファイルの `SampleInfo` から自前導出した
-//! `DisplayDecodeMap` が `.dtvi` の全行と一致すること」（`#27` の
-//! [`crate::mp4io::order_map::verify_against_dtvi`]）をもう一度確認する
-//! （[`verify_dtvi_consistency`]）。`#27` の検証と論理的には重複するが、cut パイプライン
+//! `DisplayDecodeMap` が `.dtvi` の全行と一致すること」
+//! （[`crate::mp4io::order_map::verify_against_dtvi`]）をもう一度確認する
+//! （[`verify_dtvi_consistency`]）。既存の検証と論理的には重複するが、cut パイプライン
 //! 全体を1箇所で検証する「最後の関門」として、表示順とデコード順の混同（CLAUDE.md の
 //! 罠3、唯一の重大バグ源）を実行時にもう一度確認する意味がある。
 //!
@@ -44,7 +44,7 @@
 //! 検査4（`.dtvi` との突き合わせ）が、表示順とデコード順の混同という唯一の重大バグ源
 //! （CLAUDE.md の罠3）に対する実効的な防御である。`.dtvi` が無いと検査4を一切実行でき
 //! ず、混同があってもエラーを出さずに間違った位置で切られたファイルが出力されてしまう
-//! （CLAUDE.md「静かに壊れる3つの罠」の通り、混同は例外を飛ばさない）。そのため
+//! （CLAUDE.md「静かに壊れる4つの罠」の通り、混同は例外を飛ばさない）。そのため
 //! [`cut_and_verify`] は `dtvi: None` を早期エラーにする。エラーメッセージには
 //! `tachikaze analyze` を先に実行するよう促す趣旨の文言を含める。`.dtvi` 無しでの実行を
 //! 許容するオプション（例: `--skip-dtvi-check`）は本 issue のスコープ外とし、将来
@@ -54,7 +54,6 @@ use std::collections::HashSet;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::Instant;
 
 use anyhow::Context;
@@ -779,30 +778,6 @@ fn log_audio_drift(
 // ffprobe によるパケット単位 CRC32 の一致確認（`--verify` 指定時、CLAUDE.md の罠2）。
 // ---------------------------------------------------------------------
 
-/// `ffprobe_path` を使って `path` に対して `args` を実行し、標準出力を文字列で返す。
-/// 終了コードが 0 以外、または起動自体に失敗した場合はエラーを返す。
-fn run_ffprobe_lines(ffprobe_path: &Path, path: &Path, args: &[&str]) -> anyhow::Result<String> {
-    let output = Command::new(ffprobe_path)
-        .args(args)
-        .arg(path)
-        .output()
-        .with_context(|| {
-            format!(
-                "ffprobe({}) の起動に失敗しました(対象: {})",
-                ffprobe_path.display(),
-                path.display()
-            )
-        })?;
-    anyhow::ensure!(
-        output.status.success(),
-        "ffprobe({}) が失敗しました(対象: {}): {}",
-        ffprobe_path.display(),
-        path.display(),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    String::from_utf8(output.stdout).context("ffprobe の出力が utf-8 ではありません")
-}
-
 /// 映像ストリームの全パケットの CRC32 を、コンテナの格納順
 /// （= デコード順、[`crate::mp4io::read::samples`] が返す `SampleInfo` と同じ順序）で
 /// 取得する。`video_keep`（元ファイルのデコード順 `DecodeIdx` 列）のインデックスと
@@ -811,73 +786,23 @@ fn video_packet_crc32_in_decode_order(
     ffprobe_path: &Path,
     path: &Path,
 ) -> anyhow::Result<Vec<String>> {
-    let text = run_ffprobe_lines(
-        ffprobe_path,
-        path,
-        &[
-            "-v",
-            "error",
-            "-select_streams",
-            "v:0",
-            "-show_entries",
-            "packet=size,data_hash",
-            "-show_data_hash",
-            "CRC32",
-            "-of",
-            "csv=p=0",
-        ],
-    )?;
-    Ok(text
-        .lines()
-        .filter(|line| !line.is_empty())
-        .map(str::to_string)
-        .collect())
+    crate::ffprobe::csv_rows(ffprobe_path, path, "v:0", "packet=size,data_hash")
 }
 
-/// 音声ストリームの全パケットの CRC32 集合を取得する（`#35` と同じ集合比較のため）。
+/// 音声ストリームの全パケットの CRC32 集合を取得する（集合比較のため）。
 fn audio_packet_crc32_set(ffprobe_path: &Path, path: &Path) -> anyhow::Result<HashSet<String>> {
-    let text = run_ffprobe_lines(
-        ffprobe_path,
-        path,
-        &[
-            "-v",
-            "error",
-            "-select_streams",
-            "a:0",
-            "-show_entries",
-            "packet=data_hash",
-            "-show_data_hash",
-            "CRC32",
-            "-of",
-            "csv=p=0",
-        ],
-    )?;
-    Ok(text
-        .lines()
-        .filter(|line| !line.is_empty())
-        .map(str::to_string)
-        .collect())
+    Ok(
+        crate::ffprobe::csv_rows(ffprobe_path, path, "a:0", "packet=data_hash")?
+            .into_iter()
+            .collect(),
+    )
 }
 
 /// 音声ストリームの全パケットの dts を格納順に取得する（順序検証用。集合比較では
 /// 順序や重複を検出できないため、これで補う）。
 fn audio_packet_dts(ffprobe_path: &Path, path: &Path) -> anyhow::Result<Vec<i64>> {
-    let text = run_ffprobe_lines(
-        ffprobe_path,
-        path,
-        &[
-            "-v",
-            "error",
-            "-select_streams",
-            "a:0",
-            "-show_entries",
-            "packet=dts",
-            "-of",
-            "csv=p=0",
-        ],
-    )?;
-    text.lines()
-        .filter(|line| !line.is_empty())
+    crate::ffprobe::csv_rows(ffprobe_path, path, "a:0", "packet=dts")?
+        .into_iter()
         .map(|line| {
             line.parse::<i64>().with_context(|| {
                 format!("音声パケットの dts が整数としてパースできません: {line:?}")
@@ -937,9 +862,22 @@ fn verify_video_packets_with_ffprobe(
     Ok(())
 }
 
-/// 音声: 出力の全パケットが元ファイルのパケット集合に含まれるか（`#35` と同じ集合
-/// 比較）を確認し、加えて出力の音声パケットの dts が単調増加であることを assert する
+/// 音声: 出力の全パケットが元ファイルのパケット集合に含まれるか（集合比較）を確認し、
+/// 加えて出力の音声パケットの dts が単調増加であることを assert する
 /// （集合比較では順序や重複を検出できないため）。
+///
+/// # 0件を先に弾く理由
+///
+/// この関数の検査は**どちらも「0件」を素通りさせる**。集合比較は
+/// `HashSet::difference` が空集合同士で空を返し、dts の単調増加チェックは
+/// `windows(2)` が空列に対して1回も回らない。つまり ffprobe が何らかの理由で
+/// パケットを1つも返さなかった場合、`--verify` の音声側検査は**エラーを出さずに
+/// 黙って無効化される**（`src/ffprobe.rs::build_csv_args` の doc comment に、
+/// ffprobe が終了コード0・stderr 空のまま空行だけを返す実測例がある）。
+///
+/// 呼び出し元（[`verify_with_ffprobe`]）は `has_audio` が真のときだけここへ来るので、
+/// 3つの ffprobe クエリはいずれも1件以上返るはずであり、0件は入力の性質ではなく
+/// クエリ側の異常である。検査の前に明示エラーにする。
 fn verify_audio_packets_with_ffprobe(
     ffprobe_path: &Path,
     input_path: &Path,
@@ -949,6 +887,19 @@ fn verify_audio_packets_with_ffprobe(
         .context("元ファイルの音声パケットCRC32の取得に失敗しました")?;
     let out_set = audio_packet_crc32_set(ffprobe_path, output_path)
         .context("出力ファイルの音声パケットCRC32の取得に失敗しました")?;
+
+    anyhow::ensure!(
+        !src_set.is_empty(),
+        "元ファイルの音声パケットCRC32が0件です(対象: {})。音声トラックがあるはずの \
+         入力に対して ffprobe が1件も返していないため、集合比較が素通りする状態です",
+        input_path.display()
+    );
+    anyhow::ensure!(
+        !out_set.is_empty(),
+        "出力ファイルの音声パケットCRC32が0件です(対象: {})。音声トラックがあるはずの \
+         出力に対して ffprobe が1件も返していないため、集合比較が素通りする状態です",
+        output_path.display()
+    );
 
     let mut diff: Vec<&String> = out_set.difference(&src_set).collect();
     diff.sort();
@@ -962,6 +913,12 @@ fn verify_audio_packets_with_ffprobe(
 
     let dts = audio_packet_dts(ffprobe_path, output_path)
         .context("出力の音声パケットのdts取得に失敗しました")?;
+    anyhow::ensure!(
+        !dts.is_empty(),
+        "出力ファイルの音声パケットのdtsが0件です(対象: {})。CRC32 は取得できている \
+         のに dts が0件のため、dts の単調増加チェックが素通りする状態です",
+        output_path.display()
+    );
     for (i, w) in dts.windows(2).enumerate() {
         anyhow::ensure!(
             w[1] > w[0],
@@ -983,7 +940,7 @@ fn verify_audio_packets_with_ffprobe(
 /// - 映像: `video_keep` から期待される CRC32 列を組み立て、出力の実際の CRC32 列と
 ///   1対1で比較する。
 /// - 音声: `has_audio` が真の場合、出力の全パケットが元ファイルのパケット集合に
-///   含まれるか（`#35` と同じ集合比較）、および出力の音声パケットの dts が単調増加で
+///   含まれるか（集合比較）、および出力の音声パケットの dts が単調増加で
 ///   あるかを確認する。
 ///
 /// `ffprobe_path` は呼び出し側が [`crate::tools::resolve_tool`] で解決済みのものを渡す
@@ -1794,7 +1751,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------
-    // ffprobe によるパケット単位 CRC32 の一致確認（#37）。
+    // ffprobe によるパケット単位 CRC32 の一致確認。
     // ---------------------------------------------------------------
 
     /// フィクスチャ/ffmpeg/ffprobe に加え、この一連のテストが必要とする ffprobe を
@@ -1807,6 +1764,46 @@ mod tests {
                 None
             }
         }
+    }
+
+    /// ffprobe が終了コード0のまま空行だけを返す状況で、音声側の検査が素通りせず
+    /// 明示エラーになることを確認する（[`verify_audio_packets_with_ffprobe`] の
+    /// doc comment「0件を先に弾く理由」）。
+    ///
+    /// 実測でこの出力になるのは `-show_data_hash CRC32` を落として
+    /// `packet=data_hash` を要求した場合（`src/ffprobe.rs::build_csv_args` の doc
+    /// comment）。ここでは本物の ffprobe を使わず、その出力だけを真似た偽 ffprobe
+    /// （音声パケット数ぶんの空行を返すシェルスクリプト）を置いて条件を作る。
+    /// 本物の ffprobe を使うと、現在のコードは正しい引数列を渡すので0件を再現できない。
+    #[cfg(unix)]
+    #[test]
+    fn audio_verification_rejects_ffprobe_returning_only_blank_lines() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp_dir = make_tmp_dir("ffprobe-blank-lines");
+        let fake_ffprobe = tmp_dir.join("ffprobe");
+        // 実測と同じ形（終了コード0・stderr 空・空行のみ）を返す。
+        std::fs::write(&fake_ffprobe, "#!/bin/sh\nprintf '\\n\\n\\n'\nexit 0\n")
+            .expect("偽 ffprobe を書けること");
+        let mut perms = std::fs::metadata(&fake_ffprobe).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&fake_ffprobe, perms).expect("実行権限を付与できること");
+
+        // 偽 ffprobe は引数を見ないので、入力/出力は実在しなくてよい。
+        let err = verify_audio_packets_with_ffprobe(
+            &fake_ffprobe,
+            &tmp_dir.join("in.mp4"),
+            &tmp_dir.join("out.mp4"),
+        )
+        .expect_err("音声パケットが0件なら検査を素通りさせずエラーにするはず");
+
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("0件"),
+            "0件であることを述べたエラーになるはず: {message}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 
     /// 完了条件1: フィクスチャで `cut --verify` 相当の処理（`cut_and_verify` →

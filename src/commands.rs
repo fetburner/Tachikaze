@@ -13,6 +13,7 @@ use mp4_atom::{Codec, Moov};
 
 use crate::cli::{AnalyzeArgs, AutoArgs, Cli, Commands, CutArgs, PrepareArgs, RemapSubsArgs};
 use crate::dtvi::Dtvi;
+use crate::errctx::PathContext;
 use crate::mp4io::read::SampleInfo;
 use crate::order::{DecodeIdx, DisplayIdx, OrderMap};
 use crate::{
@@ -26,7 +27,7 @@ use crate::{
 /// - [`ExitOutcome::GateStopped`]: 3 で終了する（2 は clap が引数の誤り
 ///   （usage error）に使うため、`main.rs` の doc comment参照）。
 ///
-/// `auto`（#62）の gate が疑わしいと判定して cut を実行せず止まった場合にだけ
+/// `auto` の gate が疑わしいと判定して cut を実行せず止まった場合にだけ
 /// [`ExitOutcome::GateStopped`] を返す。`analyze` / `cut` / `prepare` / `remap-subs`
 /// はこの値を返す経路を持たない（常に `Ok(ExitOutcome::Success)` か `Err`
 /// （呼び出し元の `main.rs` で exit code 1 になる、変更前と同じ挙動）のどちらかで、
@@ -130,22 +131,14 @@ fn run_remap_subs(cache_dir: Option<PathBuf>, args: RemapSubsArgs) -> anyhow::Re
     }
     let segment_map_path =
         resolve_segment_map_path(segment_map_path, cache_dir.as_deref(), &input)?;
-    let segment_map_json = fs::read_to_string(&segment_map_path).with_context(|| {
-        format!(
-            "区間マップの読み込みに失敗しました: {}",
-            segment_map_path.display()
-        )
-    })?;
+    let segment_map_json = fs::read_to_string(&segment_map_path)
+        .path_ctx("区間マップの読み込み", &segment_map_path)?;
     let segment_map = segmap::SegmentMap::from_json(&segment_map_json)
         .map_err(|err| anyhow!("区間マップのパースに失敗しました: {err}"))?;
 
     let (subs_input_path, format) = resolve_subs_path(subs_path_arg, cache_dir.as_deref(), &input)?;
-    let subs_content = fs::read_to_string(&subs_input_path).with_context(|| {
-        format!(
-            "字幕サイドカーの読み込みに失敗しました: {}",
-            subs_input_path.display()
-        )
-    })?;
+    let subs_content = fs::read_to_string(&subs_input_path)
+        .path_ctx("字幕サイドカーの読み込み", &subs_input_path)?;
 
     let remap_output = match format {
         subtitle::SubsFormat::Ass => subtitle::remap_ass(
@@ -163,8 +156,7 @@ fn run_remap_subs(cache_dir: Option<PathBuf>, args: RemapSubsArgs) -> anyhow::Re
 
     let output =
         output.unwrap_or_else(|| default_remap_subs_output_path(&input, format.extension()));
-    fs::write(&output, &remap_output.content)
-        .with_context(|| format!("字幕の書き出しに失敗しました: {}", output.display()))?;
+    fs::write(&output, &remap_output.content).path_ctx("字幕の書き出し", &output)?;
 
     let stats = &remap_output.stats;
     eprintln!(
@@ -200,7 +192,7 @@ fn resolve_segment_map_path(
     }
 
     let cached = workdir::cached_segment_map_path(cache_dir, input)
-        .with_context(|| format!("区間マップの自動解決に失敗しました: {}", input.display()))?;
+        .path_ctx("区間マップの自動解決", input)?;
     if cached.is_file() {
         return Ok(cached);
     }
@@ -215,8 +207,7 @@ fn resolve_segment_map_path(
 }
 
 /// `--subs` を解決する。明示されていればその拡張子から形式を判定する。未指定なら
-/// `prepare` が書くキャッシュ（`workdir::subs_path`）を `ass` → `srt` の順に探す
-/// （issue #59 「やること」1）。
+/// `prepare` が書くキャッシュ（`workdir::subs_path`）を `ass` → `srt` の順に探す。
 fn resolve_subs_path(
     explicit: Option<PathBuf>,
     cache_dir: Option<&Path>,
@@ -233,13 +224,8 @@ fn resolve_subs_path(
     }
 
     for format in [subtitle::SubsFormat::Ass, subtitle::SubsFormat::Srt] {
-        let candidate =
-            workdir::subs_path(cache_dir, input, format.extension()).with_context(|| {
-                format!(
-                    "字幕サイドカーのキャッシュパスの解決に失敗しました: {}",
-                    input.display()
-                )
-            })?;
+        let candidate = workdir::subs_path(cache_dir, input, format.extension())
+            .path_ctx("字幕サイドカーのキャッシュパスの解決", input)?;
         if candidate.is_file() {
             return Ok((candidate, format));
         }
@@ -259,7 +245,7 @@ fn resolve_subs_path(
 /// ファイルをカレントディレクトリに黙って作ってしまう（CLAUDE.md の罠。`analyze -o -`
 /// だけが標準出力を意味する特別扱いで、`commands::run_analyze` が別に処理する）。
 ///
-/// `pub(crate)`: `auto::run`（#62）が `cut` と同じ出力先（`output` / `cm_output`）を
+/// `pub(crate)`: `auto::run` が `cut` と同じ出力先（`output` / `cm_output`）を
 /// 検証するため。
 pub(crate) fn reject_dash_output(path: &Path, flag: &str) -> anyhow::Result<()> {
     anyhow::ensure!(
@@ -270,19 +256,15 @@ pub(crate) fn reject_dash_output(path: &Path, flag: &str) -> anyhow::Result<()> 
     Ok(())
 }
 
-/// `remap-subs` の `-o` 省略時の出力先。`*_CMcut.<ext>` という stem を使う
-/// （かつて存在したシェルラッパー `scripts/tachikaze-cmcut` の `build_output_path`
-/// が使っていた、`cut` の当時の既定出力名 `*_CMcut.mp4` と同じ規則。`cut` の `-o`
-/// は現在は必須で既定名を持たないが、`remap-subs` を単体で使うときの利便性の
-/// ためにこの規則を残している。`auto` の追加に伴いシェルラッパー自体は削除済み、
-/// `[E11-7]`）ことで、多くのプレイヤーが同名の字幕サイドカーを自動的に読み込める
-/// 形にする（issue #59「やること」5）。出力は入力の隣に置く
-/// （`docs/architecture.md`「パス解決」節の「出力」分類と同じ扱い。キャッシュ
-/// ではなく成果物）。
+/// `remap-subs` の `-o` 省略時の出力先。`*_CMcut.<ext>` という stem を使う。
+/// `cut` の `-o` は現在は必須で既定名を持たないが、`remap-subs` を単体で使う
+/// ときの利便性のためにこの規則を残している。この名前にすることで、多くの
+/// プレイヤーが同名の字幕サイドカーを自動的に読み込める形にする。出力は
+/// 入力の隣に置く（`docs/architecture.md`「パス解決」節の「出力」分類と同じ扱い。
+/// キャッシュではなく成果物）。
 ///
 /// `auto` は入力の stem ではなく `-o` の stem から字幕サイドカーを導出するため
-/// （`src/auto.rs::subs_sidecar_path`、issue #73「やること」5）、この関数は
-/// 使わない。
+/// （`src/auto.rs::subs_sidecar_path`）、この関数は使わない。
 fn default_remap_subs_output_path(input: &Path, extension: &str) -> PathBuf {
     let dir = input.parent().map(Path::to_path_buf).unwrap_or_default();
     let stem = input
@@ -376,7 +358,7 @@ fn run_analyze(cache_dir: Option<PathBuf>, args: AnalyzeArgs) -> anyhow::Result<
 /// キーが無い、または数値としてパースできない場合は対象素材の実測値
 /// （30000/1001 ≈ 29.97fps）を既定にする。
 ///
-/// `pub(crate)`: `auto::run`（#62）が見逃し候補の警告表示に同じ fps を使うため
+/// `pub(crate)`: `auto::run` が見逃し候補の警告表示に同じ fps を使うため
 /// （`analyze --report` と同じ計算式で重複させないための共有）。
 pub(crate) fn fps_from_dtvi(dtvi: &dtvi::Dtvi) -> f64 {
     let parse = |key: &str, default: f64| {
@@ -396,7 +378,7 @@ pub(crate) fn fps_from_dtvi(dtvi: &dtvi::Dtvi) -> f64 {
 /// `cut` サブコマンドの実行。処理本体は [`execute_cut`] に集約してあり、ここでは
 /// CLI 引数から [`CutParams`] を組み立て、結果を人間向けに表示するだけ。
 ///
-/// この分離は `auto`（#62、`src/auto.rs`）が `cut` と同じ処理（`--cm-output` の
+/// この分離は `auto`（`src/auto.rs`）が `cut` と同じ処理（`--cm-output` の
 /// 自己検証8・保持側/CM側の atomic rename・区間マップの書き出しを含む）を複製せずに
 /// 再利用するために導入した（CLAUDE.md「analyze/cut のロジックを複製しない」）。
 /// `run_cut` 自体は `pub` にせず（CLI のオプション構成は変えたくない）、
@@ -498,8 +480,8 @@ pub(crate) fn execute_cut(params: CutParams) -> anyhow::Result<CutOutcome> {
     }
 
     // 自己検証を通って新しいマップを書けた場合だけ区間マップが残る、という状態に
-    // するため、処理を始める前に既定キャッシュパスの古い区間マップを削除する
-    // （レビュー指摘#4）。cut が一度成功して区間マップを書いた後、同じ入力に対して
+    // するため、処理を始める前に既定キャッシュパスの古い区間マップを削除する。
+    // cut が一度成功して区間マップを書いた後、同じ入力に対して
     // 別の trim.avs で再実行して自己検証に失敗すると、古い区間マップがキャッシュに
     // 残ったままになり、`remap-subs` が鮮度チェックなしにそれを使ってしまう
     // （古い trim.avs に基づく境界で字幕を張り替えてしまうが、エラーも警告も出ない）。
@@ -523,14 +505,12 @@ pub(crate) fn execute_cut(params: CutParams) -> anyhow::Result<CutOutcome> {
         );
     }
 
-    let moov = mp4io::read::read_moov(&input)
-        .with_context(|| format!("入力 mp4 の読み込みに失敗しました: {}", input.display()))?;
+    let moov = mp4io::read::read_moov(&input).path_ctx("入力 mp4 の読み込み", &input)?;
 
     let dtvi_path = resolve_dtvi_path(dtvi_path, cache_dir.as_deref(), &input)?;
     let dtvi_data = match &dtvi_path {
         Some(path) => {
-            let content = fs::read_to_string(path)
-                .with_context(|| format!(".dtvi の読み込みに失敗しました: {}", path.display()))?;
+            let content = fs::read_to_string(path).path_ctx(".dtvi の読み込み", path)?;
             Some(
                 dtvi::parse(&content)
                     .map_err(|err| anyhow!(".dtvi のパースに失敗しました: {err}"))?,
@@ -559,12 +539,7 @@ pub(crate) fn execute_cut(params: CutParams) -> anyhow::Result<CutOutcome> {
             .context("trim の標準入力からの読み込みに失敗しました")?;
         buf
     } else {
-        fs::read_to_string(&trim_path).with_context(|| {
-            format!(
-                "trim ファイルの読み込みに失敗しました: {}",
-                trim_path.display()
-            )
-        })?
+        fs::read_to_string(&trim_path).path_ctx("trim ファイルの読み込み", &trim_path)?
     };
     let trim = trim::TrimList::parse(&trim_content)
         .map_err(|err| anyhow!("trim ファイルのパースに失敗しました: {err}"))?;
@@ -673,9 +648,9 @@ pub(crate) fn execute_cut(params: CutParams) -> anyhow::Result<CutOutcome> {
                 )
             })?;
 
-            // 区間マップは保持側だけ出す（CM側は検出確認用で、字幕を付ける対象ではない。
-            // issue #57「やること」6）。両方の rename が終わった後（＝自己検証を通って
-            // 最終出力へ rename できた後）にだけ書く。
+            // 区間マップは保持側だけ出す（CM側は検出確認用で、字幕を付ける対象ではない）。
+            // 両方の rename が終わった後（＝自己検証を通って最終出力へ rename できた後）
+            // にだけ書く。
             if let Some(dtvi) = dtvi_data.as_ref() {
                 write_segment_map(
                     cache_dir.as_deref(),
@@ -719,8 +694,8 @@ fn resolve_dtvi_path(
         return Ok(dtvi_path);
     }
 
-    let cached = workdir::cached_dtvi_path(cache_dir, input)
-        .with_context(|| format!("`.dtvi` の自動解決に失敗しました: {}", input.display()))?;
+    let cached =
+        workdir::cached_dtvi_path(cache_dir, input).path_ctx("`.dtvi` の自動解決", input)?;
     if cached.is_file() {
         return Ok(Some(cached));
     }
@@ -840,9 +815,9 @@ impl CutPipeline<'_> {
 /// [`verify::VerifyReport`] に加えて、その書き出しで使った区間ごとの情報
 /// （出力の長さ・ソース上の開始 DTS）も一緒に返す。
 ///
-/// この2つは元々 `run` の内部でだけ計算していた値だが、区間マップ（`segmap.rs`、
-/// issue #57）を書くには snap 後の値そのもの（`trim.avs` から再計算した値ではない）
-/// が要る。ここで一緒に返すことで、`run_cut` 側で同じ計算をやり直さずに済む
+/// この2つは元々 `run` の内部でだけ計算していた値だが、区間マップ（`segmap.rs`）を
+/// 書くには snap 後の値そのもの（`trim.avs` から再計算した値ではない）が要る。
+/// ここで一緒に返すことで、`run_cut` 側で同じ計算をやり直さずに済む
 /// （計算が2箇所に分かれて食い違うリスクを避ける）。
 struct CutRunOutput {
     report: verify::VerifyReport,
@@ -915,7 +890,7 @@ fn sibling_pending_path(path: &Path) -> PathBuf {
 /// cut 完了時の結果表示。保持側/CM側で見出しと区間数のラベルだけを変える
 /// （`docs/architecture.md`「コマンド構成」節の表示例参照）。
 ///
-/// `pub(crate)`: `auto::run`（#62）が `cut` と同じ完了表示を再利用するため。
+/// `pub(crate)`: `auto::run` が `cut` と同じ完了表示を再利用するため。
 pub(crate) fn print_cut_report(
     label: &str,
     range_label: &str,
@@ -933,7 +908,7 @@ pub(crate) fn print_cut_report(
 }
 
 /// `cut` の処理を始める前に、既定キャッシュパス（`workdir::cached_segment_map_path`）
-/// にある古い区間マップを削除する（[`execute_cut`] 冒頭のコメント、レビュー指摘#4）。
+/// にある古い区間マップを削除する（[`execute_cut`] 冒頭のコメント参照）。
 ///
 /// 削除に失敗しても致命的エラーにはしない（警告に留める。区間マップ自体が
 /// 「消えても再生成できるキャッシュ」という位置づけで、その削除の失敗を理由に
@@ -973,7 +948,7 @@ fn clear_stale_cached_segment_map(cache_dir: Option<&Path>, input: &Path) {
 }
 
 /// cut が自己検証を通り、最終出力へ rename し終えた**後**に、保持側の区間マップ
-/// （`segmap.rs`、issue #57）を書き出す。
+/// （`segmap.rs`）を書き出す。
 ///
 /// マップは analyze の中間物（`.dtvi` / `trim.avs` / `detail.jls`）と同じ分類の
 /// 再生成できるキャッシュ（docs/architecture.md「パス解決」節）。書き込みに失敗しても
@@ -1085,9 +1060,7 @@ fn track_index(moov: &Moov, kind: TrackKind) -> Option<usize> {
 /// `source_dts(区間kの先頭サンプル) + u` であり、**区間の音声は「ソース時刻
 /// `dts(区間先頭サンプル)`」から選び始めるのが正しい**。
 ///
-/// 以前はここに合成時刻（`dts + cts_offset` を返す `composition_time` という関数が
-/// あった。以後は使われなくなったため削除し、DTS のみを返す
-/// `mp4io::order_map::decode_timestamp` に置き換えた）を渡していた。`mp4io/write.rs` は
+/// 以前はここに合成時刻（`dts + cts_offset`）を渡していた。`mp4io/write.rs` は
 /// `ctts` を引き継ぐため、出力の先頭フレームの pts は 0 ではなく `cts_offset`
 /// （B フレームの並べ替え深度ぶん。実測で約 66.7ms = 2 フレーム分）のままになる。
 /// 一方で音声は出力タイムライン 0 から並び始めるため、**音声が映像より
@@ -1209,7 +1182,7 @@ mod tests {
 
     #[test]
     fn resolve_dtvi_path_finds_cached_dtvi_left_by_analyze() {
-        // キャッシュの根を引数で直接渡すため、環境変数もロックも不要（E12-2）。
+        // キャッシュの根を引数で直接渡すため、環境変数もロックも不要。
         let cache_root = make_scratch_dir("resolve-dtvi-found-cache");
 
         let input_dir = make_scratch_dir("resolve-dtvi-found-input");

@@ -6,12 +6,15 @@
 //! stderr の末尾）を含めてエラーを返す。
 
 use std::env;
+use std::ffi::OsStr;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
 
 use anyhow::{bail, Context};
+
+use crate::errctx::PathContext;
 
 /// 起動に成功した外部プロセスの実行結果。
 ///
@@ -26,10 +29,10 @@ pub struct ExternalOutput {
 ///
 /// 空白や特殊文字を含む引数は単純に無視し、スペース区切りで連結するだけの簡易実装。
 /// 表示目的のみでシェルへの実際の入力には使わない。
-fn command_line(program: &str, args: &[&str]) -> String {
-    let mut line = String::from(program);
+fn command_line(program: &Path, args: &[&OsStr]) -> String {
+    let mut line = program.to_string_lossy().into_owned();
     for arg in args {
-        let _ = write!(line, " {arg}");
+        let _ = write!(line, " {}", arg.to_string_lossy());
     }
     line
 }
@@ -56,16 +59,10 @@ fn tail_lines(text: &str, max_lines: usize) -> String {
 /// ファイルパスも新しい cwd 基準で解決するため、`PATH` に `tools` のような
 /// 相対エントリが含まれる場合、そのまま起動すると `cwd` 配下の
 /// `tools/...` を探しにいって `No such file or directory` になる。
-pub fn run(program: &str, args: &[&str], cwd: &Path) -> anyhow::Result<ExternalOutput> {
+pub fn run(program: &Path, args: &[&OsStr], cwd: &Path) -> anyhow::Result<ExternalOutput> {
     let absolute_program = absolutize_program(program)?;
-    let absolute_cwd = absolutize_path(cwd).with_context(|| {
-        format!(
-            "作業ディレクトリの絶対パス解決に失敗しました: {}",
-            cwd.display()
-        )
-    })?;
-    let program_display = absolute_program.to_string_lossy();
-    let cmdline = command_line(&program_display, args);
+    let absolute_cwd = absolutize_path(cwd).path_ctx("作業ディレクトリの絶対パス解決", cwd)?;
+    let cmdline = command_line(&absolute_program, args);
     let started = Instant::now();
 
     let output = Command::new(&absolute_program)
@@ -131,13 +128,11 @@ fn absolutize_path(path: &Path) -> anyhow::Result<PathBuf> {
 ///
 /// パス区切りを含まない名前（`ffprobe` など）は PATH 解決に任せるため、
 /// そのまま返す。相対パス（`tools/dtvindex`）だけを絶対化する。
-fn absolutize_program(program: &str) -> anyhow::Result<PathBuf> {
-    let path = Path::new(program);
-    if path.is_absolute() || path.components().count() == 1 {
-        return Ok(path.to_path_buf());
+fn absolutize_program(program: &Path) -> anyhow::Result<PathBuf> {
+    if program.is_absolute() || program.components().count() == 1 {
+        return Ok(program.to_path_buf());
     }
-    absolutize_path(path)
-        .with_context(|| format!("実行ファイルの絶対パス解決に失敗しました: {program}"))
+    absolutize_path(program).path_ctx("実行ファイルの絶対パス解決", program)
 }
 
 #[cfg(test)]
@@ -167,15 +162,20 @@ mod tests {
     #[test]
     fn run_captures_stdout() {
         let cwd = std::env::temp_dir();
-        let result = run("/bin/echo", &["hello"], &cwd).expect("echo should succeed");
+        let result =
+            run(Path::new("/bin/echo"), &[OsStr::new("hello")], &cwd).expect("echo should succeed");
         assert_eq!(result.stdout.trim(), "hello");
     }
 
     #[test]
     fn run_fails_with_nonzero_exit_code() {
         let cwd = std::env::temp_dir();
-        let err =
-            run("/bin/sh", &["-c", "exit 3"], &cwd).expect_err("exit code 3 should be an error");
+        let err = run(
+            Path::new("/bin/sh"),
+            &[OsStr::new("-c"), OsStr::new("exit 3")],
+            &cwd,
+        )
+        .expect_err("exit code 3 should be an error");
         let message = err.to_string();
         assert!(
             message.contains("終了コード: 3") || message.contains("3"),
@@ -190,7 +190,7 @@ mod tests {
     #[test]
     fn run_reports_missing_program_clearly() {
         let cwd = std::env::temp_dir();
-        let err = run("this-binary-does-not-exist-tachikaze", &[], &cwd)
+        let err = run(Path::new("this-binary-does-not-exist-tachikaze"), &[], &cwd)
             .expect_err("missing binary should be an error");
         let message = err.to_string();
         assert!(
@@ -225,7 +225,7 @@ mod tests {
         let original_cwd = env::current_dir().unwrap();
         env::set_current_dir(&root).unwrap();
 
-        let result = run("tools/dummy_tool", &[], Path::new("work"));
+        let result = run(Path::new("tools/dummy_tool"), &[], Path::new("work"));
 
         env::set_current_dir(original_cwd).unwrap();
         let _ = fs::remove_dir_all(&root);

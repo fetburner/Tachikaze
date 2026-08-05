@@ -17,17 +17,12 @@
 //! 決まるキャッシュディレクトリを使い、削除しないことで `cut --dtvi` へ
 //! そのまま繋げられるようにしている。
 //!
-//! ## キャッシュの根の決め方（E12-2）
+//! ## キャッシュの根の決め方
 //!
-//! かつては `TACHIKAZE_CACHE_DIR` → `XDG_CACHE_HOME` → `HOME` → `env::temp_dir()`
-//! の4段の環境変数フォールバックと、CLI の `--work-dir` / `--no-keep-work` を
-//! 合わせて6つの口が同じ「キャッシュの置き場所」を決めていた。どれが効いているか
-//! 読んで確かめないと分からず、環境変数を書き換えるテストがプロセス共有の状態を
-//! 触るため直列化用の `Mutex` が必要になっていた。
-//!
-//! 今は CLI のグローバルオプション `--cache-dir <DIR>`（[`crate::cli::Cli::cache_dir`]）
-//! → [`cache_root`] の既定値の2段だけにしてある。`--work-dir` / `--no-keep-work` は
-//! 削除した（使い捨てにしたい場合は `--cache-dir "$(mktemp -d)"` を使う）。
+//! キャッシュの置き場所を決める口は、CLI のグローバルオプション
+//! `--cache-dir <DIR>`（[`crate::cli::Cli::cache_dir`]）→ [`cache_root`] の既定値の
+//! 2段だけにしてある。`--work-dir` / `--no-keep-work` は削除した（使い捨てに
+//! したい場合は `--cache-dir "$(mktemp -d)"` を使う）。
 
 use std::fs;
 use std::os::unix::ffi::OsStrExt;
@@ -35,6 +30,8 @@ use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+
+use crate::errctx::PathContext;
 
 const WORK_FILE_NAME: &str = "work.mp4";
 const DTVI_FILE_NAME: &str = "work.mp4.dtvi";
@@ -72,21 +69,12 @@ impl WorkDir {
     ///   ハッシュからディレクトリ名を決める（[`cache_dir_for_input`]）。
     pub fn new(cache_dir: Option<&Path>, input: &Path) -> Result<Self> {
         let path = cache_dir_for_input(cache_dir, input)?;
-        fs::create_dir_all(&path).with_context(|| {
-            format!(
-                "キャッシュディレクトリの作成に失敗しました: {}",
-                path.display()
-            )
-        })?;
+        fs::create_dir_all(&path).path_ctx("キャッシュディレクトリの作成", &path)?;
         // 相対パスのまま保持すると、`external::run` が `current_dir` を
         // このディレクトリに切り替えたあと、引数の `work/work.mp4` などが
         // 二重にネストして解決される。作成直後に絶対化しておく。
-        let path = fs::canonicalize(&path).with_context(|| {
-            format!(
-                "キャッシュディレクトリの絶対パス解決に失敗しました: {}",
-                path.display()
-            )
-        })?;
+        let path =
+            fs::canonicalize(&path).path_ctx("キャッシュディレクトリの絶対パス解決", &path)?;
         Ok(Self { path })
     }
 
@@ -101,12 +89,8 @@ impl WorkDir {
     /// カレントディレクトリが変わっても壊れない。入力自体が symlink でも、
     /// その解決先へ張るので問題なく動く。既に `work.mp4` がある場合は張り替える。
     pub fn link_input(&self, input: &Path) -> Result<PathBuf> {
-        let absolute_input = fs::canonicalize(input).with_context(|| {
-            format!(
-                "入力ファイルの絶対パス解決に失敗しました: {}",
-                input.display()
-            )
-        })?;
+        let absolute_input =
+            fs::canonicalize(input).path_ctx("入力ファイルの絶対パス解決", input)?;
 
         let work_path = self.work_path();
 
@@ -243,7 +227,7 @@ fn absolutize_cache_dir(dir: &Path) -> Result<PathBuf> {
 /// （`${XDG_CACHE_HOME:-~/.cache}`）と同じものを借りている（利用者にとって
 /// 見慣れた場所にするため）が、`XDG_CACHE_HOME` / `TACHIKAZE_CACHE_DIR` と
 /// いった環境変数は一切読まない。置き場所を決める口を `--cache-dir` 1本に
-/// 絞ることが本モジュールの目的（E12-2）であり、環境変数を読む経路を残すと
+/// 絞ることが本モジュールの目的であり、環境変数を読む経路を残すと
 /// `--cache-dir` を渡しても環境変数が別の場所を指していればどちらが効くか
 /// コードを読まないと分からなくなる。
 ///
@@ -260,16 +244,13 @@ fn absolutize_cache_dir(dir: &Path) -> Result<PathBuf> {
 /// ## `HOME` が未設定でも、たいていエラーにはならない
 ///
 /// `home` は呼び出し元（[`cache_root`]）が `std::env::home_dir()` の戻り値を
-/// そのまま渡す。`std::env::home_dir()` は Windows での挙動の問題から非推奨
-/// 扱いだった時期があるが、rustc 1.97.1 時点では非推奨警告が出ず、Unix では
+/// そのまま渡す。`std::env::home_dir()` はかつて非推奨扱いだった時期があるが
+/// （非推奨の理由は Windows での挙動であり、本ツールは macOS 専用なので関係しない）、
+/// rustc 1.97.1 時点では非推奨警告が出ないことを実測で確認済みで、Unix では
 /// `$HOME` 環境変数が unset でも `getpwuid` 経由でホームディレクトリを引ける
 /// （実測済み）。つまりこの関数が実際に `None` を受け取る（＝エラーになる）のは
 /// 「`$HOME` が無い」だけでは足りず、「呼び出しユーザーの passwd エントリすら
 /// 無い」ような環境（コンテナで存在しない UID として動かす等）に限られる。
-/// Go の `os.UserCacheDir` は `$HOME` 環境変数の有無だけを見てエラーにするため
-/// 挙動が異なる点に注意（あちらは `$HOME` が無ければ即エラー、こちらは
-/// passwd 由来のホームまで見るぶん範囲が狭い）。本ツールは macOS 専用
-/// （CLAUDE.md「前提」）なので Windows の問題は関係しない。
 fn default_cache_root(home: Option<&Path>) -> Result<PathBuf> {
     let home = home.ok_or_else(|| {
         anyhow::anyhow!(
@@ -284,9 +265,7 @@ fn default_cache_root(home: Option<&Path>) -> Result<PathBuf> {
 /// キャッシュディレクトリ名に使う stem を安全化する。
 ///
 /// 空白・`/`・制御文字は `_` に置き換える。日本語などマルチバイト文字は
-/// そのまま残す。かつて存在したシェルラッパー `scripts/tachikaze-cmcut`
-/// （`auto` の追加に伴い削除済み、`[E11-7]`）にも同名の `safe_stem` があり、
-/// この関数と同じ規則（空白・`/`・制御文字を `_` に置換）を実装していた。
+/// そのまま残す。
 fn sanitize_stem(stem: &str) -> String {
     stem.chars()
         .map(|c| {
@@ -323,12 +302,7 @@ fn fnv1a_hex(bytes: &[u8]) -> String {
 /// ハッシュだけでなく stem も併記するのは、万が一ハッシュが衝突しても別入力が
 /// 同じディレクトリを共有しないようにするため（人間が見て区別しやすくもなる）。
 fn cache_dir_for_input(cache_dir: Option<&Path>, input: &Path) -> Result<PathBuf> {
-    let absolute = fs::canonicalize(input).with_context(|| {
-        format!(
-            "入力ファイルの絶対パス解決に失敗しました: {}",
-            input.display()
-        )
-    })?;
+    let absolute = fs::canonicalize(input).path_ctx("入力ファイルの絶対パス解決", input)?;
     let hash = fnv1a_hex(absolute.as_os_str().as_bytes());
     let stem = absolute
         .file_stem()
@@ -339,46 +313,43 @@ fn cache_dir_for_input(cache_dir: Option<&Path>, input: &Path) -> Result<PathBuf
 }
 
 /// `cut --dtvi` 省略時に使う、入力ごとのキャッシュディレクトリ内の `.dtvi` の
-/// パスを返す。`WorkDir::new` が使うキャッシュパス規則を [`cache_dir_for_input`]
-/// 1か所に集約し、`cut` 側もそれをそのまま参照する（`analyze` が作った
-/// ディレクトリと `cut` が探すディレクトリがずれると、無関係な入力の `.dtvi` を
-/// 指してしまいかねないため）。
+/// パスを返す。
 ///
-/// ディレクトリの作成は行わない。ファイルが存在するかどうかの確認・存在しない
-/// 場合の扱いは呼び出し側の責務とする（`.dtvi` が無いのに検証を省略してはい
-/// けないため、呼び出し側で明示的に判断させる）。
+/// この関数を含む以下4関数（[`cached_segment_map_path`] / [`prepared_input_path`] /
+/// [`subs_path`]）はいずれも [`cache_dir_for_input`] 1か所にキャッシュパス規則を
+/// 集約する。呼び出し側ごとにパス規則がずれると、無関係な入力の対応ファイルを
+/// 指してしまいかねないため。ディレクトリの作成はいずれも行わない
+/// （ファイルの存在確認・作成は呼び出し側の責務とする。`.dtvi` が無いのに
+/// 検証を省略してはいけないため、呼び出し側で明示的に判断させる）。
 pub fn cached_dtvi_path(cache_dir: Option<&Path>, input: &Path) -> Result<PathBuf> {
     Ok(cache_dir_for_input(cache_dir, input)?.join(DTVI_FILE_NAME))
 }
 
 /// `cut` が既定で書き出す区間マップ（`work.mp4.segmap.json`）のキャッシュパスを返す。
 ///
-/// [`cached_dtvi_path`] と同じ理由で [`cache_dir_for_input`] 1か所に集約する（`cut` は
-/// `.dtvi` と同じ入力ごとのキャッシュディレクトリへ区間マップを書くため、パス規則が
-/// ずれると無関係な入力のマップを指しうる）。ディレクトリの作成は行わない
-/// （書き込み側で必要なら作る）。
+/// パス規則とディレクトリ作成の契約は [`cached_dtvi_path`] 参照。ディレクトリの
+/// 作成は行わない（書き込み側で必要なら作る）。
 pub fn cached_segment_map_path(cache_dir: Option<&Path>, input: &Path) -> Result<PathBuf> {
     Ok(cache_dir_for_input(cache_dir, input)?.join(SEGMENT_MAP_FILE_NAME))
 }
 
 /// `prepare` が elst 除去・字幕トラック除去後のメディアを書き出すキャッシュパスを返す。
 ///
-/// [`cached_dtvi_path`] と同じキャッシュディレクトリ規則([`cache_dir_for_input`])を
-/// 共有する。`analyze` / `cut` / `prepare` がすべて同じ入力に対して同じキャッシュ
-/// ディレクトリを使うことで、`cut` が `prepare` の出力を暗黙に見つけられる余地を
-/// 残す(現時点では `cut` はこのパスを自動探索しない。呼び出し側が明示的に
-/// `prepare` の出力パスを `cut` の入力として渡す)。
-///
-/// ディレクトリの作成は行わない([`cached_dtvi_path`]と同様、呼び出し側の責務)。
+/// パス規則とディレクトリ作成の契約は [`cached_dtvi_path`] 参照。`analyze` /
+/// `cut` / `prepare` がすべて同じ入力に対して同じキャッシュディレクトリを
+/// 使うため、`cut` が `prepare` の出力を暗黙に見つけられる余地を残す(現時点では
+/// `cut` はこのパスを自動探索しない。呼び出し側が明示的に `prepare` の出力パスを
+/// `cut` の入力として渡す)。
 pub fn prepared_input_path(cache_dir: Option<&Path>, input: &Path) -> Result<PathBuf> {
     Ok(cache_dir_for_input(cache_dir, input)?.join(INPUT_PREPARED_FILE_NAME))
 }
 
 /// `prepare` が字幕サイドカーを書き出すキャッシュパスを返す。
 ///
-/// `extension` には `"ass"` / `"srt"` など、`.` を含まない拡張子を渡す
+/// パス規則とディレクトリ作成の契約は [`cached_dtvi_path`] 参照。`extension`
+/// には `"ass"` / `"srt"` など、`.` を含まない拡張子を渡す
 /// (どちらを使うかは字幕トラックのコーデックから `prepare` が決める。
-/// `prepare::SubtitleFormat` 参照)。ディレクトリの作成は行わない。
+/// `prepare::SubtitleFormat` 参照)。
 pub fn subs_path(cache_dir: Option<&Path>, input: &Path, extension: &str) -> Result<PathBuf> {
     Ok(cache_dir_for_input(cache_dir, input)?.join(format!("{SUBS_BASE_NAME}.{extension}")))
 }
@@ -392,9 +363,7 @@ mod tests {
     /// テスト用に、システムの一時ディレクトリ配下にユニークなディレクトリを作る。
     /// `WorkDir` 自体のテストなので `tempfile` クレートには頼らず、素朴な方式で
     /// 自前実装する。`--cache-dir` を明示的に渡すことでプロセス共有の環境変数を
-    /// 一切触らずに済むため（E12-2 以前は `TACHIKAZE_CACHE_DIR` の書き換えを
-    /// 直列化するための `Mutex` が必要だったが、根を引数で受け取る形にしたことで
-    /// 不要になった）、テストは並行実行しても競合しない。
+    /// 一切触らずに済むため、テストは並行実行しても競合しない。
     fn make_scratch_dir(label: &str) -> PathBuf {
         let base = std::env::temp_dir();
         let pid = process::id();
@@ -582,7 +551,7 @@ mod tests {
     /// 各中間ファイルパスの名前が集約されていることを確認する。
     ///
     /// `WorkDir::new` は入力の絶対パス解決（`fs::canonicalize`）を必ず行うため
-    /// （使い捨て一時ディレクトリの経路は削除済み、E12-2）、実在する入力が要る。
+    /// （使い捨て一時ディレクトリの経路は削除済み）、実在する入力が要る。
     #[test]
     fn intermediate_file_names_are_correct() {
         let cache_root = make_scratch_dir("names-cache");
@@ -653,7 +622,7 @@ mod tests {
         fs::remove_dir_all(&cache_root).ok();
     }
 
-    /// 完了条件（レビュー指摘）: 相対パスの `--cache-dir` は呼び出し元の
+    /// 完了条件: 相対パスの `--cache-dir` は呼び出し元の
     /// カレントディレクトリを基準に絶対化される。`absolutize_cache_dir` の
     /// doc comment参照（絶対化しないと `prepare` が二重にネストしたパスを
     /// 探しに行って `No such file or directory` になる実機バグがあった）。

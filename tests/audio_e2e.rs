@@ -49,19 +49,6 @@ use std::process::Command;
 
 // --- 集合比較・パース・順序検証（ffprobe 不要、実ファイル不要） ---
 
-/// `ffprobe -show_entries packet=data_hash -show_data_hash CRC32 -of csv=p=0` の
-/// 出力（1行1パケット、`CRC32:xxxxxxxx` 形式）をパースして集合にする。
-///
-/// 空行は無視する。`sort -u` 相当（重複は `HashSet` で自然に畳み込まれる）。
-fn parse_crc_set(ffprobe_output: &str) -> HashSet<String> {
-    ffprobe_output
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(str::to_string)
-        .collect()
-}
-
 /// `comm -23 out.txt src.txt` 相当: `out` にあって `src` に無い要素を返す
 /// （＝出力にしか存在しないパケット。0件なら全パケットがビットコピー）。
 ///
@@ -190,21 +177,6 @@ fn reference_nearest_cumulative_index(cumulative: &[u64], target: f64) -> u64 {
 #[cfg(test)]
 mod pure_logic_tests {
     use super::*;
-
-    #[test]
-    fn parse_crc_set_dedupes_and_ignores_blank_lines() {
-        let output = "CRC32:aaaa0001\nCRC32:aaaa0002\nCRC32:aaaa0001\n\n";
-        let set = parse_crc_set(output);
-        assert_eq!(set.len(), 2);
-        assert!(set.contains("CRC32:aaaa0001"));
-        assert!(set.contains("CRC32:aaaa0002"));
-    }
-
-    #[test]
-    fn parse_crc_set_of_empty_input_is_empty() {
-        assert!(parse_crc_set("").is_empty());
-        assert!(parse_crc_set("\n\n   \n").is_empty());
-    }
 
     #[test]
     fn packets_only_in_output_is_empty_when_output_is_subset_of_source() {
@@ -428,67 +400,19 @@ mod pure_logic_tests {
 
 // --- ffprobe ラッパ（実行には ffprobe が必要） ---
 
-fn skip_if_missing(bin: &str) -> bool {
-    match Command::new(bin).arg("-version").output() {
-        Ok(output) if output.status.success() => false,
-        _ => {
-            eprintln!("{bin} が無いためスキップします。");
-            true
-        }
-    }
-}
-
 /// 音声ストリームの全パケットの CRC32 集合を ffprobe で取得する。
 fn ffprobe_audio_crc_set(path: &Path) -> HashSet<String> {
-    let output = Command::new("ffprobe")
-        .args([
-            "-v",
-            "error",
-            "-select_streams",
-            "a:0",
-            "-show_entries",
-            "packet=data_hash",
-            "-show_data_hash",
-            "CRC32",
-            "-of",
-            "csv=p=0",
-        ])
-        .arg(path)
-        .output()
-        .expect("ffprobe の起動に失敗した（PATH を確認）");
-    assert!(
-        output.status.success(),
-        "ffprobe が失敗した: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    parse_crc_set(&String::from_utf8_lossy(&output.stdout))
+    tachikaze::ffprobe::csv_rows(Path::new("ffprobe"), path, "a:0", "packet=data_hash")
+        .expect("ffprobe の起動に失敗した（PATH を確認）")
+        .into_iter()
+        .collect()
 }
 
 /// 音声ストリームの全パケットの dts を格納順に取得する。
 fn ffprobe_audio_dts(path: &Path) -> Vec<i64> {
-    let output = Command::new("ffprobe")
-        .args([
-            "-v",
-            "error",
-            "-select_streams",
-            "a:0",
-            "-show_entries",
-            "packet=dts",
-            "-of",
-            "csv=p=0",
-        ])
-        .arg(path)
-        .output()
-        .expect("ffprobe の起動に失敗した");
-    assert!(
-        output.status.success(),
-        "ffprobe が失敗した: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
+    tachikaze::ffprobe::csv_rows(Path::new("ffprobe"), path, "a:0", "packet=dts")
+        .expect("ffprobe の起動に失敗した")
+        .into_iter()
         .map(|line| {
             line.parse::<i64>()
                 .unwrap_or_else(|_| panic!("dts が整数としてパースできない: {line:?}"))
@@ -516,33 +440,8 @@ fn ffprobe_audio_packet_durations(path: &Path) -> Vec<u64> {
 /// 「区間の先頭パケットが元ファイルの正しい位置のパケットと一致するか」という
 /// **位置**の検査には、集合ではなく列としての値が要る。
 fn ffprobe_audio_crc_ordered(path: &Path) -> Vec<String> {
-    let output = Command::new("ffprobe")
-        .args([
-            "-v",
-            "error",
-            "-select_streams",
-            "a:0",
-            "-show_entries",
-            "packet=data_hash",
-            "-show_data_hash",
-            "CRC32",
-            "-of",
-            "csv=p=0",
-        ])
-        .arg(path)
-        .output()
-        .expect("ffprobe の起動に失敗した（PATH を確認）");
-    assert!(
-        output.status.success(),
-        "ffprobe が失敗した: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(str::to_string)
-        .collect()
+    tachikaze::ffprobe::csv_rows(Path::new("ffprobe"), path, "a:0", "packet=data_hash")
+        .expect("ffprobe の起動に失敗した（PATH を確認）")
 }
 
 /// 映像ストリームの全パケットの pts（timescale 単位、格納順 = デコード順）を取得する。
@@ -570,7 +469,7 @@ fn ffprobe_video_pts(path: &Path) -> Vec<i64> {
 ///
 /// 区間のソース上の絶対開始時刻として使うべきなのは合成時刻（pts 相当）ではなく
 /// **DTS** である（`src/commands.rs::segment_video_source_starts` の doc comment、
-/// CLAUDE.md「静かに壊れる3つの罠」参照）。過去に `expected_video_segments`
+/// CLAUDE.md「静かに壊れる4つの罠」参照）。過去に `expected_video_segments`
 /// （このテストファイルのオラクル）が `ffprobe_video_pts`（合成時刻）をそのまま
 /// 区間開始時刻として使っており、実装本体（`src/commands.rs`）が合成時刻を使う
 /// バグと**同じ間違いを踏んでいた**ため、テストとバグが「合意」してしまい検出でき
@@ -636,54 +535,13 @@ fn ffprobe_audio_packet_positions(path: &Path) -> Vec<(u64, u64)> {
 
 /// `ffprobe ... -of csv=p=0` の出力を空行を除いた行の列として返す。
 fn ffprobe_csv_column(path: &Path, stream_selector: &str, entry: &str) -> Vec<String> {
-    let output = Command::new("ffprobe")
-        .args([
-            "-v",
-            "error",
-            "-select_streams",
-            stream_selector,
-            "-show_entries",
-            entry,
-            "-of",
-            "csv=p=0",
-        ])
-        .arg(path)
-        .output()
-        .expect("ffprobe の起動に失敗した");
-    assert!(
-        output.status.success(),
-        "ffprobe が失敗した: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(str::to_string)
-        .collect()
+    tachikaze::ffprobe::csv_rows(Path::new("ffprobe"), path, stream_selector, entry)
+        .expect("ffprobe の起動に失敗した")
 }
 
 fn ffprobe_scalar_stream_entry(path: &Path, stream_selector: &str, entry: &str) -> String {
-    let output = Command::new("ffprobe")
-        .args([
-            "-v",
-            "error",
-            "-select_streams",
-            stream_selector,
-            "-show_entries",
-            entry,
-            "-of",
-            "default=nk=1:nw=1",
-        ])
-        .arg(path)
-        .output()
-        .expect("ffprobe の起動に失敗した");
-    assert!(
-        output.status.success(),
-        "ffprobe が失敗した: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    String::from_utf8_lossy(&output.stdout).trim().to_string()
+    tachikaze::ffprobe::scalar_entry(Path::new("ffprobe"), path, stream_selector, entry)
+        .expect("ffprobe の起動に失敗した")
 }
 
 /// `IN.mp4` に対して ffprobe の CRC32 ラッパと集合比較ロジックが実際に動くことを、
@@ -693,7 +551,7 @@ fn ffprobe_scalar_stream_entry(path: &Path, stream_selector: &str, entry: &str) 
 /// 自動でスキップする。`tests/fixtures/gen.sh` を参照）。
 #[test]
 fn ffprobe_wrapper_round_trips_on_real_fixture() {
-    if common::skip_if_fixture_missing() || skip_if_missing("ffprobe") {
+    if common::skip_if_fixture_missing() || common::skip_if_missing("ffprobe") {
         return;
     }
 
@@ -752,12 +610,6 @@ const SNAPPED_FRAMES_PER_SEGMENT: [u64; 2] = [120, 120];
 /// インデックスであり、`ffprobe_video_pts` の同じ添字でそのままソース時刻が引ける。
 const SNAPPED_START_DISPLAY_FRAMES: [usize; 2] = [0, 360];
 
-/// `cut` に渡す `.dtvi`。実 `dtvindex` 出力の抜粋（`src/mp4io/order_map.rs` の
-/// テストが同じものをフィクスチャとの全行一致検証に使っている）。
-fn dtvi_path() -> std::path::PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/sample.dtvi")
-}
-
 /// 指定したフィクスチャに対して `tachikaze cut` を実行し、
 /// `(一時ディレクトリ, 出力パス)` を返す。
 fn run_cut_with_fixture(fixture: &Path, label: &str) -> (std::path::PathBuf, std::path::PathBuf) {
@@ -778,7 +630,7 @@ fn run_cut_with_fixture(fixture: &Path, label: &str) -> (std::path::PathBuf, std
         .arg("-o")
         .arg(&out_path)
         .arg("--dtvi")
-        .arg(dtvi_path())
+        .arg(common::dtvi_path())
         .arg("--verify")
         .output()
         .expect("tachikaze cut の起動に失敗した");
@@ -806,7 +658,7 @@ fn run_cut(label: &str) -> (std::path::PathBuf, std::path::PathBuf) {
 /// `video_segment_source_starts` は `SNAPPED_START_DISPLAY_FRAMES` の各表示フレームの
 /// 実測 **dts**（`ffprobe_video_dts`）を使う。合成時刻（pts）ではない
 /// （`src/commands.rs::segment_video_source_starts` の doc comment、CLAUDE.md
-/// 「静かに壊れる3つの罠」参照）。
+/// 「静かに壊れる4つの罠」参照）。
 ///
 /// 過去はここで `ffprobe_video_pts`（合成時刻）を使っており、実装本体
 /// （`src/commands.rs`）が合成時刻を区間開始時刻として使うバグと**まったく同じ
@@ -874,7 +726,9 @@ fn expected_video_segments(fixture: &Path) -> (Vec<u64>, Vec<u64>, u32) {
 #[test]
 #[ignore = "tests/fixtures/sample.mp4 と ffmpeg/ffprobe が必要。tests/fixtures/gen.sh を先に実行すること"]
 fn cut_audio_is_bitwise_copy_and_matches_expected_count() {
-    if common::skip_if_fixture_missing() || skip_if_missing("ffmpeg") || skip_if_missing("ffprobe")
+    if common::skip_if_fixture_missing()
+        || common::skip_if_missing("ffmpeg")
+        || common::skip_if_missing("ffprobe")
     {
         return;
     }
@@ -948,7 +802,9 @@ fn cut_audio_is_bitwise_copy_and_matches_expected_count() {
 #[test]
 #[ignore = "tests/fixtures/sample.mp4 と ffmpeg/ffprobe が必要。tests/fixtures/gen.sh を先に実行すること"]
 fn cut_audio_segments_start_from_correct_source_position() {
-    if common::skip_if_fixture_missing() || skip_if_missing("ffmpeg") || skip_if_missing("ffprobe")
+    if common::skip_if_fixture_missing()
+        || common::skip_if_missing("ffmpeg")
+        || common::skip_if_missing("ffprobe")
     {
         return;
     }
@@ -1035,7 +891,9 @@ fn cut_audio_segments_start_from_correct_source_position() {
 #[test]
 #[ignore = "tests/fixtures/sample.mp4 と ffmpeg/ffprobe が必要。tests/fixtures/gen.sh を先に実行すること"]
 fn output_video_and_audio_first_packet_stay_in_av_sync_with_source() {
-    if common::skip_if_fixture_missing() || skip_if_missing("ffmpeg") || skip_if_missing("ffprobe")
+    if common::skip_if_fixture_missing()
+        || common::skip_if_missing("ffmpeg")
+        || common::skip_if_missing("ffprobe")
     {
         return;
     }
@@ -1121,8 +979,8 @@ fn output_video_and_audio_first_packet_stay_in_av_sync_with_source() {
 fn aac_cut_is_bitwise_copy_and_preserves_segment_positions_and_av_sync() {
     let fixture = common::aac_fixture_path();
     if common::skip_if_fixture_missing_at(&fixture)
-        || skip_if_missing("ffmpeg")
-        || skip_if_missing("ffprobe")
+        || common::skip_if_missing("ffmpeg")
+        || common::skip_if_missing("ffprobe")
     {
         return;
     }
@@ -1223,8 +1081,8 @@ fn aac_cut_is_bitwise_copy_and_preserves_segment_positions_and_av_sync() {
 fn flac_cut_smoke_is_bitwise_copy() {
     let fixture = common::fixture_path_named("sample_flac.mp4");
     if common::skip_if_fixture_missing_at(&fixture)
-        || skip_if_missing("ffmpeg")
-        || skip_if_missing("ffprobe")
+        || common::skip_if_missing("ffmpeg")
+        || common::skip_if_missing("ffprobe")
     {
         return;
     }
@@ -1261,7 +1119,9 @@ fn flac_cut_smoke_is_bitwise_copy() {
 #[test]
 #[ignore = "tests/fixtures/sample.mp4 と ffmpeg/ffprobe が必要。tests/fixtures/gen.sh を先に実行すること"]
 fn corrupted_audio_packet_is_detected_by_set_comparison() {
-    if common::skip_if_fixture_missing() || skip_if_missing("ffmpeg") || skip_if_missing("ffprobe")
+    if common::skip_if_fixture_missing()
+        || common::skip_if_missing("ffmpeg")
+        || common::skip_if_missing("ffprobe")
     {
         return;
     }

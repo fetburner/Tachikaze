@@ -128,7 +128,7 @@ impl DecodeIdx {
 /// `DisplayIdx` と `DecodeIdx` の相互変換を担う写像。
 ///
 /// 表示順とデコード順の相互変換はこの型を経由するときのみ許可する。実データからの構築は
-/// 別 issue（#27）で行うため、ここでは API と往復可能な最小実装のみを提供する。
+/// 別のモジュールで行うため、ここでは API と往復可能な最小実装のみを提供する。
 pub struct OrderMap {
     /// (display, decode) のペアを保持する。過剰な最適化はせず、線形探索で十分とする。
     pairs: Vec<(DisplayIdx, DecodeIdx)>,

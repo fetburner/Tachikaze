@@ -17,7 +17,7 @@
 //! なる想定だったため「書き出し専用でよい」と判断し、`serde` / `serde_json` を
 //! 追加せずに手書きの JSON パーサ・シリアライザ（`mod json` 相当、約 186 行）と
 //! `json_escape` を書いていた。「読み込みが必要になった時点で改めて依存を検討する」
-//! と当時の doc comment に残していた再検討条件があったが、その後 #59 で
+//! と当時の doc comment に残していた再検討条件があったが、その後
 //! `remap-subs` が同じ Rust プロセスから [`SegmentMap::from_json`] で読み戻すように
 //! なり、条件が満たされた。手書きパーサは真偽値・null・浮動小数点非対応など
 //! 汎用性を落として書かれており、読み込み側の消費者が増えた以上そのコストが
@@ -156,8 +156,8 @@ impl SegmentMap {
         fs::write(path, self.to_json())
     }
 
-    /// [`to_json`](Self::to_json) が書き出した JSON を読み戻す（#59 `remap-subs` が
-    /// 区間マップを読み込むために追加）。フィールドの並び順は問わない（`to_json` の
+    /// [`to_json`](Self::to_json) が書き出した JSON を読み戻す（`remap-subs` が
+    /// 区間マップを読み込むために使う）。フィールドの並び順は問わない（`to_json` の
     /// 出力順と一致している必要はない。`serde_json` の既定の挙動）。
     pub fn from_json(json_text: &str) -> Result<SegmentMap, SegmentMapParseError> {
         serde_json::from_str(json_text).map_err(SegmentMapParseError)

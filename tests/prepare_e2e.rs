@@ -8,8 +8,9 @@
 //!
 //! `Cargo.toml` に `[lib]` ターゲットがある(#11)ため、`tests/` から
 //! `tachikaze::prepare` / `tachikaze::mp4io` を直接呼べる(他の `*_e2e.rs` が使う
-//! `#[path]` インクルードや `CARGO_BIN_EXE_tachikaze` 起動は、lib ターゲットが
-//! 無かった頃の回避策)。
+//! `CARGO_BIN_EXE_tachikaze` 起動でバイナリを1本立ち上げるのは、CLI 経由の
+//! 挙動そのものを確認したい場合の手段であって、lib ターゲットが無いからでは
+//! ない)。
 
 mod common;
 
@@ -29,34 +30,11 @@ use tachikaze::prepare;
 /// このロックを取ること。`src/external.rs::tests::CWD_LOCK` と同じ理由）。
 static CWD_LOCK: Mutex<()> = Mutex::new(());
 
-fn skip_if_missing(bin: &str) -> bool {
-    match Command::new(bin).arg("-version").output() {
-        Ok(output) if output.status.success() => false,
-        _ => {
-            eprintln!("{bin} が無いためスキップします。");
-            true
-        }
-    }
-}
-
-/// テストごとに一意な一時ディレクトリを作る(`tempfile` クレートに依存しない、
-/// 他のテストファイルと同じ素朴な方式)。
+/// テストごとに一意な一時ディレクトリを作る(`common::make_scratch_dir` を
+/// このファイル固有の接頭辞 `prepare-e2e-` 付きで呼ぶ薄いラッパ。ディレクトリ名は
+/// 元と同じ `tachikaze-prepare-e2e-<label>-<pid>-<nanos>-<attempt>` になる)。
 fn make_scratch_dir(label: &str) -> PathBuf {
-    let base = std::env::temp_dir();
-    let pid = std::process::id();
-    for attempt in 0..100 {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let candidate = base.join(format!(
-            "tachikaze-prepare-e2e-{label}-{pid}-{nanos}-{attempt}"
-        ));
-        if fs::create_dir_all(&candidate).is_ok() {
-            return candidate;
-        }
-    }
-    panic!("scratch dir の作成に失敗しました");
+    common::make_scratch_dir(&format!("prepare-e2e-{label}"))
 }
 
 /// `prepare::run` に渡すキャッシュの根を、テストごとの一意なスクラッチ
@@ -147,7 +125,8 @@ fn dir_entries(dir: &Path) -> Vec<PathBuf> {
 #[test]
 #[ignore = "tests/fixtures/sample_aac.mp4 と ffmpeg が必要。tests/fixtures/gen.sh を先に実行すること"]
 fn prepare_strips_edit_list_and_result_is_accepted_by_check_supported() {
-    if common::skip_if_fixture_missing_at(&common::aac_fixture_path()) || skip_if_missing("ffmpeg")
+    if common::skip_if_fixture_missing_at(&common::aac_fixture_path())
+        || common::skip_if_missing("ffmpeg")
     {
         return;
     }
@@ -199,7 +178,7 @@ fn prepare_strips_edit_list_and_result_is_accepted_by_check_supported() {
 #[test]
 #[ignore = "tests/fixtures/sample.mp4 と ffmpeg が必要。tests/fixtures/gen.sh を先に実行すること"]
 fn prepare_extracts_subtitle_and_drops_track_from_media() {
-    if common::skip_if_fixture_missing() || skip_if_missing("ffmpeg") {
+    if common::skip_if_fixture_missing() || common::skip_if_missing("ffmpeg") {
         return;
     }
 
@@ -282,7 +261,7 @@ fn prepare_is_noop_for_plain_fixture_and_creates_nothing_next_to_input() {
 #[test]
 #[ignore = "tests/fixtures/sample.mp4 と ffmpeg が必要。tests/fixtures/gen.sh を先に実行すること"]
 fn prepare_prefers_external_subs_over_embedded_track() {
-    if common::skip_if_fixture_missing() || skip_if_missing("ffmpeg") {
+    if common::skip_if_fixture_missing() || common::skip_if_missing("ffmpeg") {
         return;
     }
 
@@ -325,7 +304,8 @@ fn prepare_prefers_external_subs_over_embedded_track() {
 #[test]
 #[ignore = "tests/fixtures/sample_aac.mp4 と ffmpeg が必要。tests/fixtures/gen.sh を先に実行すること"]
 fn prepare_strips_edit_list_with_relative_input_and_relative_cache_dir() {
-    if common::skip_if_fixture_missing_at(&common::aac_fixture_path()) || skip_if_missing("ffmpeg")
+    if common::skip_if_fixture_missing_at(&common::aac_fixture_path())
+        || common::skip_if_missing("ffmpeg")
     {
         return;
     }

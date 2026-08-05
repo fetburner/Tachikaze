@@ -24,31 +24,10 @@ use tachikaze::workdir;
 /// `Snap::Outward`（既定）で `[10,110)` は `[0,120)` へ、`[370,470)` は `[360,480)` へ広がる。
 const TRIM_AVS_CONTENT: &str = "Trim(10,109) ++ Trim(370,469)";
 
-fn dtvi_path() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/sample.dtvi")
-}
-
-fn tools_available() -> bool {
-    for bin in ["ffmpeg", "ffprobe"] {
-        match Command::new(bin).arg("-version").output() {
-            Ok(output) if output.status.success() => {}
-            _ => {
-                eprintln!("{bin} が無いためスキップします。");
-                return false;
-            }
-        }
-    }
-    true
-}
-
+/// `label` に `"remap-subs-e2e-"` を付けて [`common::make_tmp_dir`] を呼ぶ薄い
+/// ラッパ（ディレクトリ名は元と同じ `tachikaze-remap-subs-e2e-<label>-<pid>`）。
 fn make_tmp_dir(label: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "tachikaze-remap-subs-e2e-{label}-{}",
-        std::process::id()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("一時ディレクトリを作れること");
-    dir
+    common::make_tmp_dir(&format!("remap-subs-e2e-{label}"))
 }
 
 // ---------------------------------------------------------------------
@@ -129,7 +108,7 @@ fn run_cut_with_segment_map(tmp_dir: &Path, cache_root: &Path) -> (PathBuf, Path
         .arg("-o")
         .arg(&out_path)
         .arg("--dtvi")
-        .arg(dtvi_path())
+        .arg(common::dtvi_path())
         .arg("--segment-map")
         .arg(&segmap_path)
         .output()
@@ -154,7 +133,7 @@ fn remap_subs_ass_matches_real_segment_map_including_tail_segment() {
     if common::skip_if_fixture_missing() {
         return;
     }
-    if !tools_available() {
+    if !common::tools_available() {
         return;
     }
 
@@ -347,7 +326,7 @@ fn remap_subs_srt_matches_ass_result_for_same_events() {
     if common::skip_if_fixture_missing() {
         return;
     }
-    if !tools_available() {
+    if !common::tools_available() {
         return;
     }
 
@@ -460,7 +439,7 @@ fn remap_subs_resolves_from_cache_and_explicit_args_take_priority() {
     if common::skip_if_fixture_missing() {
         return;
     }
-    if !tools_available() {
+    if !common::tools_available() {
         return;
     }
 
@@ -488,7 +467,7 @@ fn remap_subs_resolves_from_cache_and_explicit_args_take_priority() {
         .arg("-o")
         .arg(&out_path)
         .arg("--dtvi")
-        .arg(dtvi_path())
+        .arg(common::dtvi_path())
         .output()
         .expect("tachikaze cut の起動に失敗した");
     assert!(cut_output.status.success());
@@ -555,7 +534,7 @@ fn remap_subs_resolves_from_cache_and_explicit_args_take_priority() {
         .arg("-o")
         .arg(tmp_dir.join("out2.mp4"))
         .arg("--dtvi")
-        .arg(dtvi_path())
+        .arg(common::dtvi_path())
         .arg("--segment-map")
         .arg(&explicit_segmap)
         .output()
@@ -595,7 +574,7 @@ fn remap_subs_resolves_from_cache_and_explicit_args_take_priority() {
 /// フィクスチャ/ツールが無い環境でもテストの意図が読めるようにするプレースホルダ。
 #[test]
 fn remap_subs_e2e_module_compiles_and_helpers_are_reachable() {
-    let _ = tools_available;
+    let _ = common::tools_available;
     let _ = cs_floor;
     let _ = cs_ceil;
     let _ = ms_floor;

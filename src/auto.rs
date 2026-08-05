@@ -1,5 +1,5 @@
-//! `auto` サブコマンド: `prepare`(#58) → `analyze` → gate 判定(#61) →
-//! `cut`(区間マップ込み、#57) → `remap-subs`(#59) を対話なしで合成する（#62）。
+//! `auto` サブコマンド: `prepare` → `analyze` → gate 判定 → `cut`(区間マップ込み) →
+//! `remap-subs` を対話なしで合成する。
 //!
 //! `docs/architecture.md`「モジュール構成」の「`commands.rs` は各モジュールを繋ぐ
 //! 組み立て（アルゴリズムは持たない）」と同じ方針で書く。このモジュール自身も
@@ -17,9 +17,7 @@
 //!   自分で決める」という異なる制御フローを持つため（呼び出し方自体が違う）。
 //! - **cut**: `cut` の実体（`CutPipeline` の組み立て、`--cm-output` 時の自己検証8・
 //!   atomic rename、区間マップの書き出し）は `src/commands.rs` の `execute_cut` に
-//!   ある。ここを複製すると `cut` 単体のバグ修正が `auto` に伝播しなくなる
-//!   （これが、ロジックを複製していたシェルラッパー `scripts/tachikaze-cmcut` を
-//!   このエピックで削除した理由そのもの、CLAUDE.md「罠」参照）。そのため
+//!   ある。ここを複製すると `cut` 単体のバグ修正が `auto` に伝播しなくなるため、
 //!   `commands::execute_cut` を `pub(crate)` にしてそのまま呼ぶ（`commands.rs`
 //!   の doc comment参照）。
 //!
@@ -54,7 +52,7 @@
 //! 潰さないため）。判定は実処理（`prepare`/`analyze`/`cut`)を始める前に行うため、
 //! 800MB 級の重い処理を無駄に行わない。
 //!
-//! **例外: 字幕が必要なのに欠けている場合はスキップしない（レビュー指摘#2）。**
+//! **例外: 字幕が必要なのに欠けている場合はスキップしない。**
 //! `remap_subtitles` は `cut` が本編・CM側を最終パスへ rename した**後**に走る
 //! ため、字幕の張り替えに失敗すると本編/CM側だけが最終パスに残った状態で
 //! この入力全体が失敗扱いになる（字幕を黙って落とさないための意図的な仕様、
@@ -75,6 +73,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context};
 
+use crate::errctx::PathContext;
 use crate::{analyze, cli, commands, gate, mp4io, prepare, report, segmap, subtitle, workdir};
 
 /// `auto` サブコマンドの設定（`src/cli.rs::Commands::Auto` の CLI 引数と1対1）。
@@ -127,7 +126,7 @@ pub fn run(config: &AutoConfig, input: &Path) -> anyhow::Result<InputStatus> {
     // `--snap inward` は保持区間を退化させうるため `--cm-output` と併用できない
     // （`commands::execute_cut` にも同じ検査がある。ここで早期に弾くのは
     // `prepare`/`analyze` という重い処理より前に設定ミスを検出するため。
-    // 理由は `execute_cut` 側の検証と同じ、issue #62「罠」8）。
+    // 理由は `execute_cut` 側の検証と同じ）。
     if config.cm_output.is_some() && config.snap == cli::Snap::Inward {
         bail!(
             "--cm-output と --snap inward は併用できません。inward スナップでは保持区間が \
@@ -181,7 +180,7 @@ fn process_one(
 
     // 「字幕が必要なのに字幕サイドカー出力が無い」場合は、他の出力(本編/CM側)が
     // 揃っていてもスキップしない（本モジュール冒頭 doc comment「既存出力のスキップと
-    // -f/--force」の例外、レビュー指摘#2）。前回 remap-subs が失敗して本編/CM側だけ
+    // -f/--force」の例外）。前回 remap-subs が失敗して本編/CM側だけ
     // 残った状態を、次回再実行で自動的に再試行できるようにするため。
     let subs_missing_but_expected =
         !config.no_subtitles && subs_existing.is_empty() && input_has_subtitle_track(input);
@@ -204,8 +203,8 @@ fn process_one(
         return Ok(InputStatus::Skipped);
     }
 
-    // 1. prepare（elst 除去・字幕抽出。#58）。`auto` は外部字幕（--subs 相当）を
-    // 受け付けない（issue #62 の CLI 一覧に無い）ため常に `None`。
+    // 1. prepare（elst 除去・字幕抽出）。`auto` は外部字幕（--subs 相当）を
+    // 受け付けない（`auto` の CLI 一覧に無い）ため常に `None`。
     eprintln!("[auto] prepare: {}", input.display());
     let prepare_outcome = prepare::run(input, config.cache_dir.as_deref(), None)
         .with_context(|| format!("prepare に失敗しました: {}", input.display()))?;
@@ -226,13 +225,8 @@ fn process_one(
     // 同じキャッシュディレクトリを返す。冪等）、ここで一度作っても競合しない。
     // `commands::resolve_dtvi_path` はキャッシュの既定パスしか見ないため、
     // ここで確定させたパスを cut にも明示的に渡す。
-    let work_probe =
-        workdir::WorkDir::new(config.cache_dir.as_deref(), &media_path).with_context(|| {
-            format!(
-                "作業ディレクトリの解決に失敗しました: {}",
-                media_path.display()
-            )
-        })?;
+    let work_probe = workdir::WorkDir::new(config.cache_dir.as_deref(), &media_path)
+        .path_ctx("作業ディレクトリの解決", &media_path)?;
     let dtvi_path = work_probe.dtvi_path();
 
     // 2. analyze（キャッシュを短絡せず必ず呼ぶ。本モジュール冒頭の doc comment参照）。
@@ -253,7 +247,7 @@ fn process_one(
     let trim_path = analyze_output.cache_trim_path.clone();
     eprintln!("trim.avs を書き出しました: {}", trim_path.display());
 
-    // 3. gate 判定（#61）。`analyze --report` と同じ情報を表示する
+    // 3. gate 判定。`analyze --report` と同じ情報を表示する
     // （gate.rs の doc comment「auto を使わない人間も同じ情報を見られるよう」）。
     let fps = commands::fps_from_dtvi(&analyze_output.dtvi);
     let missed =
@@ -316,7 +310,7 @@ fn process_one(
         }
     }
 
-    // 4. cut（区間マップ込み、#57）。`commands::execute_cut` をそのまま呼ぶ
+    // 4. cut（区間マップ込み）。`commands::execute_cut` をそのまま呼ぶ
     // （本モジュール冒頭の doc comment「cut のロジックを複製しない」）。
     eprintln!(
         "[auto] cut: {} -> {}",
@@ -347,8 +341,8 @@ fn process_one(
         commands::print_cut_report("CM 出力完了", "CM区間数", cm, cm_report);
     }
 
-    // 5. remap-subs（#59）。字幕の張り替えは既定でハードエラーにする
-    // （issue #62「やること」7: 本編だけ出して字幕を黙って落とさない）。
+    // 5. remap-subs。字幕の張り替えは既定でハードエラーにする
+    // （本編だけ出して字幕を黙って落とさない）。
     // `--no-subtitles` のときは抽出済みの字幕サイドカーがあっても張り替えない。
     if config.no_subtitles {
         eprintln!("[auto] --no-subtitles のため字幕の張り替えは行いません。");
@@ -361,8 +355,8 @@ fn process_one(
         ) {
             // 本編/CM側は既に最終パスへ rename 済み（失敗しても削除しない、
             // モジュール冒頭 doc comment参照）。この入力は従来どおり失敗扱いに
-            // するが（issue #62「やること」7: 本編だけ出して字幕を黙って落とさない）、
-            // 次回実行時に何が起きるかを明示する（レビュー指摘#2）。
+            // するが（本編だけ出して字幕を黙って落とさない）、
+            // 次回実行時に何が起きるかを明示する。
             eprintln!(
                 "[auto] 警告: 本編{}の出力は完了していますが、字幕の張り替えに失敗しました。\
                  字幕サイドカーが未作成のため、次回（-f/--force なしでも）\
@@ -370,8 +364,7 @@ fn process_one(
                 if cm_out_path.is_some() { "/CM側" } else { "" },
                 input.display()
             );
-            return Err(err)
-                .with_context(|| format!("字幕の張り替えに失敗しました: {}", input.display()));
+            return Err(err).path_ctx("字幕の張り替え", input);
         }
     } else {
         eprintln!("[auto] 字幕トラックが無いため remap-subs は行いません。");
@@ -426,12 +419,8 @@ fn remap_subtitles(
             subs_input.display()
         )
     })?;
-    let subs_content = fs::read_to_string(subs_input).with_context(|| {
-        format!(
-            "字幕サイドカーの読み込みに失敗しました: {}",
-            subs_input.display()
-        )
-    })?;
+    let subs_content =
+        fs::read_to_string(subs_input).path_ctx("字幕サイドカーの読み込み", subs_input)?;
 
     let remap_output = match format {
         subtitle::SubsFormat::Ass => subtitle::remap_ass(
@@ -448,8 +437,7 @@ fn remap_subtitles(
     .map_err(|err| anyhow!("{err}"))?;
 
     let subs_out = subs_sidecar_path(out_path, format.extension());
-    fs::write(&subs_out, &remap_output.content)
-        .with_context(|| format!("字幕の書き出しに失敗しました: {}", subs_out.display()))?;
+    fs::write(&subs_out, &remap_output.content).path_ctx("字幕の書き出し", &subs_out)?;
 
     let stats = &remap_output.stats;
     eprintln!(
@@ -480,7 +468,7 @@ fn input_has_subtitle_track(input: &Path) -> bool {
 }
 
 /// 字幕サイドカーの出力先を、`out_path`（`-o`）と同じ stem・別拡張子で作る
-/// （issue #73「やること」5: プレイヤーが本編と同名の字幕を自動で読み込むため。
+/// （プレイヤーが本編と同名の字幕を自動で読み込むため。
 /// `commands::default_remap_subs_output_path` は入力の stem から `_CMcut` を
 /// 付けて導出するが、`auto` は `-o` の値そのものが最終的な本編出力なので、
 /// そちらに揃える）。
@@ -489,7 +477,7 @@ fn subs_sidecar_path(out_path: &Path, extension: &str) -> PathBuf {
 }
 
 /// 完了時に、何がどこに残るか（ディスク使用量）をログへ出す
-/// （issue #62「罠」: 800MB級 × 保持側 + CM側 + prepare済み中間物）。
+/// （800MB級 × 保持側 + CM側 + prepare済み中間物）。
 ///
 /// サイズ取得に失敗しても処理は続ける（ログ用の補助情報のため、失敗を
 /// エラーにする必要が無い）。

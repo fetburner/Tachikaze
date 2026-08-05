@@ -139,7 +139,7 @@ impl DisplayDecodeMap {
     /// `sync_decode_indices` を表示順に変換するだけで表示順のリストが得られる
     /// （念のため昇順ソートしてから返す）。
     ///
-    /// `plan`（#29）がキーフレーム境界スナップを表示順で行うために使う。
+    /// `plan` がキーフレーム境界スナップを表示順で行うために使う。
     pub fn sync_display_indices(&self) -> Vec<DisplayIdx> {
         let mut indices: Vec<DisplayIdx> = self
             .sync_decode_indices
@@ -202,7 +202,7 @@ mod tests {
     use crate::mp4io::read::{find_video_track, read_moov, samples};
 
     /// フィクスチャ: H.264 (Avc1) + Opus, GOP 120, 30000/1001fps, クローズド GOP の mp4。
-    /// `tests/fixtures/gen.sh`（issue #15）で生成する。無ければスキップする。
+    /// `tests/fixtures/gen.sh` で生成する。無ければスキップする。
     // cwd 非依存にする（`external::tests` がプロセスの cwd を一時的に変えるため）。
     const FIXTURE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/sample.mp4");
 

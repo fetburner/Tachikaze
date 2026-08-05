@@ -27,7 +27,9 @@ pub mod auto;
 pub mod cli;
 pub mod commands;
 pub mod dtvi;
+pub(crate) mod errctx;
 pub mod external;
+pub mod ffprobe;
 pub mod gate;
 pub mod jls;
 pub mod mp4io;
@@ -46,7 +48,7 @@ pub mod workdir;
 mod tests {
     use mp4_atom::{Encode, Ftyp};
 
-    /// 依存クレート `mp4-atom` が実際に使えることの確認（#11 の完了条件）。
+    /// 依存クレート `mp4-atom` が実際に使えることの確認。
     #[test]
     fn ftyp_encodes() -> std::result::Result<(), Box<dyn std::error::Error>> {
         let ftyp = Ftyp {

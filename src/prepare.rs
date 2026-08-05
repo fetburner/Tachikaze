@@ -2,13 +2,10 @@
 //!
 //! `cut` は elst 付き入力と字幕トラック付き入力を明示エラーで拒否する
 //! (`mp4io::support::check_no_edit_list` / `check_track_counts`、#41 の調査結果。
-//! この方針は変えない)。回避策の前処理はこれまで `scripts/tachikaze-cmcut` の
-//! `prepare_input`(bash + python3)にあったが、字幕は抽出されずに `-map` 省略の
-//! 既定選択で1本引き継がれ、結局 `check_track_counts` に弾かれていた。`auto`
-//! (#62、実装済み、`src/auto.rs`)とラッパーが別々に前処理を持つと elst の扱いと
+//! この方針は変えない)。`auto`(`src/auto.rs`)と前処理を別々に持つと elst の扱いと
 //! 字幕の抽出元が必ずずれるため、同じコードをここ1か所に置く。
 //!
-//! # 複数トラックの扱い(レビュー指摘: 黙って1本目だけを残さない)
+//! # 複数トラックの扱い(黙って1本目だけを残さない)
 //!
 //! `run()` が実際に ffmpeg へ渡すコマンドは `-map 0:v:0 -map 0:a:0` 固定であり、
 //! 映像2本以上・音声2本以上の入力(二重音声放送など)でも黙って1本目だけを
@@ -101,12 +98,14 @@
 //! しており、この場合 mp4 内蔵の字幕トラックの抽出(ffmpeg呼び出し)は行わない
 //! (ただし elst 除去や、mp4 内蔵字幕トラック自体の除去は引き続き行う)。
 
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use mp4_atom::{Codec, Moov};
 
+use crate::errctx::PathContext;
 use crate::mp4io::read::is_audio_codec;
 use crate::{external, tools, workdir};
 
@@ -267,14 +266,6 @@ pub struct PrepareOutcome {
     pub had_edit_list: bool,
 }
 
-/// パスを `&str` として取り出す。UTF-8 でないパスは非対応として扱う
-/// (`analyze.rs` の同名関数と同じ役割。モジュールごとに小さく持つ方針は
-/// `analyze.rs` に合わせている)。
-fn require_utf8(path: &Path) -> Result<&str> {
-    path.to_str()
-        .ok_or_else(|| anyhow::anyhow!("パスが UTF-8 として扱えません: {}", path.display()))
-}
-
 /// `prepare` 本体。
 ///
 /// - `input`: 入力 mp4。
@@ -291,8 +282,7 @@ pub fn run(
     cache_dir: Option<&Path>,
     external_subs: Option<&Path>,
 ) -> Result<PrepareOutcome> {
-    let moov = crate::mp4io::read::read_moov(input)
-        .with_context(|| format!("入力 mp4 の読み込みに失敗しました: {}", input.display()))?;
+    let moov = crate::mp4io::read::read_moov(input).path_ctx("入力 mp4 の読み込み", input)?;
 
     // 映像/音声が2本以上ある入力は、ffmpeg を呼ぶかどうかに関わらずここで明示エラーに
     // する(モジュール doc comment「複数トラックの扱い」参照)。needs_strip が false
@@ -338,20 +328,15 @@ pub fn run(
         )
     })?;
 
-    let prepared_path = workdir::prepared_input_path(cache_dir, input)
-        .with_context(|| format!("キャッシュパスの解決に失敗しました: {}", input.display()))?;
+    let prepared_path =
+        workdir::prepared_input_path(cache_dir, input).path_ctx("キャッシュパスの解決", input)?;
     // 入力ごとのキャッシュディレクトリ（`--cache-dir` の値そのものではなく、
     // その配下の `<入力ハッシュ>-<stem>/`）。ffmpeg の作業ディレクトリとして使う。
     let ffmpeg_cwd = prepared_path
         .parent()
         .ok_or_else(|| anyhow::anyhow!("キャッシュパスに親ディレクトリがありません"))?
         .to_path_buf();
-    fs::create_dir_all(&ffmpeg_cwd).with_context(|| {
-        format!(
-            "キャッシュディレクトリの作成に失敗しました: {}",
-            ffmpeg_cwd.display()
-        )
-    })?;
+    fs::create_dir_all(&ffmpeg_cwd).path_ctx("キャッシュディレクトリの作成", &ffmpeg_cwd)?;
 
     if inspection.has_edit_list {
         eprintln!(
@@ -367,33 +352,33 @@ pub fn run(
     // 絶対化しないと踏む罠。`workdir::cache_root` の `--cache-dir` 絶対化と同種の
     // 問題で、実機で `cwd` を `ffmpeg_cwd` に変えた状態で相対 `input` を渡すと
     // 再現した）。
-    let absolute_input = fs::canonicalize(input).with_context(|| {
-        format!(
-            "入力ファイルの絶対パス解決に失敗しました: {}",
-            input.display()
-        )
-    })?;
+    let absolute_input = fs::canonicalize(input).path_ctx("入力ファイルの絶対パス解決", input)?;
 
-    let mut args: Vec<String> = vec![
-        "-hide_banner".into(),
-        "-loglevel".into(),
-        "error".into(),
-        "-y".into(),
-        "-i".into(),
-        require_utf8(&absolute_input)?.into(),
-        "-map".into(),
-        "0:v:0".into(),
-        "-map".into(),
-        "0:a:0".into(),
-        "-c".into(),
-        "copy".into(),
-        "-use_editlist".into(),
-        "0".into(),
-        "-movflags".into(),
-        "+faststart".into(),
-        require_utf8(&prepared_path)?.into(),
+    let mut args: Vec<OsString> = vec![
+        OsString::from("-hide_banner"),
+        OsString::from("-loglevel"),
+        OsString::from("error"),
+        OsString::from("-y"),
+        OsString::from("-i"),
+        absolute_input.into_os_string(),
+        OsString::from("-map"),
+        OsString::from("0:v:0"),
+        OsString::from("-map"),
+        OsString::from("0:a:0"),
+        OsString::from("-c"),
+        OsString::from("copy"),
+        OsString::from("-use_editlist"),
+        OsString::from("0"),
+        OsString::from("-movflags"),
+        OsString::from("+faststart"),
+        prepared_path.clone().into_os_string(),
     ];
 
+    // 字幕パスの決定はこの match 式1箇所に集約する。`(Some(format), None)`
+    // アームも他のアームと同じく、そのアームの結果そのものを返す(呼び出し元で
+    // `subtitle_path.or(extracted_subtitle)` のように2つの値を合成しない)。
+    // 決定が2箇所に分かれていると、将来どちらのアームも値を持つよう変更した際に
+    // 片方が黙って捨てられる恐れがあるため。
     let subtitle_path = match (inspection.subtitle, external_subs) {
         (Some(format), Some(external)) => {
             eprintln!(
@@ -405,24 +390,19 @@ pub fn run(
             Some(external.to_path_buf())
         }
         (Some(format), None) => {
-            let subs_out =
-                workdir::subs_path(cache_dir, input, format.extension()).with_context(|| {
-                    format!(
-                        "字幕サイドカーのキャッシュパスの解決に失敗しました: {}",
-                        input.display()
-                    )
-                })?;
+            let subs_out = workdir::subs_path(cache_dir, input, format.extension())
+                .path_ctx("字幕サイドカーのキャッシュパスの解決", input)?;
             eprintln!(
                 "[prepare] 字幕トラック({})を検出しました。抽出します: {}",
                 format.label(),
                 subs_out.display()
             );
             args.extend([
-                "-map".into(),
-                "0:s:0".into(),
-                "-c:s".into(),
-                format.ffmpeg_encoder().into(),
-                require_utf8(&subs_out)?.into(),
+                OsString::from("-map"),
+                OsString::from("0:s:0"),
+                OsString::from("-c:s"),
+                OsString::from(format.ffmpeg_encoder()),
+                subs_out.clone().into_os_string(),
             ]);
             Some(subs_out)
         }
@@ -436,8 +416,8 @@ pub fn run(
         (None, None) => None,
     };
 
-    let args_ref: Vec<&str> = args.iter().map(String::as_str).collect();
-    external::run(require_utf8(&ffmpeg_path)?, &args_ref, &ffmpeg_cwd)?;
+    let args_ref: Vec<&OsStr> = args.iter().map(AsRef::as_ref).collect();
+    external::run(&ffmpeg_path, &args_ref, &ffmpeg_cwd)?;
 
     eprintln!(
         "[prepare] 前処理済みファイルはキャッシュに残ります(自動削除しません): {}",
@@ -512,7 +492,7 @@ mod tests {
         assert_eq!(inspection.subtitle_track_count, 0);
     }
 
-    // --- レビュー指摘#1: 複数トラックを黙って1本目だけ残さない ---
+    // --- 複数トラックを黙って1本目だけ残さない ---
 
     #[test]
     fn reject_multiple_video_or_audio_tracks_accepts_single_video_and_audio() {
