@@ -133,3 +133,35 @@ fn ffmpeg_failure_is_reported_instead_of_frame_count_mismatch() {
         "フレーム数不一致の文言に隠れてはいけない: message={message}"
     );
 }
+
+/// `on_frame` コールバックが1フレーム目でエラーを返して読み取りを中断した場合、
+/// そのエラーメッセージがそのまま返ることを確認する（ffmpeg はまだ生きている
+/// ので `kill()` されるが、`kill` によるシグナル終了エラーで `on_frame` 本来の
+/// エラーが隠れてはいけない。レビューで見つかった回帰の防止）。
+#[test]
+#[ignore = "tests/fixtures/sample.mp4 と ffmpeg が必要。tests/fixtures/gen.sh を先に実行すること"]
+fn callback_error_is_not_masked_by_kill() {
+    if common::skip_if_fixture_missing() || common::skip_if_missing("ffmpeg") {
+        return;
+    }
+    let ffmpeg = tools::resolve_tool(tools::FFMPEG).expect("ffmpeg を解決できること");
+    let cwd = common::make_tmp_dir("logo-frames-callback-error");
+    let rect = sample_rect();
+
+    let err = stream_luma_frames(
+        &ffmpeg,
+        &common::fixture_path(),
+        &cwd,
+        rect,
+        VIDEO_SIZE,
+        EXPECTED_FRAME_COUNT,
+        |_frame| anyhow::bail!("on_frame からの特有のエラー文言"),
+    )
+    .expect_err("on_frame のエラーが伝播するはず");
+
+    let message = err.to_string();
+    assert!(
+        message.contains("on_frame からの特有のエラー文言"),
+        "on_frame 本来のエラーが出るはず（kill 由来のエラーに隠れていないはず）: message={message}"
+    );
+}

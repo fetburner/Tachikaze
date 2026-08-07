@@ -136,7 +136,9 @@ pub struct VideoSize {
 ///
 /// `ffmpeg` が見つからない・異常終了した場合は `external::spawn_streaming` /
 /// `StreamingChild::wait` の流儀（コマンドラインと stderr の末尾を含むエラー）
-/// に従う。
+/// に従う。`on_frame` がエラーを返した場合はそのエラーがそのまま返る
+/// （`ffmpeg` はまだ動いている可能性があるため内部で `kill()` するが、
+/// `kill` によるシグナル終了エラーで `on_frame` 本来のエラーを隠さない）。
 pub fn stream_luma_frames(
     ffmpeg: &Path,
     input: &Path,
@@ -182,20 +184,51 @@ pub fn stream_luma_frames(
         on_frame,
     );
 
-    // `read_frames` がフレーム数不一致・端数バイトで失敗するのは、いずれも
-    // reader が EOF に達した後（ffmpeg は既に終了している）。しかし `on_frame`
-    // コールバックがエラーを返して読み取りを中断した場合は EOF 前で、ffmpeg が
-    // まだ書き込み中の可能性がある。そのまま `wait()` するとパイプが詰まって
-    // デッドロックしうるため、読み取りの成否にかかわらず必ず先に `kill()` する
-    // （既に終了しているプロセスへの `kill` は無害）。
-    child.kill();
+    match read_result {
+        // `read_frames` がフレーム数不一致・端数バイトで失敗するのは、いずれも
+        // reader が EOF に達した後（ffmpeg は既に終了しているはず）。`wait()` は
+        // ブロックしないので安全に呼べる。ffmpeg 自体も異常終了していた場合は、
+        // フレーム数不一致等より根本原因に近いのでそちらを優先する（そうしないと
+        // 「壊れた入力で ffmpeg が落ちた」が常に「座標系がずれている」という
+        // 無関係な誤誘導メッセージに隠れる）。
+        Err(ReadFramesError::Protocol(protocol_err)) => match child.wait() {
+            Err(wait_err) => Err(wait_err),
+            Ok(()) => Err(protocol_err),
+        },
+        // `on_frame` コールバックがエラーを返して読み取りを中断した場合は EOF 前
+        // で、ffmpeg がまだ書き込み中の可能性がある。そのまま `wait()` すると
+        // パイプが詰まってデッドロックしうるため、先に `kill()` してから `wait()`
+        // は結果を捨てて reap だけする（`kill` によるシグナル終了エラーが
+        // `on_frame` 本来のエラーを隠してしまうため、`wait()` の結果は使わない）。
+        Err(ReadFramesError::Callback(callback_err)) => {
+            child.kill();
+            let _ = child.wait();
+            Err(callback_err)
+        }
+        Ok(frame_count) => {
+            child.wait()?;
+            Ok(frame_count)
+        }
+    }
+}
 
-    match child.wait() {
-        // ffmpeg 自体が異常終了していた場合は、フレーム数不一致等より根本原因に
-        // 近いのでそちらを優先する（そうしないと「壊れた入力で ffmpeg が落ちた」が
-        // 常に「座標系がずれている」という無関係な誤誘導メッセージに隠れる）。
-        Err(wait_err) => Err(wait_err),
-        Ok(()) => read_result,
+/// [`read_frames`] の失敗要因。`stream_luma_frames` が `wait()` の呼び方を
+/// 分けるために区別する（詳細は呼び出し側の doc comment参照）。
+#[derive(Debug)]
+enum ReadFramesError {
+    /// フレーム数不一致・端数バイト。reader は既に EOF に達している
+    /// （ffmpeg は既に終了しているはずなので `wait()` は安全）。
+    Protocol(anyhow::Error),
+    /// `on_frame` コールバックが返したエラー。EOF 前で中断したため、ffmpeg が
+    /// まだ動いている可能性がある（`wait()` の前に `kill()` が必要）。
+    Callback(anyhow::Error),
+}
+
+impl std::fmt::Display for ReadFramesError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ReadFramesError::Protocol(e) | ReadFramesError::Callback(e) => write!(f, "{e}"),
+        }
     }
 }
 
@@ -212,31 +245,31 @@ fn read_frames<R: Read>(
     frame_bytes: usize,
     expected_frame_count: u64,
     mut on_frame: impl FnMut(&[u8]) -> anyhow::Result<()>,
-) -> anyhow::Result<u64> {
+) -> Result<u64, ReadFramesError> {
     let mut buf = vec![0u8; frame_bytes];
     let mut frame_count: u64 = 0;
     loop {
-        let n = fill_or_eof(&mut reader, &mut buf)?;
+        let n = fill_or_eof(&mut reader, &mut buf).map_err(ReadFramesError::Protocol)?;
         if n == 0 {
             break;
         }
         if n != frame_bytes {
-            bail!(
+            return Err(ReadFramesError::Protocol(anyhow::anyhow!(
                 "ffmpeg の出力が1フレーム分のバイト数({frame_bytes}バイト)の倍数になって\
                  いません: フレーム{frame_count}個目の途中、実際は{n}バイトで終わっています。\
                  ロゴ矩形の座標や crop フィルタの指定を確認してください。"
-            );
+            )));
         }
         frame_count += 1;
-        on_frame(&buf)?;
+        on_frame(&buf).map_err(ReadFramesError::Callback)?;
     }
     if frame_count != expected_frame_count {
-        bail!(
+        return Err(ReadFramesError::Protocol(anyhow::anyhow!(
             "ffmpeg から読み取ったフレーム数({frame_count})が .dtvi の frame_count\
              ({expected_frame_count})と一致しません。この不一致を無視して後続の\
              ロゴ検出に進むと、ロゴ区間だけがフレーム数ぶんずれた Trim が出て、\
              CM の位置が黙ってずれます（join_logo_scp はこのずれをエラーにしません）。"
-        );
+        )));
     }
     Ok(frame_count)
 }
