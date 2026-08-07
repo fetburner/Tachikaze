@@ -27,4 +27,4 @@ Cargo 依存（`cargo metadata` で確認した tachikaze 自身を除く全 51 
 - 著作権表示: Copyright (c) 2017-2019 Nekopanda
 - ライセンス全文: <http://opensource.org/licenses/mit-license.php>（原典のファイルヘッダに記載のリンク）
 
-MIT ライセンスの義務は著作権表示とライセンス文の保持だけなので、上記と各ファイル冒頭の doc comment（同じ表示）で足りる。`src/logo/score.rs` 内の `approxim_line()` / `GetAB()` / `med_average()`（MakKi 氏の delogo 由来でライセンス不明）は参照していない。
+MIT ライセンスの義務は著作権表示とライセンス文の保持だけなので、上記と各ファイル冒頭の doc comment（同じ表示）で足りる。原典 `LogoScan.hpp` 内の `approxim_line()` / `GetAB()` / `med_average()`（MakKi 氏の delogo 由来でライセンス不明）は参照していない。

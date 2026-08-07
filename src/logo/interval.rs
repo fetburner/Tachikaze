@@ -66,6 +66,13 @@
 //! スコア列を使う。本ツールはロゴ1本の運用を前提にしており、複数ロゴからの
 //! 選択（`selectLogo` 相当）は呼び出し側の責務にする。この関数はすでに1本に
 //! 決まった `(corr0, corr1)` の列だけを受け取る。
+//!
+//! [`build_text`] 内の `s_end` の後方精緻化は、原典（`LogoScan.hpp`
+//! L1779-1781、`std::find_if(std::make_reverse_iterator(sEnd), frameResult.rend(), ...)`）
+//! が配列の先頭 (0) まで戻るのに対し、本実装は呼び出し元が渡す `it`
+//! （直前の区間の終端）までしか戻らない。意図的な逸脱で、原典側がこの下限を
+//! 超えて戻る入力では逆イテレータ範囲が反転して UB になる（本実装はその
+//! ケースで安全に `it` で止まる）。
 
 /// フレーム1個の判定値。**数値のまま扱わず列挙型にする**
 /// （原典は `int`（0/1/2）で、取り違えても例外が飛ばない）。
@@ -118,6 +125,10 @@ pub struct LogoIntervals {
 ///
 /// `scores` が空の場合は `text` が空文字列、`logo_frames` / `total_frames` が
 /// 0 の [`LogoIntervals`] を返す。
+///
+/// `fps` は有限の値を渡すこと。`f64::INFINITY` を渡すと `half_avg_frames` が
+/// `usize::MAX` に飽和し、直後の `* 2` で（debug build では）overflow panic
+/// する。
 pub fn write_result(scores: &[(f32, f32)], fps: f64) -> LogoIntervals {
     let n = scores.len();
     if n == 0 {
@@ -346,8 +357,12 @@ fn build_text(result: &[Judgement], score: &[f32]) -> String {
         let s_best = find_forward(s_start, s_end, |k| score[k] > 0.0);
         let e_best = find_backward_base(e_end, e_start, |k| score[k] > 0.0);
 
-        // 区間がある場合だけ出力する。
-        if s_end != e_end {
+        // 区間がある場合だけ出力する。開始位置の前方精緻化（直後の
+        // `find_forward(s_end, n, ...)`）が `e_end` を追い越すと `s_end >
+        // e_end` になり得る（原典ならここで逆イテレータ範囲が反転して UB）。
+        // `!=` ではなく`<` にして、この malformed なケース（範囲が反転した
+        // 行）だけを出力しない（S より前の E を join_logo_scp に渡さない）。
+        if s_end < e_end {
             let s_starti = s_start as i64;
             let s_besti = s_best as i64;
             let s_endi = s_end as i64;
@@ -398,21 +413,21 @@ mod tests {
 
         let result = write_result(&scores, 30.0);
 
+        // フレーム番号までそのまま固定する。issue の罠「1始まりにすると
+        // 全区間が1フレームずれ、しかもエラーは出ない」への直接の回帰テスト
+        // になる（0始まり・表示順で `0-999` / `1450-2449` にぴったり一致する
+        // はず）。
         assert_eq!(
-            count_markers(&result.text, "S"),
-            2,
-            "S行は2本のはず: {}",
-            result.text
-        );
-        assert_eq!(
-            count_markers(&result.text, "E"),
-            2,
-            "E行は2本のはず: {}",
-            result.text
+            result.text,
+            concat!(
+                "     0 S 0 ALL      0      0\n",
+                "   999 E 0 ALL    999    999\n",
+                "  1450 S 0 ALL   1450   1450\n",
+                "  2449 E 0 ALL   2449   2449\n",
+            )
         );
         assert_eq!(result.total_frames, 2450);
-        // 判定がロゴありになったフレームがある（穴が空いていない程度の粗い確認）。
-        assert!(result.logo_frames > 0);
+        assert_eq!(result.logo_frames, 1994);
     }
 
     #[test]
@@ -484,5 +499,83 @@ mod tests {
                 total_frames: 0,
             }
         );
+    }
+
+    /// テスト用の決定的な擬似乱数生成器（xorshift64*）。標準の乱数クレートを
+    /// 追加せずに再現可能なノイズ入力を作るためだけに使う。
+    struct Xorshift64(u64);
+
+    impl Xorshift64 {
+        fn next_f32(&mut self) -> f32 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            // [0, 1) の範囲に落とす。
+            (self.0 >> 11) as f32 / (1u64 << 53) as f32
+        }
+    }
+
+    /// 出力1行 (`"<best> S 0 ALL <左> <右>"` / `"<best> E 0 ALL <左> <右>"`) を
+    /// `(best, 左, 右)` にパースする。
+    fn parse_line(line: &str) -> (i64, i64, i64) {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        // fields = [best, "S"/"E", "0", "ALL", 左, 右]
+        let best = fields[0].parse().unwrap();
+        let left = fields[4].parse().unwrap();
+        let right = fields[5].parse().unwrap();
+        (best, left, right)
+    }
+
+    /// 実バグの回帰テスト: 開始位置の前方精緻化（`build_text` 内、
+    /// `find_forward(s_end, n, score >= THRESH)`）が `e_end` を追い越すと
+    /// `s_end > e_end` になることがある。修正前は `if s_end != e_end` を
+    /// 通ってしまい、
+    /// ```text
+    ///     79 S 0 ALL     79     79
+    ///     78 E 0 ALL     78     69      <- 範囲左(78) > 範囲右(69)
+    /// ```
+    /// のような、E行の範囲が反転した壊れた出力を実際に吐いていた（fps=5・
+    /// ノイズの多いランダム入力で確認済み）。`if s_end < e_end` に直したので、
+    /// このケースは出力から除外される。fps=5・ノイズの多いランダム入力
+    /// 5000ケースについて、出力される全行が「範囲の左 <= 右」を満たし、
+    /// 各区間で S行がE行より前に来ることを確認する。
+    #[test]
+    fn build_text_never_emits_reversed_ranges() {
+        let mut rng = Xorshift64(0x2545_F491_4F6C_DD1D);
+        let n = 200;
+
+        for case in 0..5000u32 {
+            let raw: Vec<f32> = (0..n).map(|_| rng.next_f32() * 4.0 - 2.0).collect();
+            let scores = scores_from_raw(&raw);
+
+            let result = write_result(&scores, 5.0);
+
+            let lines: Vec<&str> = result.text.lines().collect();
+            assert_eq!(
+                lines.len() % 2,
+                0,
+                "case {case}: S行とE行が対になっていない: {}",
+                result.text
+            );
+            for pair in lines.chunks(2) {
+                let (s_line, e_line) = (pair[0], pair[1]);
+                assert!(
+                    s_line.split_whitespace().nth(1) == Some("S")
+                        && e_line.split_whitespace().nth(1) == Some("E"),
+                    "case {case}: S行・E行の順序がおかしい: {s_line} / {e_line}"
+                );
+                let (_, s_left, s_right) = parse_line(s_line);
+                let (_, e_left, e_right) = parse_line(e_line);
+                assert!(s_left <= s_right, "case {case}: S行の範囲が反転: {s_line}");
+                assert!(
+                    e_left <= e_right,
+                    "case {case}: E行の範囲が反転(実バグの再発): {e_line}"
+                );
+                assert!(
+                    s_right <= e_right,
+                    "case {case}: S行がE行より後: {s_line} / {e_line}"
+                );
+            }
+        }
     }
 }
