@@ -260,7 +260,7 @@ struct DecodeIdx(u32);    // デコード順（mp4 のサンプル番号 / .dtvi
 | 項目 | 理由 |
 |---|---|
 | CM 検出アルゴリズム | 既存ツール（chapter_exe → join_logo_scp）が担当 |
-| ロゴ検出 | delogo 済み mp4 では原理的に不可 |
+| ロゴ検出 | 現状は自前実装していない（[E14](https://github.com/fetburner/Tachikaze/issues/89) で実装中）。旧記述「delogo 済み mp4 では原理的に不可」は実測していない仮定だった。実際には局によって残っている（[measurements.md](measurements.md)「ロゴの残存」） |
 | 映像の再エンコード | 数秒の CM 残りを許容する方針 |
 | 音声の再エンコード | 継ぎ目のノイズは残存 CM の範囲内 |
 | `auto` の複数入力・ディレクトリ一括処理（glob 展開） | 1プロセス1入力にすると exit code の意味が一意になる（#70）。繰り返しはシェル（`for` / `xargs -n1`）の仕事 |

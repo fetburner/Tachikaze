@@ -41,7 +41,7 @@ Amatsukaze は MPEG2-TS を入力して CM カットとエンコードを行い 
 | 項目 | 理由 |
 |---|---|
 | CM 検出アルゴリズム | chapter_exe + join_logo_scp が担当 |
-| ロゴ検出 | delogo 済み mp4 では原理的に使えない |
+| ロゴ検出 | 現状は自前実装していない（[E14](https://github.com/fetburner/Tachikaze/issues/89) で実装中）。旧記述「delogo 済み mp4 では原理的に使えない」は実測していない仮定だった。実際には局によって残っている（[measurements.md](measurements.md)「ロゴの残存」） |
 | 映像の再エンコード | 数秒の CM 残りを許容する方針のため不要 |
 | 音声の再エンコード | 継ぎ目のノイズは残存 CM の範囲に収まるため無視可 |
 | チャプター生成 | dtvindex に実装済み（`create_join_logo_scp_chapters`） |
