@@ -110,6 +110,22 @@ tachikaze auto IN.mp4 -o OUT.mp4 [--cm-output CM.mp4] [--ignore-gate]
        があっても毎回実行する（キャッシュキーが入力の
        絶対パスのハッシュだけで、内容の変化を検出できないため。`src/auto.rs`
        の doc comment参照）
+
+tachikaze make-logo IN.mp4 --rect x,y,w,h -o OUT.lgd [--threshold N]
+   20. ロゴ検出に使う `.lgd`（Amatsukaze 形式ロゴデータ）を、入力 mp4 とロゴ矩形
+       だけから作る（`.dtvi` も外部3ツールも使わない、E14-6、#95）。ロゴ位置は
+       CLI の `--rect`（`x,y,w,h`、2の倍数に丸める）で手動指定する。位置を自動
+       探索しないのは、ロゴの形・色は局や番組ごとに異なり、対象素材だけから
+       汎用的に検出する既存手段（Amatsukaze 側にも自動探索は無い）が無いため
+   21. 矩形の外周1ピクセルが単色（最小値・最大値の差が `--threshold`、既定12、
+       以下）のフレームだけを学習に使い、画素ごとに最小二乗で回帰係数 `a`/`b` を
+       求める（`src/logo/scan.rs`）。入力全体を既定で走らせる（CM区間だけを
+       指定すると「ロゴが無い」ロゴデータができてしまうため）
+   22. 有効フレーム数（何フレーム中いくつ使ったか）を必ず stderr に出す。0件、
+       4件未満（`MIN_USABLE_FRAMES`。少数点では回帰係数がNaN/infにならずに
+       黙って有限値になりうるため、件数そのものを別に検査する）、または係数が
+       NaN/inf/`a==0` になった場合は失敗させる（壊れたロゴデータを黙って
+       書き出さない）
 ```
 
 ### exit code
@@ -201,6 +217,7 @@ tachikaze auto IN.mp4 -o OUT.mp4 [--cm-output CM.mp4] [--ignore-gate]
 | `logo/lgd.rs` | Amatsukaze 形式ロゴデータ `.lgd`（AviUtl 互換のベース部 + Amatsukaze 独自の float 部）の読み込み | [E14](https://github.com/fetburner/Tachikaze/issues/89) |
 | `logo/frames.rs` | ffmpeg を子プロセスとして起動し、ロゴ矩形の輝度平面をフレーム順にストリームで読む。読み取ったフレーム数と `.dtvi` の `frame_count` の一致検査 | [E14](https://github.com/fetburner/Tachikaze/issues/89) |
 | `logo/score.rs` | ロゴマスク生成と相関スコア（`corr0`/`corr1`）。Amatsukaze `LogoScan.hpp` の相関方式を移植 | [E14](https://github.com/fetburner/Tachikaze/issues/89) |
+| `logo/scan.rs` | `make-logo` 本体: 外周1ピクセルが単色のフレームだけを使い、画素ごとに最小二乗で `.lgd` の係数 `a`/`b` を求める。`.lgd` の書き出し（ベース部はゼロ埋め） | 上記「コマンド構成」手順20〜22、[E14](https://github.com/fetburner/Tachikaze/issues/89) |
 | `logo/interval.rs` | `corr0`/`corr1` の列からロゴ表示区間を判定し logoframe 形式で出力。Amatsukaze `LogoScan.hpp` の `LogoFrame::writeResult` を移植 | [E14](https://github.com/fetburner/Tachikaze/issues/89) |
 
 **解析側（analyze）は mp4 の読み込みに依存しない。** `--report` が必要とするキーフレーム位置を `.dtvi` から取る設計にしてあるため。**この性質を崩さないこと**（キーフレーム位置を mp4 から取る実装に変えると解析とカットが結合する）。

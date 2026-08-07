@@ -9,16 +9,19 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context};
-use mp4_atom::{Codec, Moov};
+use mp4_atom::{Codec, Moov, Trak};
 
-use crate::cli::{AnalyzeArgs, AutoArgs, Cli, Commands, CutArgs, PrepareArgs, RemapSubsArgs};
+use crate::cli::{
+    AnalyzeArgs, AutoArgs, Cli, Commands, CutArgs, MakeLogoArgs, PrepareArgs, RemapSubsArgs,
+};
 use crate::dtvi::Dtvi;
 use crate::errctx::PathContext;
+use crate::logo::frames::VideoSize;
 use crate::mp4io::read::SampleInfo;
 use crate::order::{DecodeIdx, DisplayIdx, OrderMap};
 use crate::{
-    analyze, audio, auto, cli, dtvi, gate, mp4io, plan, prepare, report, segmap, subtitle, tools,
-    trim, verify, workdir,
+    analyze, audio, auto, cli, dtvi, gate, logo, mp4io, plan, prepare, report, segmap, subtitle,
+    tools, trim, verify, workdir,
 };
 
 /// `main.rs` が終了コードを決めるための、サブコマンド実行結果。
@@ -48,6 +51,9 @@ pub fn run(cli: Cli) -> anyhow::Result<ExitOutcome> {
         Commands::Prepare(args) => run_prepare(cache_dir, args).map(|()| ExitOutcome::Success),
         Commands::RemapSubs(args) => run_remap_subs(cache_dir, args).map(|()| ExitOutcome::Success),
         Commands::Auto(args) => run_auto(cache_dir, args),
+        // make-logo はキャッシュを持たない(入力 mp4 と ffmpeg だけで完結させる方針、
+        // issue #95「解くべき問題」)ため、`--cache-dir` は受け取っても使わない。
+        Commands::MakeLogo(args) => run_make_logo(args).map(|()| ExitOutcome::Success),
     }
 }
 
@@ -112,6 +118,81 @@ fn run_prepare(cache_dir: Option<PathBuf>, args: PrepareArgs) -> anyhow::Result<
     }
 
     Ok(())
+}
+
+/// `make-logo` サブコマンドの実行。処理本体は [`logo::scan::run`] に集約してあり
+/// （`commands.rs` はアルゴリズムを持たない方針、本ファイル冒頭の doc comment参照）、
+/// ここでは mp4 から映像サイズ・フレーム数を読み出す配線と、矩形の丸め・結果の
+/// 書き出し・表示だけを行う。
+///
+/// `.dtvi` は使わない（`analyze`/`cut` と異なり、外部3ツールに一切依存しない。
+/// issue #95「解くべき問題」参照）。
+fn run_make_logo(args: MakeLogoArgs) -> anyhow::Result<()> {
+    let MakeLogoArgs {
+        input,
+        rect,
+        output,
+        threshold,
+    } = args;
+
+    reject_dash_output(&output, "-o/--output")?;
+
+    let (rect, rounding_message) = logo::scan::round_rect_to_even(rect);
+    if let Some(message) = rounding_message {
+        eprintln!("[make-logo] {message}");
+    }
+
+    let moov = mp4io::read::read_moov(&input).path_ctx("入力 mp4 の読み込み", &input)?;
+    let (video_trak, _) = mp4io::read::find_video_track(&moov)
+        .ok_or_else(|| anyhow!("映像トラックが見つかりません"))?;
+    let video_size = video_size_from_trak(video_trak)?;
+    let frame_count = mp4io::read::samples(&video_trak.mdia.minf.stbl).len() as u64;
+
+    let ffmpeg = tools::resolve_tool(tools::FFMPEG)?;
+    let cwd = std::env::current_dir().context("カレントディレクトリの取得に失敗しました")?;
+
+    let config = logo::scan::MakeLogoConfig {
+        ffmpeg,
+        input: input.clone(),
+        cwd,
+        rect,
+        video_size,
+        frame_count,
+        threshold,
+        name: logo_name_from_input(&input),
+        service_id: logo::scan::UNSPECIFIED_SERVICE_ID,
+    };
+
+    let result = logo::scan::run(&config)?;
+    logo::scan::write_lgd(&result.logo, &output)?;
+
+    eprintln!("[make-logo] 完了: {}", output.display());
+    Ok(())
+}
+
+/// `moov` の映像トラックから映像サイズを取り出す。`find_video_track` は `stsd` の
+/// 先頭コーデックが `Avc1` であることを既に確認しているため、ここでの `Avc1` 以外の
+/// 分岐は理論上到達しない（対象素材は映像 H.264 前提、CLAUDE.md「前提」）が、
+/// パニックにはせず明示エラーにする。
+fn video_size_from_trak(trak: &Trak) -> anyhow::Result<VideoSize> {
+    match trak.mdia.minf.stbl.stsd.codecs.first() {
+        Some(Codec::Avc1(avc1)) => Ok(VideoSize {
+            width: avc1.visual.width as u32,
+            height: avc1.visual.height as u32,
+        }),
+        _ => bail!("映像トラックの Avc1 サンプルエントリが見つかりません"),
+    }
+}
+
+/// ロゴデータの `name` フィールドの既定値。入力ファイル名（拡張子を除く）を使う
+/// （番組名を反映しやすく、複数の入力から作ったロゴデータを見分けやすいため）。
+/// ファイル名から stem を取れない場合は固定の既定文字列にする。
+fn logo_name_from_input(input: &Path) -> String {
+    input
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("tachikaze-make-logo")
+        .to_string()
 }
 
 /// `remap-subs` サブコマンドの実行。区間マップ・字幕サイドカーを解決し、
