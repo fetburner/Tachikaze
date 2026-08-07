@@ -52,8 +52,7 @@ pub fn run(cli: Cli) -> anyhow::Result<ExitOutcome> {
         Commands::RemapSubs(args) => run_remap_subs(cache_dir, args).map(|()| ExitOutcome::Success),
         Commands::Auto(args) => run_auto(cache_dir, args),
         // make-logo はキャッシュを持たない(入力 mp4 と ffmpeg だけで完結させる方針、
-        // src/logo/scan.rs の doc comment「解くべき問題」)ため、`--cache-dir` は
-        // 受け取っても使わない。
+        // issue #95「解くべき問題」)ため、`--cache-dir` は受け取っても使わない。
         Commands::MakeLogo(args) => run_make_logo(args).map(|()| ExitOutcome::Success),
     }
 }
@@ -127,7 +126,7 @@ fn run_prepare(cache_dir: Option<PathBuf>, args: PrepareArgs) -> anyhow::Result<
 /// 書き出し・表示だけを行う。
 ///
 /// `.dtvi` は使わない（`analyze`/`cut` と異なり、外部3ツールに一切依存しない。
-/// `src/logo/scan.rs` の doc comment「解くべき問題」参照）。
+/// issue #95「解くべき問題」参照）。
 fn run_make_logo(args: MakeLogoArgs) -> anyhow::Result<()> {
     let MakeLogoArgs {
         input,

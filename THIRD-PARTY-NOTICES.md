@@ -24,3 +24,5 @@ Cargo 依存（`cargo metadata` で確認した tachikaze 自身を除く全 51 
 現時点では無い。
 
 将来 Amatsukaze（[nekopanda/Amatsukaze](https://github.com/nekopanda/Amatsukaze)、`LogoScan.hpp`、MIT、Copyright (c) 2017-2019 Nekopanda）からロゴ検出等のアルゴリズムを移植した場合、ここに著作権表示を追記する。MIT ライセンスの義務は著作権表示とライセンス文の保持だけなので、追記はここで足りる。
+
+`src/logo/scan.rs`（E14-6、issue #95）が実装するロゴ学習アルゴリズムのうち、Amatsukaze の `LogoScan::AddFrame` 系（`GetAB()` / `med_average()` / `approxim_line()` / `ToOutLGP()`）は MakKi 氏の delogo 由来でライセンス不明（配布物・GitHub のいずれにも LICENSE 表記が無い）。そのため**これらのコードは移植せず、issue #95 本文に書かれた数式（最小二乗の回帰直線、外周値の中央半分の平均）から自分で書き下ろした**（判断の詳細は `src/logo/scan.rs` のモジュール doc comment「重要: MakKi 氏 delogo 由来のコードは訳さない」節）。

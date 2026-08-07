@@ -238,11 +238,11 @@ pub enum Snap {
 pub struct MakeLogoArgs {
     pub input: PathBuf,
 
-    /// ロゴ矩形。`x,y,w,h`（カンマ区切り、映像の左上を原点とする表示ピクセル座標。
-    /// `--rect` そのままを ffmpeg の `crop` フィルタに渡す）。クロマの間引きに
-    /// 合わせて2の倍数に丸める（丸めた場合は stderr へ通知する。
-    /// `src/logo/scan.rs::round_rect_to_even`）。矩形の外周1ピクセルが単色になる
-    /// フレームだけを学習に使うため、ロゴそのものより少し広めに取ると学習しやすい。
+    /// ロゴ矩形。`x,y,w,h`（カンマ区切り、映像の左上を原点とする表示ピクセル座標）。
+    /// クロマの間引きに合わせて2の倍数に丸めた後、ffmpeg の `crop` フィルタに渡す
+    /// （丸めた場合は stderr へ通知する。`src/logo/scan.rs::round_rect_to_even`）。
+    /// 矩形の外周1ピクセルが単色になるフレームだけを学習に使うため、ロゴそのものより
+    /// 少し広めに取ると学習しやすい。
     #[arg(long, value_parser = parse_logo_rect)]
     pub rect: LogoRect,
 

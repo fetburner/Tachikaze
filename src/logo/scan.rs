@@ -24,7 +24,9 @@
 //!    溜め、最小二乗で回帰直線を引いて係数を得る。回帰は観測値→背景の向きと
 //!    背景→観測値の向きの両方で行い、平均する（傾き `(A1 + 1/A2) / 2`、切片
 //!    `(B1 - B2/A2) / 2`。[`FrameLearner::finish`]）。
-//! 4. 係数が NaN / inf / `a == 0` になったら失敗させる（[`ScanError::InvalidCoefficient`]）。
+//! 4. 有効フレーム数が[`MIN_USABLE_FRAMES`]未満、または係数が NaN / inf / `a == 0`
+//!    になったら失敗させる（[`ScanError::TooFewUsableFrames`] /
+//!    [`ScanError::InvalidCoefficient`]）。
 //!
 //! `.lgd`（[`lgd::LogoData`]）の `aY`/`bY` は「`background = a * observed + b * maxv`」
 //! という関係にある（`lgd.rs` の doc comment参照。`maxv` は 8bit なら 255）。上の
@@ -73,6 +75,18 @@ pub const UNSPECIFIED_SERVICE_ID: i32 = -1;
 /// 「学習アルゴリズム」節参照）における `maxv`。`stream_luma_frames` は常に
 /// `-pix_fmt gray`（8bit）で読むため固定値でよい。
 const MAXV: f64 = 255.0;
+
+/// 学習に使う有効フレーム数の下限（issue #95「やること 3」: 「0件や極端に少ない
+/// 場合は失敗させる」）。
+///
+/// 画素ごとの回帰は観測値(X)側と背景(Y)側それぞれの分散（`denom_x`/`denom_y`）で
+/// 割るため、2〜3点程度でも分散が偶然0にならなければ有限値が出てしまい、
+/// [`ScanError::InvalidCoefficient`] の NaN/inf 検査では捕まらない
+/// （実際に有効3フレームで `.lgd` が黙って書き出される事例を確認済み）。
+/// 4点あれば1次式1本を引いた後に自由度が2残る（他の統計処理と同様、経験的な
+/// 「小標本すぎる」の目安として最小限の値を採る。これより小さくすべき理由がある
+/// と分かれば値を見直す）。
+const MIN_USABLE_FRAMES: u64 = 4;
 
 /// クロマの間引き（4:2:0 前提、log2）。CLAUDE.md「前提」の「映像は H.264」を
 /// 前提にした値で、対象素材（地上波録画）は 8bit 4:2:0 を想定している。矩形は
@@ -162,13 +176,11 @@ fn estimate_frame_background(frame: &[u8], border: &[usize], threshold: u8) -> O
     values.sort_unstable();
     let len = values.len();
     let quarter = len / 4;
-    let (start, end) = if quarter < len - quarter {
-        (quarter, len - quarter)
-    } else {
-        // 極端に短い外周（`w`/`h` が非常に小さい場合）では中央半分の範囲が空になり
-        // うるため、その場合は全体の平均にフォールバックする。
-        (0, len)
-    };
+    // `len >= 1`（上の `values.is_empty()` チェック済み）なら `quarter < len - quarter`
+    // は常に真（`quarter = len/4` は切り捨てなので、`len - quarter` は必ずそれより
+    // 大きい）。中央半分の範囲が空になることは無い。
+    debug_assert!(quarter < len - quarter);
+    let (start, end) = (quarter, len - quarter);
     let mid = &values[start..end];
     let sum: u64 = mid.iter().map(|&v| v as u64).sum();
     Some(sum as f64 / mid.len() as f64)
@@ -179,6 +191,11 @@ fn estimate_frame_background(frame: &[u8], border: &[usize], threshold: u8) -> O
 pub enum ScanError {
     /// 単色判定を通ったフレームが0件だった。
     NoUsableFrames { total_frames: u64 },
+    /// 単色判定を通ったフレームが [`MIN_USABLE_FRAMES`] 未満だった（0件より多いが
+    /// 「極端に少ない」場合、issue #95「やること 3」）。回帰係数の NaN/inf 検査
+    /// （[`ScanError::InvalidCoefficient`]）は少数点でも分散が0にならなければ
+    /// 素通りするため、件数そのものを別に検査する。
+    TooFewUsableFrames { used_frames: u64, total_frames: u64 },
     /// 画素ごとの回帰係数が NaN / inf / `a == 0` になった（モジュール doc comment
     /// 「学習アルゴリズム」手順4）。原典が `"Insufficient logo frames"` で失敗させて
     /// いるのと同じ状況（フレームが足りない、または背景の明るさがほとんど変化して
@@ -200,6 +217,16 @@ impl std::fmt::Display for ScanError {
                  ロゴ周りが単色になっているフレームが見つからないと学習できません \
                  （矩形の位置や --threshold を見直してください）。"
             ),
+            ScanError::TooFewUsableFrames {
+                used_frames,
+                total_frames,
+            } => write!(
+                f,
+                "単色判定を通った有効フレームが{used_frames}件しかありません（全{total_frames}\
+                 フレーム中、下限は{MIN_USABLE_FRAMES}件）。件数が極端に少ないと、回帰係数が\
+                 偶然有限値になり不正な検出に気づけないため、壊れたロゴデータを書き出さずに\
+                 失敗させています（矩形の位置や --threshold を見直してください）。"
+            ),
             ScanError::InvalidCoefficient {
                 pixel_index,
                 used_frames,
@@ -208,9 +235,9 @@ impl std::fmt::Display for ScanError {
             } => write!(
                 f,
                 "画素{pixel_index}個目の回帰係数が不正です（a={a}, b={b}）。有効フレーム\
-                 {used_frames}件では学習できません（フレームが足りない、または背景の明るさが\
-                 ほとんど変化していない可能性があります）。壊れたロゴデータを書き出さずに\
-                 失敗させています。"
+                 {used_frames}件では学習できません（フレームが足りない、または画素の観測値が\
+                 全フレームで同一で分散が0になっている（完全不透明な画素・一様な背景など）\
+                 可能性があります）。壊れたロゴデータを書き出さずに失敗させています。"
             ),
         }
     }
@@ -299,6 +326,12 @@ impl FrameLearner {
     pub fn finish(&self) -> Result<(Vec<f32>, Vec<f32>), ScanError> {
         if self.used_frames == 0 {
             return Err(ScanError::NoUsableFrames {
+                total_frames: self.total_frames,
+            });
+        }
+        if self.used_frames < MIN_USABLE_FRAMES {
+            return Err(ScanError::TooFewUsableFrames {
+                used_frames: self.used_frames,
                 total_frames: self.total_frames,
             });
         }
@@ -669,6 +702,36 @@ mod tests {
             .finish()
             .expect_err("有効フレームが0件なのでエラーになるはず");
         assert_eq!(err, ScanError::NoUsableFrames { total_frames: 5 });
+    }
+
+    #[test]
+    fn too_few_usable_frames_is_an_error_even_with_finite_coefficients() {
+        // 有効フレームが極端に少ない（ただし0件ではない）場合。issue #95
+        // 「やること 3」（有効フレームが0件や極端に少ない場合は失敗させる）の
+        // 「極端に少ない」側を検査する。背景を変化させているため回帰係数自体は
+        // 有限値になり得るが、MIN_USABLE_FRAMES 未満なので
+        // InvalidCoefficient（NaN/inf 検査）では捕まらないことを確認する。
+        let (w, h) = (6, 4);
+        let backgrounds = [60.0, 120.0, 180.0];
+        assert!((backgrounds.len() as u64) < MIN_USABLE_FRAMES);
+
+        let mut learner = FrameLearner::new(w as u32, h as u32, DEFAULT_THRESHOLD);
+        for &bg in &backgrounds {
+            let frame = synth_frame(w, h, bg, 1.5, 0.02);
+            learner.add_frame(&frame).expect("add_frame は常に成功する");
+        }
+
+        assert_eq!(learner.used_frames(), backgrounds.len() as u64);
+        let err = learner
+            .finish()
+            .expect_err("有効フレームが下限未満なのでエラーになるはず");
+        assert_eq!(
+            err,
+            ScanError::TooFewUsableFrames {
+                used_frames: backgrounds.len() as u64,
+                total_frames: backgrounds.len() as u64,
+            }
+        );
     }
 
     #[test]
