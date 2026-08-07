@@ -201,6 +201,7 @@ tachikaze auto IN.mp4 -o OUT.mp4 [--cm-output CM.mp4] [--ignore-gate]
 | `logo/lgd.rs` | Amatsukaze 形式ロゴデータ `.lgd`（AviUtl 互換のベース部 + Amatsukaze 独自の float 部）の読み込み | [E14](https://github.com/fetburner/Tachikaze/issues/89) |
 | `logo/frames.rs` | ffmpeg を子プロセスとして起動し、ロゴ矩形の輝度平面をフレーム順にストリームで読む。読み取ったフレーム数と `.dtvi` の `frame_count` の一致検査 | [E14](https://github.com/fetburner/Tachikaze/issues/89) |
 | `logo/score.rs` | ロゴマスク生成と相関スコア（`corr0`/`corr1`）。Amatsukaze `LogoScan.hpp` の相関方式を移植 | [E14](https://github.com/fetburner/Tachikaze/issues/89) |
+| `logo/interval.rs` | `corr0`/`corr1` の列からロゴ表示区間を判定し logoframe 形式で出力。Amatsukaze `LogoScan.hpp` の `LogoFrame::writeResult` を移植 | [E14](https://github.com/fetburner/Tachikaze/issues/89) |
 
 **解析側（analyze）は mp4 の読み込みに依存しない。** `--report` が必要とするキーフレーム位置を `.dtvi` から取る設計にしてあるため。**この性質を崩さないこと**（キーフレーム位置を mp4 から取る実装に変えると解析とカットが結合する）。
 
