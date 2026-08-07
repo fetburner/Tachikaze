@@ -21,6 +21,10 @@ Cargo 依存（`cargo metadata` で確認した tachikaze 自身を除く全 51 
 
 ## 移植したコード
 
-現時点では無い。
+`src/logo/score.rs`（ロゴ相関スコア `corr0`/`corr1` の計算）は、Amatsukaze（[nekopanda/Amatsukaze](https://github.com/nekopanda/Amatsukaze)）`LogoScan.hpp` の相関方式を移植したもの。
 
-将来 Amatsukaze（[nekopanda/Amatsukaze](https://github.com/nekopanda/Amatsukaze)、`LogoScan.hpp`、MIT、Copyright (c) 2017-2019 Nekopanda）からロゴ検出等のアルゴリズムを移植した場合、ここに著作権表示を追記する。MIT ライセンスの義務は著作権表示とライセンス文の保持だけなので、追記はここで足りる。
+- ライセンス: MIT
+- 著作権表示: Copyright (c) 2017-2019 Nekopanda
+- ライセンス全文: <http://opensource.org/licenses/mit-license.php>（原典のファイルヘッダに記載のリンク）
+
+MIT ライセンスの義務は著作権表示とライセンス文の保持だけなので、上記と `src/logo/score.rs` 冒頭の doc comment（同じ表示）で足りる。同ファイル内の `approxim_line()` / `GetAB()` / `med_average()`（MakKi 氏の delogo 由来でライセンス不明）は参照していない。
