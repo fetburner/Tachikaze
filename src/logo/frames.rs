@@ -21,14 +21,18 @@
 //! ## フレームの重複・欠落を防ぐオプション（`-fps_mode passthrough`）
 //!
 //! ffmpeg は既定で、出力側のタイムスタンプをフレームレートに合わせて丸める際に
-//! フレームを複製・欠落させることがある。これを止めるオプションが必要かどうかは
-//! 実際に検証するまでもなく明らかで、`-fps_mode passthrough`（`-vsync 0` と同義、
-//! ffmpeg のフレーム同期方式のうち唯一「入力フレームをそのまま来た順に出力し、
-//! 複製も欠落もしない」もの）を指定しないと、rawvideo 出力のフレーム数が入力と
-//! 一致する保証がない。`-fps_mode` は `-vsync`（非推奨）の後継で、本プロジェクトが
-//! 前提とする ffmpeg（docs/toolchain-macos.md、homebrew 版）はこの環境で実測した
-//! ffmpeg 8.1.2 を含め対応しているため、非推奨の `-vsync 0` ではなく
-//! `-fps_mode passthrough` を使う。
+//! フレームを複製・欠落させることがある。**実測**（ffmpeg 8.1.2 / macOS arm64、
+//! `tests/fixtures/sample.mp4`、599フレーム、64x64 crop）: `-fps_mode passthrough`
+//! を付けないと出力が 2,461,696 バイト（= 601 フレーム分）になり、付けると
+//! 2,453,504 バイト（= 599 フレーム分、入力と一致）になる。**付けないと実際に
+//! フレームが増える。** `-fps_mode passthrough`（`-vsync 0` と同義、ffmpeg の
+//! フレーム同期方式のうち唯一「入力フレームをそのまま来た順に出力し、複製も
+//! 欠落もしない」もの）を指定する。`-fps_mode` は `-vsync`（非推奨）の後継で、
+//! 本プロジェクトが前提とする ffmpeg（docs/toolchain-macos.md、homebrew 版）は
+//! この環境で実測した ffmpeg 8.1.2 を含め対応しているため、非推奨の `-vsync 0`
+//! ではなく `-fps_mode passthrough` を使う。付けなかった場合の 601 という数は
+//! `.dtvi` の 599 と食い違うため、下記のフレーム数一致検査にも引っかかる
+//! （オプションと検査は二重の防御になっている）。
 //!
 //! **`-fps_mode passthrough` を付けてもフレーム数の検査だけでは捕まらないバグが
 //! ありうる**（CLAUDE.md 罠3の一般形）: 万一このオプションが効かない・外部要因で
@@ -171,14 +175,28 @@ pub fn stream_luma_frames(
     ];
 
     let mut child = external::spawn_streaming(ffmpeg, &args, cwd)?;
-    let frame_count = read_frames(
+    let read_result = read_frames(
         child.stdout(),
         rect.frame_bytes(),
         expected_frame_count,
         on_frame,
-    )?;
-    child.wait()?;
-    Ok(frame_count)
+    );
+
+    // `read_frames` がフレーム数不一致・端数バイトで失敗するのは、いずれも
+    // reader が EOF に達した後（ffmpeg は既に終了している）。しかし `on_frame`
+    // コールバックがエラーを返して読み取りを中断した場合は EOF 前で、ffmpeg が
+    // まだ書き込み中の可能性がある。そのまま `wait()` するとパイプが詰まって
+    // デッドロックしうるため、読み取りの成否にかかわらず必ず先に `kill()` する
+    // （既に終了しているプロセスへの `kill` は無害）。
+    child.kill();
+
+    match child.wait() {
+        // ffmpeg 自体が異常終了していた場合は、フレーム数不一致等より根本原因に
+        // 近いのでそちらを優先する（そうしないと「壊れた入力で ffmpeg が落ちた」が
+        // 常に「座標系がずれている」という無関係な誤誘導メッセージに隠れる）。
+        Err(wait_err) => Err(wait_err),
+        Ok(()) => read_result,
+    }
 }
 
 /// `reader` から輝度フレームを `frame_bytes` バイトずつ読み、フレームごとに
@@ -349,6 +367,24 @@ mod tests {
         assert!(message.contains("CM"), "message={message}");
         assert!(message.contains('3'), "message={message}");
         assert!(message.contains('4'), "message={message}");
+    }
+
+    #[test]
+    fn actual_frame_count_exceeding_expected_is_an_error() {
+        // frame_bytes=4 の4フレーム(16バイト)に対し、期待値を3と偽る。
+        let data: Vec<u8> = (0..16).collect();
+        let mut called = 0;
+        let err = read_frames(Cursor::new(data), 4, 3, |_| {
+            called += 1;
+            Ok(())
+        })
+        .expect_err("期待値(3)と実際(4)が食い違うのでエラーになるはず");
+        // 実際が期待を上回る方向でも、超過分を含めて on_frame は呼ばれてから
+        // エラーになる（読み取り自体は最後まで進む。副作用が先に出る）。
+        assert_eq!(called, 4, "4フレームぶんon_frameが呼ばれるはず");
+        let message = err.to_string();
+        assert!(message.contains('4'), "message={message}");
+        assert!(message.contains('3'), "message={message}");
     }
 
     #[test]
