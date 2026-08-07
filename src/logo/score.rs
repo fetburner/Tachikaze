@@ -317,6 +317,10 @@ impl LogoMask {
     /// `dst = a * src + b * maxv`）の相関を [`LogoMask::black_score`] で正規化
     /// したもの。ロゴが実際にあれば `corr0` が 1 付近・`corr1` が 0 付近、
     /// 無いのに評価すると `corr0` が 0 付近・`corr1` が負に振れる。
+    ///
+    /// # Panics
+    ///
+    /// `src.len()` がロゴの `w * h` と一致しない場合。
     pub fn evaluate(&self, src: &[u8]) -> (f32, f32) {
         assert_eq!(
             src.len(),
@@ -436,9 +440,57 @@ mod tests {
             .collect()
     }
 
+    /// テスト用の合成ロゴ: 単色（α=0.5・ロゴ輝度 255 の十字。[`cross_logo`] と違い
+    /// 縦棒・横棒が同じ色）。単色ロゴでは `1/a` と `-255b/a` の分布が比例するため、
+    /// カーネルをどの明るさの画像から作っても定数倍（符号違い）にしかならず、
+    /// レビュー指摘1（カーネルの取り違え）は原理的に再現しない（issue #93 の
+    /// 完了条件「corr0 が 1 付近」「明るさを変えても同程度」を字面どおり検証する
+    /// 用途に限る。カーネルの取り違えを検出する役目は [`cross_logo`] が担う）。
+    fn solid_cross_logo(w: usize, h: usize) -> LogoData {
+        let mut a = vec![1.0f32; w * h];
+        let mut b = vec![0.0f32; w * h];
+        let cx = w / 2;
+        let cy = h / 2;
+        let (a_logo, b_logo) = alpha_ab(0.5, 255.0);
+        for y in 0..h {
+            for x in 0..w {
+                let on_cross = x == cx || x + 1 == cx || y == cy || y + 1 == cy;
+                if on_cross {
+                    a[y * w + x] = a_logo;
+                    b[y * w + x] = b_logo;
+                }
+            }
+        }
+        LogoData {
+            w: w as i32,
+            h: h as i32,
+            log_uv_x: 1,
+            log_uv_y: 1,
+            imgw: w as i32,
+            imgh: h as i32,
+            imgx: 0,
+            imgy: 0,
+            name: String::new(),
+            service_id: 0,
+            a_y: a,
+            b_y: b,
+            a_u: Vec::new(),
+            b_u: Vec::new(),
+            a_v: Vec::new(),
+            b_v: Vec::new(),
+        }
+    }
+
     /// テストで使うロゴのサイズ。レビューが実測に使った 32x32 に揃えている
     /// （このサイズ・このロゴ設計での実測値が下記各テストのしきい値の根拠）。
     const TEST_SIZE: usize = 32;
+
+    #[test]
+    fn too_small_logo_is_an_error_not_a_panic() {
+        let logo = cross_logo(4, 4);
+        let err = LogoMask::new(&logo).expect_err("4x4 は5x5窓を置けないのでエラーになるはず");
+        assert_eq!(err, LogoMaskError::TooSmall { w: 4, h: 4 });
+    }
 
     #[test]
     fn kernel_elements_sum_to_zero() {
@@ -505,6 +557,28 @@ mod tests {
             "明るさ別正規化により corr0 の差は小さいはず（暴走していない）\
              （dark={corr0_dark}, bright={corr0_bright}）"
         );
+    }
+
+    /// issue #93 の完了条件「背景の明るさを変えても corr0 が同程度（明るさ別
+    /// 正規化が効いていることの確認）」を、字面どおりの厳しい閾値で検証する
+    /// （単色ロゴでは `corr0` が理論上どの明るさでも厳密に 1.0 になる）。
+    #[test]
+    fn corr0_is_near_one_across_background_brightness_for_solid_logo() {
+        let logo = solid_cross_logo(TEST_SIZE, TEST_SIZE);
+        let mask = LogoMask::new(&logo).unwrap();
+
+        for &level in &[24.0f32, 64.0, 128.0, 200.0] {
+            let frame = to_u8(&synthesize(&logo.a_y, &logo.b_y, level));
+            let (corr0, corr1) = mask.evaluate(&frame);
+            assert!(
+                (corr0 - 1.0).abs() < 0.01,
+                "level={level}: corr0 は 1 付近のはず（実際 {corr0}）"
+            );
+            assert!(
+                corr1.abs() < 0.05,
+                "level={level}: |corr1| は小さいはず（実際 {corr1}）"
+            );
+        }
     }
 
     #[test]
