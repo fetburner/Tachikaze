@@ -28,3 +28,5 @@ Cargo 依存（`cargo metadata` で確認した tachikaze 自身を除く全 51 
 - ライセンス全文: <http://opensource.org/licenses/mit-license.php>（原典のファイルヘッダに記載のリンク）
 
 MIT ライセンスの義務は著作権表示とライセンス文の保持だけなので、上記と `src/logo/score.rs` 冒頭の doc comment（同じ表示）で足りる。同ファイル内の `approxim_line()` / `GetAB()` / `med_average()`（MakKi 氏の delogo 由来でライセンス不明）は参照していない。
+
+`src/logo/scan.rs`（E14-6、issue #95）が実装するロゴ学習アルゴリズムのうち、Amatsukaze の `LogoScan::AddFrame` 系（`GetAB()` / `med_average()` / `approxim_line()` / `ToOutLGP()`）も同じ理由（MakKi 氏の delogo 由来でライセンス不明。配布物・GitHub のいずれにも LICENSE 表記が無い）で参照していない。**これらのコードは移植せず、issue #95 本文に書かれた数式（最小二乗の回帰直線、外周値の中央半分の平均）から自分で書き下ろした**（判断の詳細は `src/logo/scan.rs` のモジュール doc comment「重要: MakKi 氏 delogo 由来のコードは訳さない」節）。
