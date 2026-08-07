@@ -32,6 +32,7 @@ pub mod external;
 pub mod ffprobe;
 pub mod gate;
 pub mod jls;
+pub mod logo;
 pub mod mp4io;
 pub mod order;
 pub mod plan;
