@@ -2,6 +2,9 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
+use crate::logo::frames::LogoRect;
+use crate::logo::scan;
+
 #[derive(Debug, Parser)]
 #[command(name = "tachikaze", version)]
 pub struct Cli {
@@ -55,6 +58,13 @@ pub enum Commands {
         \n    for f in *.mp4; do case \"$f\" in *_CMcut.mp4) continue;; esac; tachikaze auto \"$f\" -o \"${f%.mp4}_CMcut.mp4\"; done\n"
     )]
     Auto(AutoArgs),
+    /// mp4 とロゴ矩形から `.lgd`（Amatsukaze 形式ロゴデータ）を作る最小実装。
+    ///
+    /// ロゴ検出には対象の mp4 と同じ解像度で作ったロゴデータが要るが、作る手段が
+    /// 従来は Windows の AviUtl / Amatsukaze GUI しか無かった（E14-6、#95）。入力
+    /// 全体（既定で全フレーム）を走らせて学習する。CM 区間だけを指定すると
+    /// 「ロゴが無い」ロゴデータができてしまうため、区間を絞る引数は用意していない。
+    MakeLogo(MakeLogoArgs),
 }
 
 #[derive(Debug, Args)]
@@ -223,6 +233,50 @@ pub enum Snap {
     Inward,
 }
 
+/// `make-logo` サブコマンドの引数。
+#[derive(Debug, Args)]
+pub struct MakeLogoArgs {
+    pub input: PathBuf,
+
+    /// ロゴ矩形。`x,y,w,h`（カンマ区切り、映像の左上を原点とする表示ピクセル座標。
+    /// `--rect` そのままを ffmpeg の `crop` フィルタに渡す）。クロマの間引きに
+    /// 合わせて2の倍数に丸める（丸めた場合は stderr へ通知する。
+    /// `src/logo/scan.rs::round_rect_to_even`）。矩形の外周1ピクセルが単色になる
+    /// フレームだけを学習に使うため、ロゴそのものより少し広めに取ると学習しやすい。
+    #[arg(long, value_parser = parse_logo_rect)]
+    pub rect: LogoRect,
+
+    /// 出力先の `.lgd`。
+    #[arg(short, long)]
+    pub output: PathBuf,
+
+    /// 矩形の外周1ピクセルの最小値・最大値の差がこの値を超えるフレームは、
+    /// 単色背景ではない（ロゴの外側に映像が写っている）として学習から除外する。
+    #[arg(long, default_value_t = scan::DEFAULT_THRESHOLD)]
+    pub threshold: u8,
+}
+
+/// `--rect x,y,w,h` を [`LogoRect`] にパースする（clap の `value_parser`）。
+fn parse_logo_rect(s: &str) -> Result<LogoRect, String> {
+    let parts: Vec<&str> = s.split(',').collect();
+    let [x, y, w, h]: [&str; 4] = parts.as_slice().try_into().map_err(|_| {
+        format!("--rect は x,y,w,h の4値をカンマ区切りで指定してください（実際: \"{s}\"）")
+    })?;
+
+    let parse_one = |label: &str, v: &str| -> Result<u32, String> {
+        v.trim()
+            .parse::<u32>()
+            .map_err(|_| format!("--rect の{label}を非負整数として解釈できません: \"{v}\""))
+    };
+
+    Ok(LogoRect {
+        x: parse_one("x", x)?,
+        y: parse_one("y", y)?,
+        w: parse_one("w", w)?,
+        h: parse_one("h", h)?,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -243,5 +297,65 @@ mod tests {
             Commands::Cut(args) => assert_eq!(args.snap, Snap::Outward),
             _ => panic!("expected Cut command"),
         }
+    }
+
+    #[test]
+    fn make_logo_parses_rect_and_defaults_threshold() {
+        let cli = Cli::parse_from([
+            "tachikaze",
+            "make-logo",
+            "in.mp4",
+            "--rect",
+            "10,20,100,40",
+            "-o",
+            "out.lgd",
+        ]);
+
+        match cli.command {
+            Commands::MakeLogo(args) => {
+                assert_eq!(
+                    args.rect,
+                    LogoRect {
+                        x: 10,
+                        y: 20,
+                        w: 100,
+                        h: 40
+                    }
+                );
+                assert_eq!(args.threshold, scan::DEFAULT_THRESHOLD);
+                assert_eq!(args.output, PathBuf::from("out.lgd"));
+            }
+            _ => panic!("expected MakeLogo command"),
+        }
+    }
+
+    #[test]
+    fn make_logo_rejects_rect_with_wrong_number_of_fields() {
+        let err = Cli::try_parse_from([
+            "tachikaze",
+            "make-logo",
+            "in.mp4",
+            "--rect",
+            "10,20,100",
+            "-o",
+            "out.lgd",
+        ])
+        .expect_err("3値しかないので失敗するはず");
+        assert!(err.to_string().contains("--rect"));
+    }
+
+    #[test]
+    fn make_logo_rejects_non_numeric_rect_field() {
+        let err = Cli::try_parse_from([
+            "tachikaze",
+            "make-logo",
+            "in.mp4",
+            "--rect",
+            "10,20,abc,40",
+            "-o",
+            "out.lgd",
+        ])
+        .expect_err("数値でないので失敗するはず");
+        assert!(err.to_string().contains("abc"));
     }
 }
