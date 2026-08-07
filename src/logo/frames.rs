@@ -216,8 +216,11 @@ pub fn stream_luma_frames(
 /// 分けるために区別する（詳細は呼び出し側の doc comment参照）。
 #[derive(Debug)]
 enum ReadFramesError {
-    /// フレーム数不一致・端数バイト。reader は既に EOF に達している
-    /// （ffmpeg は既に終了しているはずなので `wait()` は安全）。
+    /// フレーム数不一致・端数バイト、または `fill_or_eof` 自体の I/O エラー。
+    /// 前2つは reader が既に EOF に達している（ffmpeg は既に終了しているはずなので
+    /// `wait()` は安全）。**I/O エラーの方は理論上 EOF 前にも起きうる**が、パイプの
+    /// 読み取りでは（`Interrupted` 以外は）通常起こらないため、ここでは区別せず
+    /// 同じ扱いにしている。
     Protocol(anyhow::Error),
     /// `on_frame` コールバックが返したエラー。EOF 前で中断したため、ffmpeg が
     /// まだ動いている可能性がある（`wait()` の前に `kill()` が必要）。
