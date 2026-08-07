@@ -6,11 +6,13 @@
 //! - [`score`][]: ロゴマスク生成と相関スコア（`corr0`/`corr1`）の計算。
 //! - [`scan`][]: `make-logo` サブコマンドの学習アルゴリズムと `.lgd` の書き出し
 //!   （E14-6）。
+//! - [`interval`][]: `(corr0, corr1)` の列からロゴ表示区間を判定し、
+//!   logoframe 形式のテキストを書く。
 //!
-//! 他形式（`.lgs` 等）や区間判定は別 issue でこのファイルに `pub mod` 行が
-//! 追加される。
+//! 他形式（`.lgs` 等）は別 issue でこのファイルに `pub mod` 行が追加される。
 
 pub mod frames;
+pub mod interval;
 pub mod lgd;
 pub mod scan;
 pub mod score;
