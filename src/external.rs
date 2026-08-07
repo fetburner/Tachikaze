@@ -1,15 +1,22 @@
-//! 外部プロセス（dtvindex / chapter_exe / join_logo_scp）を起動する共通基盤。
+//! 外部プロセス（dtvindex / chapter_exe / join_logo_scp / ffmpeg）を起動する共通基盤。
 //!
-//! いずれのツールも進捗を大量に stdout/stderr に出すため、素通しにせず
+//! [`run`] は、対象ツールが進捗を大量に stdout/stderr に出すため、素通しにせず
 //! `std::process::Command::output()` で溜め込んでから扱う。終了コードが
 //! 0 以外の場合は、再現に必要な情報（コマンドライン全体・作業ディレクトリ・
 //! stderr の末尾）を含めてエラーを返す。
+//!
+//! [`spawn_streaming`] は `run` とは別の用途（E14-5、ロゴ矩形の輝度平面を ffmpeg の
+//! rawvideo 出力から読む）のために追加した。stdout をまるごと溜め込む `run` とは
+//! 異なり、stdout を呼び出し側へ逐次渡す（大きな rawvideo 出力を全部メモリに
+//! 溜めないため）。終了コード・stderr の扱いは `run` と同じ流儀に揃える。
 
 use std::env;
 use std::ffi::OsStr;
 use std::fmt::Write as _;
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, ChildStdout, Command, Stdio};
+use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
 use anyhow::{bail, Context};
@@ -101,6 +108,112 @@ pub fn run(program: &Path, args: &[&OsStr], cwd: &Path) -> anyhow::Result<Extern
     }
 
     Ok(ExternalOutput { stdout, stderr })
+}
+
+/// [`spawn_streaming`] が返す、起動済みだが完了は待っていない外部プロセス。
+///
+/// stdout は呼び出し側が [`Self::stdout`] で受け取って好きなだけ読み進める。
+/// 読み終えたら必ず [`Self::wait`] を呼び、終了コードを確認すること
+/// （呼ばないと子プロセスが reap されず残る）。
+pub struct StreamingChild {
+    child: Child,
+    cmdline: String,
+    cwd: PathBuf,
+    stdout: ChildStdout,
+    /// 子プロセスの stderr を読み切るスレッド。呼び出し側が stdout を逐次読んでいる
+    /// 間、stderr パイプを溜めたままにするとデッドロックしうるため（下記
+    /// `spawn_streaming` の doc comment参照）、起動直後に読み切りを始めておく。
+    stderr_reader: JoinHandle<String>,
+}
+
+impl StreamingChild {
+    /// 子プロセスの標準出力へのハンドル。
+    pub fn stdout(&mut self) -> &mut ChildStdout {
+        &mut self.stdout
+    }
+
+    /// 子プロセスの終了を待つ。終了コードが 0 以外なら、`run` と同じ形式
+    /// （コマンドライン・cwd・終了コード・stderr の末尾20行）でエラーを返す。
+    pub fn wait(mut self) -> anyhow::Result<()> {
+        let status = self
+            .child
+            .wait()
+            .with_context(|| format!("外部プロセスの終了待ちに失敗しました: `{}`", self.cmdline))?;
+
+        let stderr = self.stderr_reader.join().unwrap_or_default();
+
+        if !status.success() {
+            let stderr_tail = tail_lines(&stderr, 20);
+            bail!(
+                "外部プロセスが失敗しました: `{}`\n  cwd: {}\n  終了コード: {}\n  stderr (末尾20行):\n{}",
+                self.cmdline,
+                self.cwd.display(),
+                status
+                    .code()
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "不明（シグナル終了）".to_string()),
+                stderr_tail,
+            );
+        }
+        Ok(())
+    }
+}
+
+/// 外部プロセスを1つ起動し、完了を待たずに返す（stdout を逐次読みたい呼び出し用）。
+///
+/// `run` との違いは stdout の扱いのみ。`program`/`args`/`cwd` の解釈（絶対パス化、
+/// PATH 解決）は `run` と同じ。
+///
+/// **デッドロック回避**: 呼び出し側が stdout を逐次読んでいる間、子プロセスの
+/// stderr パイプが OS のバッファ上限まで溜まると、子プロセスは stderr への書き込みで
+/// ブロックし、stdout の生成も止まる（呼び出し側は stdout を待ち続けているので
+/// 双方が止まる）。`run` はこれを `Command::output()` に任せている（内部で stdout/
+/// stderr を並行に読む）が、ここでは呼び出し側が stdout を手動で読むため、自分で
+/// 対策する必要がある。起動直後に専用スレッドを立てて stderr を最後まで読み切る
+/// ことで、パイプが詰まらないようにする。
+pub fn spawn_streaming(
+    program: &Path,
+    args: &[&OsStr],
+    cwd: &Path,
+) -> anyhow::Result<StreamingChild> {
+    let absolute_program = absolutize_program(program)?;
+    let absolute_cwd = absolutize_path(cwd).path_ctx("作業ディレクトリの絶対パス解決", cwd)?;
+    let cmdline = command_line(&absolute_program, args);
+
+    let mut child = Command::new(&absolute_program)
+        .args(args)
+        .current_dir(&absolute_cwd)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| {
+            format!(
+                "外部プロセスの起動に失敗しました: `{cmdline}` (cwd: {})",
+                absolute_cwd.display()
+            )
+        })?;
+
+    let stdout = child
+        .stdout
+        .take()
+        .expect("stdout は Stdio::piped() で設定済み");
+    let mut stderr = child
+        .stderr
+        .take()
+        .expect("stderr は Stdio::piped() で設定済み");
+    let stderr_reader = thread::spawn(move || {
+        let mut buf = String::new();
+        let _ = stderr.read_to_string(&mut buf);
+        buf
+    });
+
+    Ok(StreamingChild {
+        child,
+        cmdline,
+        cwd: absolute_cwd,
+        stdout,
+        stderr_reader,
+    })
 }
 
 /// 呼び出し元 cwd 基準で `path` を絶対パスにする。
