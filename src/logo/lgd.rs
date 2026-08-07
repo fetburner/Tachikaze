@@ -363,7 +363,7 @@ pub fn parse(bytes: &[u8]) -> Result<LogoData, LgdParseError> {
 pub fn read<P: AsRef<Path>>(path: P) -> anyhow::Result<LogoData> {
     let path = path.as_ref();
     let bytes = fs::read(path).path_ctx(".lgd の読み込み", path)?;
-    parse(&bytes).map_err(|err| anyhow::anyhow!(".lgd のパースに失敗しました: {err}"))
+    parse(&bytes).path_ctx(".lgd のパース", path)
 }
 
 #[cfg(test)]
@@ -646,6 +646,28 @@ mod tests {
         assert!(
             format!("{err:#}").contains(".lgd の読み込みに失敗しました"),
             "path_ctx の文言が付いているはず: {err:#}"
+        );
+    }
+
+    #[test]
+    fn read_reports_parse_failure_with_path_context() {
+        let path = std::env::temp_dir().join(format!(
+            "tachikaze-logo-lgd-parse-error-{}.lgd",
+            std::process::id()
+        ));
+        fs::write(&path, [0u8; BASE_FIXED_LEN - 1]).expect("一時ファイルを書けるはず");
+
+        let err = read(&path).unwrap_err();
+        let _ = fs::remove_file(&path);
+
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains(".lgd のパースに失敗しました"),
+            "path_ctx の文言が付いているはず: {rendered}"
+        );
+        assert!(
+            rendered.contains(&path.display().to_string()),
+            "パースエラーにもパスが含まれるはず: {rendered}"
         );
     }
 }
