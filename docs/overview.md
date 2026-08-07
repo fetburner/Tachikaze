@@ -71,6 +71,10 @@ Amatsukaze は MPEG2-TS を入力して CM カットとエンコードを行い 
 | [tobitti0/join_logo_scp](https://github.com/tobitti0/join_logo_scp) | CM 判定（Trim 生成） |
 | [tobitti0/dtvindex](https://github.com/tobitti0/dtvindex) | 共通フレーム番号の索引・Trim/jls パーサ・チャプター生成 |
 
+## ライセンス
+
+本体は MIT（[LICENSE](../LICENSE)）。外部ツール・移植コードの表記は [THIRD-PARTY-NOTICES.md](../THIRD-PARTY-NOTICES.md)。
+
 ## 記述の約束
 
 - **実測** とある数値は実ファイルで確認済み。
