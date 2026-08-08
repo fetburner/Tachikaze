@@ -7,13 +7,21 @@
 //! work.mp4 (入力への symlink)
 //!   ├─ dtvindex build work.mp4 -o work.mp4.dtvi
 //!   ├─ chapter_exe -v work.mp4 -o scp.txt
+//!   ├─ (--logo 指定時のみ) .lgd を読み、ffmpeg でロゴ矩形のフレームを流して
+//!   │      ロゴ表示区間を判定し、閾値以上なら logoframe.txt を書く（[`detect_logo`]）
 //!   └─ join_logo_scp -inscp scp.txt -incmd <JL command file> \
+//!          [-inlogo logoframe.txt] \
 //!          -o trim.avs -oscp detail.jls -set autocm_sub 11 -set param_cuttr 1
 //! ```
 //!
-//! `-inlogo` は付けない（`docs/jls-settings.md`）。対象は delogo 済みのため、
-//! ロゴ検出は原理的に使えない。省略すると join_logo_scp は全フレームをロゴ
-//! 表示中とみなす。
+//! `-inlogo` は既定では付けない。E14-2（`docs/measurements.md`「ロゴの残存」）で
+//! 判明したとおり、対象素材は delogo 済みでもロゴが実際には残っている場合がある
+//! ため、`--logo <path>`（`.lgd`、`make-logo` で作る）を指定したときだけ自前の
+//! ロゴ検出（`crate::logo`）を通す。検出フレーム割合が閾値未満、または
+//! logoframe の出力が空（[`inlogo_decision`] 参照）ならフォールバックして
+//! `-inlogo` を渡さない（[`detect_logo`] の doc comment参照、issue #97）。
+//! `--logo` を省略、またはフォールバックした場合は従来どおり付けず、join_logo_scp は
+//! 全フレームをロゴ表示中とみなす。
 
 use std::ffi::OsStr;
 use std::fs;
@@ -25,7 +33,10 @@ use crate::dtvi::{self, Dtvi};
 use crate::errctx::PathContext;
 use crate::external;
 use crate::jls::{self, JlsEntry};
-use crate::tools::{self, CHAPTER_EXE, DTVINDEX, JOIN_LOGO_SCP};
+use crate::logo::frames::{self, LogoRect, VideoSize};
+use crate::logo::lgd::{self, LogoData};
+use crate::logo::{interval as logo_interval, score};
+use crate::tools::{self, CHAPTER_EXE, DTVINDEX, FFMPEG, JOIN_LOGO_SCP};
 use crate::trim::TrimList;
 use crate::workdir::WorkDir;
 
@@ -36,6 +47,17 @@ use crate::workdir::WorkDir;
 /// - `param_cuttr=1`: 既定の `0` では番宣が `Trailer(cut-cancel)` として残る。
 ///   `1` にすると末尾 50 秒が除去される。
 const DEFAULT_JLS_SET: &[(&str, &str)] = &[("autocm_sub", "11"), ("param_cuttr", "1")];
+
+/// `--logo` 指定時のロゴ検出割合フォールバック閾値（Amatsukaze
+/// `CMAnalyze.hpp:301` と同じ規則）。検出フレーム割合がこの値未満なら
+/// `-inlogo` を渡さない（誤ったロゴ情報で判定を崩すより現状維持に倒す、
+/// issue #97「解くべき問題」）。
+const LOGO_DETECTION_THRESHOLD: f64 = 0.1;
+/// 映像長が [`LOGO_DETECTION_SHORT_VIDEO_SECONDS`] 以下の場合に使う、
+/// 緩めたフォールバック閾値（同じく `CMAnalyze.hpp:301` の規則）。
+const LOGO_DETECTION_THRESHOLD_SHORT: f64 = 0.03;
+/// 上記の緩い閾値を使う映像長の上限（7分、秒単位）。
+const LOGO_DETECTION_SHORT_VIDEO_SECONDS: f64 = 7.0 * 60.0;
 
 /// analyze コマンドの実行に必要な設定。
 #[derive(Debug, Clone)]
@@ -54,6 +76,9 @@ pub struct AnalyzeConfig {
     pub jls_set: Vec<(String, String)>,
     /// `--jl-file`。未指定なら `tools::default_jl_command_file` の既定値を使う。
     pub jl_file: Option<PathBuf>,
+    /// `--logo`（ロゴ検出に使う `.lgd`）。`None` なら従来どおりロゴ無しの経路
+    /// のまま（1バイトも変わらない、issue #97「解くべき問題」）。
+    pub logo: Option<PathBuf>,
 }
 
 /// analyze パイプライン全体の成果物。
@@ -89,11 +114,22 @@ pub struct AnalyzeOutput {
 /// の存在確認や作業ディレクトリの作成（既定のキャッシュディレクトリ使用時は
 /// 入力の `canonicalize` を伴う）より前に、探索場所を列挙したエラーで早期に
 /// 失敗させるため（`run_propagates_tool_resolution_failure_with_searched_locations`
-/// が実在しない入力パスでこの順序を検証している）。
+/// が実在しない入力パスでこの順序を検証している）。`--logo` 指定時は ffmpeg の
+/// 解決と `.lgd` の存在確認もここで行う（レビュー指摘: 以前は
+/// [`detect_logo`] の中、つまり dtvindex/chapter_exe の実行後にあったため、
+/// `.lgd` のパスを打ち間違えても外部プロセス2本ぶん待たされてから失敗して
+/// いた）。
 pub fn run(config: &AnalyzeConfig) -> Result<AnalyzeOutput> {
     let dtvindex_path = tools::resolve_tool(DTVINDEX)?;
     let chapter_exe_path = tools::resolve_tool(CHAPTER_EXE)?;
     let join_logo_scp_path = tools::resolve_tool(JOIN_LOGO_SCP)?;
+    let ffmpeg_path = match &config.logo {
+        Some(lgd_path) => {
+            fs::metadata(lgd_path).path_ctx("--logo で指定された .lgd の確認", lgd_path)?;
+            Some(tools::resolve_tool(FFMPEG)?)
+        }
+        None => None,
+    };
 
     let work = WorkDir::new(config.cache_dir.as_deref(), &config.input)?;
     let result = run_pipeline(
@@ -102,6 +138,7 @@ pub fn run(config: &AnalyzeConfig) -> Result<AnalyzeOutput> {
         &dtvindex_path,
         &chapter_exe_path,
         &join_logo_scp_path,
+        ffmpeg_path.as_deref(),
     );
     work.finish(result.is_ok());
     result
@@ -113,6 +150,7 @@ fn run_pipeline(
     dtvindex_path: &Path,
     chapter_exe_path: &Path,
     join_logo_scp_path: &Path,
+    ffmpeg_path: Option<&Path>,
 ) -> Result<AnalyzeOutput> {
     let work_mp4 = work.link_input(&config.input)?;
     let dtvi_path = work.dtvi_path();
@@ -163,7 +201,40 @@ fn run_pipeline(
         None => tools::default_jl_command_file(join_logo_scp_path)?,
     };
 
-    let set_args = build_jls_set_args(DEFAULT_JLS_SET, &config.jls_set);
+    // `--logo` があるときだけ動く経路（E14-8、issue #97）。フレーム数の不一致
+    // （`frames::stream_luma_frames` が内部で検査する。CLAUDE.md 罠3）は
+    // ここで `?` によりエラーとして中断し、この時点ではまだ join_logo_scp を
+    // 起動していない（issue #97「罠」: この検査は省略可能なオプションにせず、
+    // 必ず join_logo_scp の起動前に済ませる）。
+    let inlogo_path = match &config.logo {
+        Some(lgd_path) => {
+            // `run()` が `--logo` 指定時に必ず ffmpeg を解決してから
+            // `run_pipeline` を呼ぶため、ここで `None` になることは無い
+            // （`run_pipeline` は `run()` からしか呼ばれない private 関数）。
+            let ffmpeg_path = ffmpeg_path.ok_or_else(|| {
+                anyhow!(
+                    "内部エラー: --logo 指定時に ffmpeg_path が解決されていません\
+                     （run() の実装を確認してください）"
+                )
+            })?;
+            let dtvi_content_for_logo = fs::read_to_string(&dtvi_path).path_ctx(
+                "dtvindex が生成した .dtvi の読み込み（ロゴ検出用）",
+                &dtvi_path,
+            )?;
+            let dtvi_for_logo = dtvi::parse(&dtvi_content_for_logo)
+                .map_err(|err| anyhow!("生成された .dtvi のパースに失敗しました: {err}"))?;
+            detect_logo(
+                ffmpeg_path,
+                lgd_path,
+                &work_mp4,
+                work.path(),
+                &dtvi_for_logo,
+                &work.logoframe_path(),
+            )?
+        }
+        None => None,
+    };
+
     let mut join_logo_scp_args: Vec<&OsStr> = vec![
         OsStr::new("-inscp"),
         scp_path.as_os_str(),
@@ -174,6 +245,13 @@ fn run_pipeline(
         OsStr::new("-oscp"),
         detail_jls_path.as_os_str(),
     ];
+    // `-inlogo` は `-set` 群より前に置く（join_logo_scp はオプションを左から
+    // 順に処理して同じ項目を上書きするため、issue #97「罠」）。
+    if let Some(inlogo_path) = &inlogo_path {
+        join_logo_scp_args.push(OsStr::new("-inlogo"));
+        join_logo_scp_args.push(inlogo_path.as_os_str());
+    }
+    let set_args = build_jls_set_args(DEFAULT_JLS_SET, &config.jls_set);
     join_logo_scp_args.extend(set_args.iter().map(|s| OsStr::new(s.as_str())));
 
     external::run(join_logo_scp_path, &join_logo_scp_args, work.path())?;
@@ -213,6 +291,256 @@ fn run_pipeline(
         raw_trim: output_content,
         cache_trim_path: trim_avs_path,
     })
+}
+
+/// `--logo` 指定時のロゴ検出経路（E14-8、issue #97「解くべき問題」）。
+///
+/// `.lgd` を読み、ロゴ矩形（`imgx`/`imgy`/`w`/`h`）で `work_mp4` のフレームを
+/// 流し、フレームごとに `(corr0, corr1)` を評価して区間を作る。読み取った
+/// フレーム数が `dtvi` の `frame_count`（ヘッダ、`dtvi.rs` の doc comment参照）と
+/// 一致しなければ [`frames::stream_luma_frames`] がエラーを返し（CLAUDE.md
+/// 罠3）、そのエラーはこの関数から `?` でそのまま伝播する。呼び出し元
+/// （[`run_pipeline`]）はこの時点でまだ `join_logo_scp` を起動していないため、
+/// この検査は必ず起動前に効く。
+///
+/// 検出フレーム割合が閾値（[`logo_detection_threshold`]）以上、**かつ**
+/// `LogoIntervals::text` が空でない場合にだけ logoframe テキストを
+/// `logoframe_path` に書いてそのパスを返す。
+///
+/// `logo_frames`（`Judgement::HasLogo` の数え上げ）と `text`（`build_text` の
+/// 出力）は別経路で計算される。`build_text` は精緻化の結果 `s_end >= e_end`
+/// になった区間を出力しないため、**検出割合が閾値以上でも `text` が空文字列に
+/// なりうる**（`logo::interval` のモジュール doc comment「呼び出し側への委譲」
+/// 節）。ここで `text` が空でないことも確認しないと、空の logoframe ファイルを
+/// 書いて `-inlogo` として渡してしまう。join_logo_scp は `-inlogo` を渡されて
+/// ロゴ情報が無ければ警告を出して全フレームをロゴ表示中として扱うため
+/// （issue #97「罠」）、これは避ける。
+///
+/// いずれかの条件を満たさない場合は書かずに `None` を返し、理由を stderr に
+/// 出す（誤ったロゴ情報で判定を崩すより現状維持に倒す。issue #97
+/// 「フォールバック」）。このとき、以前の実行でキャッシュに残っている
+/// `logoframe_path` があれば削除する（`-inlogo` には渡らないため実害は無いが、
+/// キャッシュを覗いたときに紛らわしいため）。
+fn detect_logo(
+    ffmpeg_path: &Path,
+    lgd_path: &Path,
+    work_mp4: &Path,
+    cwd: &Path,
+    dtvi: &Dtvi,
+    logoframe_path: &Path,
+) -> Result<Option<PathBuf>> {
+    let logo_data = lgd::read(lgd_path)?;
+    let mask = score::LogoMask::new(&logo_data)
+        .map_err(|err| anyhow!(".lgd からロゴマスクを構築できませんでした: {err}"))?;
+
+    let rect = logo_rect_from_lgd(&logo_data)?;
+    let video_size = dtvi_video_size(dtvi)?;
+    let expected_frame_count = dtvi_frame_count(dtvi)?;
+
+    let mut scores: Vec<(f32, f32)> = Vec::new();
+    frames::stream_luma_frames(
+        ffmpeg_path,
+        work_mp4,
+        cwd,
+        rect,
+        video_size,
+        expected_frame_count,
+        |frame| {
+            scores.push(mask.evaluate(frame));
+            Ok(())
+        },
+    )?;
+
+    let fps = dtvi_fps(dtvi);
+    let result = logo_interval::write_result(&scores, fps);
+
+    let fraction = if result.total_frames == 0 {
+        0.0
+    } else {
+        result.logo_frames as f64 / result.total_frames as f64
+    };
+    let duration_seconds = if fps > 0.0 {
+        result.total_frames as f64 / fps
+    } else {
+        f64::INFINITY
+    };
+    let threshold = logo_detection_threshold(duration_seconds);
+
+    match inlogo_decision(fraction, threshold, &result.text) {
+        InlogoDecision::Use => {
+            fs::write(logoframe_path, &result.text)
+                .path_ctx("logoframe ファイルの書き出し", logoframe_path)?;
+            eprintln!(
+                "[analyze] ロゴ検出: {}/{}フレーム（割合 {:.3}、閾値 {:.3}）。\
+                 logoframe を書き出しました: {}",
+                result.logo_frames,
+                result.total_frames,
+                fraction,
+                threshold,
+                logoframe_path.display()
+            );
+            Ok(Some(logoframe_path.to_path_buf()))
+        }
+        InlogoDecision::FallbackEmptyText => {
+            // logo_frames の割合は閾値以上だが、build_text の精緻化で全区間が
+            // 捨てられ text が空になったケース（上の doc comment参照）。
+            // fraction 未満の通常フォールバックとは原因が違うので、メッセージを
+            // 分けて残す（実際に起きたときに原因の切り分けができるように）。
+            eprintln!(
+                "[analyze] ロゴ検出割合は閾値以上ですが、区間の精緻化後に text が空に\
+                 なったため -inlogo を渡しません（割合 {fraction:.3} >= 閾値 {threshold:.3}、\
+                 検出 {}/{}フレーム、logoframe の区間数 0）。空の logoframe を\
+                 join_logo_scp に渡すと警告の上で全フレームをロゴ表示中として\
+                 扱われてしまうため、渡しません。",
+                result.logo_frames, result.total_frames
+            );
+            clear_stale_logoframe(logoframe_path);
+            Ok(None)
+        }
+        InlogoDecision::FallbackBelowThreshold => {
+            eprintln!(
+                "[analyze] ロゴ検出割合が閾値未満のため -inlogo を渡しません（割合 {fraction:.3} \
+                 < 閾値 {threshold:.3}、検出 {}/{}フレーム）。誤ったロゴ情報で判定を崩すより\
+                 現状維持（ロゴ無し）に倒します。",
+                result.logo_frames, result.total_frames
+            );
+            clear_stale_logoframe(logoframe_path);
+            Ok(None)
+        }
+    }
+}
+
+/// [`inlogo_decision`] の結果。`-inlogo` を渡すかどうかと、渡さない場合の
+/// 原因を区別する（原因ごとに stderr のメッセージを分けるため）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InlogoDecision {
+    /// `-inlogo` を渡す（`fraction >= threshold` かつ `text` が空でない）。
+    Use,
+    /// `fraction >= threshold` だが `text` が空だったため渡さない
+    /// （`build_text` が `s_end >= e_end` の区間を出力しないことによる。
+    /// `logo_interval` のモジュール doc comment参照）。
+    FallbackEmptyText,
+    /// `fraction < threshold` のため渡さない（通常のフォールバック）。
+    FallbackBelowThreshold,
+}
+
+/// `-inlogo` を渡すかどうかを決める（issue #97「フォールバック」、レビュー
+/// 指摘: `fraction >= threshold` だけでは `text` が空のケースを見落とす）。
+///
+/// プロセス（ffmpeg 等）を起動せずに検証できるよう、`detect_logo` から分離した
+/// 純粋関数にしている。
+fn inlogo_decision(fraction: f64, threshold: f64, text: &str) -> InlogoDecision {
+    if fraction < threshold {
+        InlogoDecision::FallbackBelowThreshold
+    } else if text.trim().is_empty() {
+        InlogoDecision::FallbackEmptyText
+    } else {
+        InlogoDecision::Use
+    }
+}
+
+/// フォールバック（`-inlogo` を渡さない）ときに、以前の実行でキャッシュに
+/// 残っている `logoframe_path` を削除する。`-inlogo` には渡らないため実害は
+/// 無いが、キャッシュを覗いたときに古い検出結果が残っていると紛らわしい
+/// （レビュー指摘、issue #97）。削除に失敗しても `detect_logo` 自体は失敗
+/// させない（`clear_stale_cached_segment_map`、`src/commands.rs` と同じ扱い）。
+fn clear_stale_logoframe(logoframe_path: &Path) {
+    match fs::remove_file(logoframe_path) {
+        Ok(()) => {
+            eprintln!(
+                "[analyze] 古い logoframe を削除しました: {}",
+                logoframe_path.display()
+            );
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            eprintln!(
+                "[analyze] 古い logoframe の削除に失敗しました（警告のみ、処理は続行します）: \
+                 {} ({err})",
+                logoframe_path.display()
+            );
+        }
+    }
+}
+
+/// [`LogoData`] の `imgx`/`imgy`/`w`/`h` から [`LogoRect`] を作る。いずれも
+/// 負の値であればエラーにする（`.lgd` の座標は本来非負のはずで、負値を
+/// そのまま `u32` へキャストすると巨大な値に化けて後段の範囲外検査を無意味に
+/// する）。
+fn logo_rect_from_lgd(logo: &LogoData) -> Result<LogoRect> {
+    let to_u32 = |label: &str, v: i32| -> Result<u32> {
+        u32::try_from(v).map_err(|_| anyhow!(".lgd の {label} が負の値です: {v}"))
+    };
+    Ok(LogoRect {
+        x: to_u32("imgx", logo.imgx)?,
+        y: to_u32("imgy", logo.imgy)?,
+        w: to_u32("w", logo.w)?,
+        h: to_u32("h", logo.h)?,
+    })
+}
+
+/// `.dtvi` ヘッダの `width`/`height` から [`VideoSize`] を求める。
+fn dtvi_video_size(dtvi: &Dtvi) -> Result<VideoSize> {
+    let parse = |key: &str| -> Result<u32> {
+        let value = dtvi
+            .header_value(key)
+            .ok_or_else(|| anyhow!(".dtvi のヘッダに {key} がありません"))?;
+        value
+            .trim()
+            .parse::<u32>()
+            .map_err(|_| anyhow!(".dtvi のヘッダの {key}（{value:?}）を数値として解釈できません"))
+    };
+    Ok(VideoSize {
+        width: parse("width")?,
+        height: parse("height")?,
+    })
+}
+
+/// `.dtvi` ヘッダの `frame_count` を読む（`dtvi.rs` の doc comment参照）。
+/// `join_logo_scp` を起動する前に、ロゴ検出で読み取ったフレーム数との一致を
+/// 検査するために使う（`frames::stream_luma_frames` の `expected_frame_count`）。
+fn dtvi_frame_count(dtvi: &Dtvi) -> Result<u64> {
+    let value = dtvi
+        .header_value("frame_count")
+        .ok_or_else(|| anyhow!(".dtvi のヘッダに frame_count がありません"))?;
+    value
+        .trim()
+        .parse::<u64>()
+        .map_err(|_| anyhow!(".dtvi のヘッダの frame_count（{value:?}）を数値として解釈できません"))
+}
+
+/// `.dtvi` ヘッダの `frame_rate_num`/`frame_rate_den` から fps を求める。
+///
+/// `commands::fps_from_dtvi` と同じ既定値（キーが無い、または数値として
+/// パースできない場合は対象素材の実測値 30000/1001）を使うが、`analyze.rs` は
+/// `commands.rs`（`analyze` を呼ぶ側）に依存しない方針のため、ここで独立に
+/// 計算する（重複はこの1関数分だけで、値の食い違いは両者とも同じ既定値・同じ
+/// ヘッダキーを見ているため起きない）。
+fn dtvi_fps(dtvi: &Dtvi) -> f64 {
+    let parse = |key: &str, default: f64| {
+        dtvi.header_value(key)
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .unwrap_or(default)
+    };
+    let num = parse("frame_rate_num", 30000.0);
+    let den = parse("frame_rate_den", 1001.0);
+    if den == 0.0 {
+        num
+    } else {
+        num / den
+    }
+}
+
+/// ロゴ検出割合のフォールバック閾値を決める（issue #97「フォールバック」:
+/// 通常 [`LOGO_DETECTION_THRESHOLD`]、映像長が
+/// [`LOGO_DETECTION_SHORT_VIDEO_SECONDS`] 以下なら
+/// [`LOGO_DETECTION_THRESHOLD_SHORT`]。Amatsukaze `CMAnalyze.hpp:301` と同じ規則）。
+fn logo_detection_threshold(duration_seconds: f64) -> f64 {
+    if duration_seconds <= LOGO_DETECTION_SHORT_VIDEO_SECONDS {
+        LOGO_DETECTION_THRESHOLD_SHORT
+    } else {
+        LOGO_DETECTION_THRESHOLD
+    }
 }
 
 /// 2 つのパスが同じファイルを指すか（親ディレクトリを canonicalize して比較）。
@@ -397,6 +725,262 @@ mod tests {
         assert_eq!(value, "a=b");
     }
 
+    // --- --logo 用の純粋関数: プロセス起動なしで検証できる ---
+
+    /// テスト用に、指定したヘッダだけを持つ最小の `Dtvi` を組み立てる。
+    fn dtvi_with_header(pairs: &[(&str, &str)]) -> Dtvi {
+        Dtvi {
+            format_version: 1,
+            header: pairs
+                .iter()
+                .map(|&(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            frames: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn logo_rect_from_lgd_reads_imgx_imgy_w_h() {
+        let logo = LogoData {
+            w: 8,
+            h: 8,
+            log_uv_x: 1,
+            log_uv_y: 1,
+            imgw: 640,
+            imgh: 360,
+            imgx: 620,
+            imgy: 4,
+            name: String::new(),
+            service_id: 0,
+            a_y: vec![],
+            b_y: vec![],
+            a_u: vec![],
+            b_u: vec![],
+            a_v: vec![],
+            b_v: vec![],
+        };
+        let rect = logo_rect_from_lgd(&logo).expect("非負なので成功するはず");
+        assert_eq!(
+            rect,
+            LogoRect {
+                x: 620,
+                y: 4,
+                w: 8,
+                h: 8
+            }
+        );
+    }
+
+    #[test]
+    fn logo_rect_from_lgd_rejects_negative_coordinate() {
+        let mut logo = LogoData {
+            w: 8,
+            h: 8,
+            log_uv_x: 1,
+            log_uv_y: 1,
+            imgw: 640,
+            imgh: 360,
+            imgx: -1,
+            imgy: 4,
+            name: String::new(),
+            service_id: 0,
+            a_y: vec![],
+            b_y: vec![],
+            a_u: vec![],
+            b_u: vec![],
+            a_v: vec![],
+            b_v: vec![],
+        };
+        let err = logo_rect_from_lgd(&logo).expect_err("負値はエラーになるはず");
+        assert!(err.to_string().contains("imgx"));
+        // w が負でも同様にエラーになる（別フィールドでも検査経路が働くことの確認）。
+        logo.imgx = 0;
+        logo.w = -1;
+        let err = logo_rect_from_lgd(&logo).expect_err("負値はエラーになるはず");
+        assert!(err.to_string().contains('w'));
+    }
+
+    #[test]
+    fn dtvi_video_size_reads_width_and_height() {
+        let dtvi = dtvi_with_header(&[("width", "640"), ("height", "360")]);
+        let size = dtvi_video_size(&dtvi).expect("width/height があるので成功するはず");
+        assert_eq!(
+            size,
+            VideoSize {
+                width: 640,
+                height: 360
+            }
+        );
+    }
+
+    #[test]
+    fn dtvi_video_size_missing_key_is_an_error() {
+        let dtvi = dtvi_with_header(&[("width", "640")]);
+        let err = dtvi_video_size(&dtvi).expect_err("height が無いのでエラーになるはず");
+        assert!(err.to_string().contains("height"));
+    }
+
+    #[test]
+    fn dtvi_frame_count_reads_header() {
+        let dtvi = dtvi_with_header(&[("frame_count", "599")]);
+        assert_eq!(dtvi_frame_count(&dtvi).expect("成功するはず"), 599);
+    }
+
+    #[test]
+    fn dtvi_frame_count_missing_key_is_an_error() {
+        let dtvi = dtvi_with_header(&[]);
+        let err = dtvi_frame_count(&dtvi).expect_err("frame_count が無いのでエラーになるはず");
+        assert!(err.to_string().contains("frame_count"));
+    }
+
+    #[test]
+    fn dtvi_fps_reads_frame_rate_header() {
+        let dtvi = dtvi_with_header(&[("frame_rate_num", "24000"), ("frame_rate_den", "1001")]);
+        let fps = dtvi_fps(&dtvi);
+        assert!((fps - 24000.0 / 1001.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn dtvi_fps_defaults_to_measured_value_when_header_missing() {
+        let dtvi = dtvi_with_header(&[]);
+        let fps = dtvi_fps(&dtvi);
+        assert!((fps - 30000.0 / 1001.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn logo_detection_threshold_is_lenient_for_short_videos() {
+        assert_eq!(
+            logo_detection_threshold(60.0),
+            LOGO_DETECTION_THRESHOLD_SHORT
+        );
+        assert_eq!(
+            logo_detection_threshold(LOGO_DETECTION_SHORT_VIDEO_SECONDS),
+            LOGO_DETECTION_THRESHOLD_SHORT
+        );
+    }
+
+    #[test]
+    fn logo_detection_threshold_is_default_for_long_videos() {
+        assert_eq!(
+            logo_detection_threshold(LOGO_DETECTION_SHORT_VIDEO_SECONDS + 1.0),
+            LOGO_DETECTION_THRESHOLD
+        );
+        assert_eq!(logo_detection_threshold(3600.0), LOGO_DETECTION_THRESHOLD);
+    }
+
+    // --- inlogo_decision: レビュー指摘（fraction >= threshold でも text が
+    // 空になりうる）の防御 ---
+
+    #[test]
+    fn inlogo_decision_uses_inlogo_when_fraction_and_text_are_both_ok() {
+        assert_eq!(
+            inlogo_decision(0.5, LOGO_DETECTION_THRESHOLD, "0 S 0 ALL 0 0\n"),
+            InlogoDecision::Use
+        );
+    }
+
+    #[test]
+    fn inlogo_decision_falls_back_when_fraction_below_threshold() {
+        assert_eq!(
+            inlogo_decision(0.05, LOGO_DETECTION_THRESHOLD, "0 S 0 ALL 0 0\n"),
+            InlogoDecision::FallbackBelowThreshold
+        );
+    }
+
+    #[test]
+    fn inlogo_decision_falls_back_when_text_is_empty_even_if_fraction_is_high() {
+        // fraction が閾値以上でも text が空（＝build_text が区間を1つも
+        // 出力しなかった）なら Use にしてはいけない。
+        assert_eq!(
+            inlogo_decision(0.96, LOGO_DETECTION_THRESHOLD, ""),
+            InlogoDecision::FallbackEmptyText
+        );
+        // 空白だけの文字列も「空」とみなす。
+        assert_eq!(
+            inlogo_decision(0.96, LOGO_DETECTION_THRESHOLD, "  \n"),
+            InlogoDecision::FallbackEmptyText
+        );
+    }
+
+    #[test]
+    fn inlogo_decision_below_threshold_takes_priority_over_empty_text_label() {
+        // fraction が閾値未満で text も空の場合、原因は「閾値未満」であって
+        // 「text が空」ではない（メッセージの正しさの確認）。
+        assert_eq!(
+            inlogo_decision(0.0, LOGO_DETECTION_THRESHOLD, ""),
+            InlogoDecision::FallbackBelowThreshold
+        );
+    }
+
+    /// レビューで再現された不具合の再現テスト: `logo_frames` の数え上げ
+    /// （割合 96.2%、閾値 0.1 を大きく上回る）に対して `build_text` の出力
+    /// （`text`）が空になるスコア分布を作り、それでも `inlogo_decision` が
+    /// `Use` を返さないことを確認する。
+    ///
+    /// スコアは `scores[i] = (4.4, 0.0)`（21 の倍数の位置）/ `(0.0, 0.0)`
+    /// （それ以外）を 600 フレーム分、fps は本ツールの既定値 30000/1001 で
+    /// 作る（レビューコメントの再現条件そのもの）。`(4.4, 0.0)` は
+    /// `raw = corr0.max(0.0) + corr1.min(0.0) = 4.4` という強い「ロゴあり」
+    /// スコアだが、21 フレームに1回しか出ないスパイクのため 1 秒移動平均
+    /// （`AVG_DUR_SEC = 1.0`、fps ≈ 30 なので窓は約31フレーム）に均されると
+    /// `THRESH = 0.2` を超えず、MinMax 判定（前後 0.5 秒の最大値の小さい方）
+    /// だけがロゴありと判定してしまう区間ができる。この食い違いが
+    /// `fill_unknown_runs` の穴埋め結果と `build_text` の精緻化の間でずれ、
+    /// `s_end >= e_end` になった区間が出力から丸ごと落ちる。
+    #[test]
+    fn detect_logo_fallback_reproduces_review_case_high_fraction_empty_text() {
+        const N: usize = 600;
+        let scores: Vec<(f32, f32)> = (0..N)
+            .map(|i| if i % 21 == 0 { (4.4, 0.0) } else { (0.0, 0.0) })
+            .collect();
+        let fps = 30000.0 / 1001.0;
+
+        let result = logo_interval::write_result(&scores, fps);
+
+        // レビューの再現条件どおり: logo_frames の割合は閾値を大きく上回るが
+        // text は空になる。
+        let fraction = result.logo_frames as f64 / result.total_frames as f64;
+        assert!(
+            fraction >= LOGO_DETECTION_THRESHOLD,
+            "再現条件が崩れている（割合 {fraction} が閾値 {LOGO_DETECTION_THRESHOLD} 未満）"
+        );
+        assert!(
+            result.text.trim().is_empty(),
+            "再現条件が崩れている（text が空でない: {:?}）",
+            result.text
+        );
+
+        // この入力に対して inlogo_decision が Use を返してはいけない
+        // （空の logoframe を書いて -inlogo として渡してしまうバグの防御）。
+        assert_eq!(
+            inlogo_decision(fraction, LOGO_DETECTION_THRESHOLD, &result.text),
+            InlogoDecision::FallbackEmptyText,
+            "fraction が閾値以上でも text が空なら Use にしてはいけない"
+        );
+    }
+
+    // --- clear_stale_logoframe: フォールバック時の残骸削除 ---
+
+    #[test]
+    fn clear_stale_logoframe_removes_existing_file() {
+        let dir = unique_scratch_dir("clear-stale-logoframe");
+        let path = dir.join("logoframe.txt");
+        fs::write(&path, "0 S 0 ALL 0 0\n0 E 0 ALL 0 0\n").unwrap();
+        clear_stale_logoframe(&path);
+        assert!(!path.exists(), "既存の logoframe.txt が削除されているはず");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn clear_stale_logoframe_is_a_noop_when_file_does_not_exist() {
+        // ファイルが元々無い場合はエラーにならない（panic しないことの確認）。
+        let dir = unique_scratch_dir("clear-stale-logoframe-missing");
+        let path = dir.join("logoframe.txt");
+        clear_stale_logoframe(&path);
+        assert!(!path.exists());
+        fs::remove_dir_all(&dir).ok();
+    }
+
     // --- run(): resolve_tool のエラーがそのまま伝播することの確認 ---
 
     fn unique_scratch_dir(label: &str) -> PathBuf {
@@ -454,6 +1038,7 @@ mod tests {
             cache_dir: None,
             jls_set: vec![],
             jl_file: None,
+            logo: None,
         };
 
         let err = run(&config).expect_err("空振りする PATH では解決に失敗するはず");
@@ -520,6 +1105,7 @@ mod tests {
             cache_dir: Some(cache_root.clone()),
             jls_set: vec![],
             jl_file: None,
+            logo: None,
         };
 
         let err = run(&config).expect_err("chapter_exe の失敗で run 全体が失敗するはず");
@@ -599,6 +1185,7 @@ mod tests {
             cache_dir: Some(cache_root.clone()),
             jls_set: vec![],
             jl_file: None,
+            logo: None,
         };
         let out_none = run(&config_none).expect("output なしでも成功するはず");
         assert_eq!(out_none.raw_trim, TRIM_CONTENT);
@@ -620,6 +1207,7 @@ mod tests {
             cache_dir: Some(cache_root.clone()),
             jls_set: vec![],
             jl_file: None,
+            logo: None,
         };
         let out_some = run(&config_some).expect("明示パスでも成功するはず");
         assert_eq!(out_some.raw_trim, TRIM_CONTENT);
@@ -663,6 +1251,7 @@ mod tests {
             cache_dir: Some(cache_root.clone()),
             jls_set: vec![],
             jl_file: None,
+            logo: None,
         };
 
         let output = run(&config).expect("analyze パイプラインが成功するはず");

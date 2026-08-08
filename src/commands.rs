@@ -74,6 +74,7 @@ fn run_auto(cache_dir: Option<PathBuf>, args: AutoArgs) -> anyhow::Result<ExitOu
         verify,
         jl_file,
         jls_set,
+        logo,
     } = args;
 
     let config = auto::AutoConfig {
@@ -88,6 +89,7 @@ fn run_auto(cache_dir: Option<PathBuf>, args: AutoArgs) -> anyhow::Result<ExitOu
         verify,
         jl_file,
         jls_set,
+        logo,
     };
 
     match auto::run(&config, &input)? {
@@ -368,6 +370,7 @@ fn run_analyze(cache_dir: Option<PathBuf>, args: AnalyzeArgs) -> anyhow::Result<
         report: show_report,
         jls_set,
         jl_file,
+        logo,
     } = args;
 
     let jls_set = jls_set
@@ -387,6 +390,7 @@ fn run_analyze(cache_dir: Option<PathBuf>, args: AnalyzeArgs) -> anyhow::Result<
         cache_dir,
         jls_set,
         jl_file,
+        logo,
     };
 
     let result = analyze::run(&config)?;

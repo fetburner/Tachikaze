@@ -25,10 +25,32 @@ tachikaze prepare IN.mp4 [--subs PATH]
 
 tachikaze analyze IN.mp4 [-o trim.avs|-] [--report] [--cache-dir DIR]
                                      [--jls-set KEY=VALUE]... [--jl-file FILE]
+                                     [--logo FILE.lgd]
     1. dtvindex build              （外部プロセス）
     2. chapter_exe                 （外部プロセス）
     3. join_logo_scp               （外部プロセス）
                                    -set autocm_sub 11 -set param_cuttr 1 を既定付与
+                                   `--logo` 指定時は 2 と 3 の間で自前のロゴ検出
+                                   （`.lgd` を読み、ffmpeg でロゴ矩形のフレームを
+                                   流して区間判定、`src/logo/`・`src/analyze.rs`
+                                   の `detect_logo`）を行い、検出フレーム割合が
+                                   閾値（既定 0.1、映像長7分以下は 0.03。
+                                   Amatsukaze `CMAnalyze.hpp:301` と同じ規則）
+                                   以上、かつ logoframe テキスト（`logo::interval`
+                                   の `build_text`）が空でない場合にだけ logoframe
+                                   をキャッシュへ書いて `-inlogo` を 3 に渡す
+                                   （`-set` 群より前に置く。E14-8、#97）。割合が
+                                   閾値未満、または割合は閾値以上でも精緻化で
+                                   text が空になった場合は `-inlogo` を渡さず
+                                   3 へ進む（誤ったロゴ情報で判定を崩すより現状
+                                   維持。`logo_frames`（判定の数え上げ）と
+                                   `text`（`build_text` の出力）は別経路のため、
+                                   割合だけでは text が空のケースを見落とす。
+                                   `src/analyze.rs::inlogo_decision`）。フォール
+                                   バック時はキャッシュに残る古い logoframe.txt
+                                   を削除する。`.dtvi` の `frame_count` と読み取った
+                                   フレーム数が食い違う場合は 3 を実行せず中断
+                                   する（CLAUDE.md 罠3、この検査は省略不可）
     4. --report で以下を stderr に出力
        ・各カット境界とキーフレームの距離
        ・余分に残る合計秒数
@@ -82,6 +104,7 @@ tachikaze remap-subs IN.mp4 [--segment-map PATH] [--subs PATH] [-o OUT.ass|OUT.s
 tachikaze auto IN.mp4 -o OUT.mp4 [--cm-output CM.mp4] [--ignore-gate]
                                 [-f|--force] [--analyze-only] [--no-subtitles]
                                 [--snap] [--verify] [--jl-file] [--jls-set] [--cache-dir]
+                                [--logo FILE.lgd]
    16. prepare(0) → analyze(1〜4) → gate 判定 → cut(5〜12) → remap-subs(13〜15) を
        対話なしで合成する（`src/auto.rs`、#62）。アルゴリズムは持たない: 各ステップは
        上記の関数・処理をそのまま呼ぶ（`commands::execute_cut` を `cut` サブコマンドと
@@ -275,13 +298,13 @@ struct DecodeIdx(u32);    // デコード順（mp4 のサンプル番号 / .dtvi
 | `mp4io::read` のテストが並列実行で稀に落ちる | **未対応。** `src/mp4io/read.rs::tests::ffprobe_packets` が ffprobe の**起動失敗**を `.expect("ffprobe を起動できること")` で panic させる。多数の ffprobe を同時に起動すると稀に起動に失敗し、テストが落ちる（master で8回中4回再現）。同モジュールには起動できない場合をスキップ扱いにする `skip_if_ffprobe_missing` があるので、`ffprobe_packets` の起動失敗も同じ扱いにすれば直る。テストだけの問題で、製品コードには影響しない |
 | `analyze` のテストが `--include-ignored` で競合する | **未対応。** `src/analyze.rs::tests::analyze_run_produces_trim_list_with_real_tools` は `TOOL_PATH_ENV_LOCK` を取らずに実 `PATH` からツールを解決する一方、同モジュールの他3テストはそのロックの下でプロセス全体の `PATH` を差し替える。並列に走ると前者が差し替え後の `PATH` を読んで落ちうる。`--ignored` 単独では他3テストが走らないため出ず、`--include-ignored` でのみ再現する。前者にも同じロックを取らせれば直る |
 | キャッシュ鍵の弱さ | `<キャッシュの根>/<入力ごと>/`（既定 `~/.cache/tachikaze`、`--cache-dir` で変更可）のディレクトリ名は入力の**絶対パスのハッシュのみ**から決まる（`workdir::cache_dir_for_input`、FNV-1a）。同じパスに別内容のファイルが後から置かれても（録画ファイルの上書き・再利用）区別できず、古い `.dtvi` / `trim.avs` / `input_prepared.mp4` を新しい入力に対して誤って再利用しうる。`auto` は `analyze`/`prepare` を毎回作り直すことでこの穴を避けているが（`src/auto.rs` の doc comment）、`cut --dtvi` を省略してキャッシュから自動解決する経路には対策が無い。size + mtime の突き合わせなどの対策は、要求されていない現時点では追加しないと判断している（理由は `src/auto.rs` の doc comment参照） |
+| ロゴありの JL 設定の実測 | `analyze --logo`（E14-8、#97）は実装済みだが、`-inlogo` を渡した状態での join_logo_scp の挙動・チューニング（`docs/jls-settings.md`）はロゴ無し前提のまま未更新（[E14-9](https://github.com/fetburner/Tachikaze/issues/98)）。実測が済んだら `docs/jls-settings.md` を更新する |
 
 ## 方針として作らないもの
 
 | 項目 | 理由 |
 |---|---|
 | CM 検出アルゴリズム | 既存ツール（chapter_exe → join_logo_scp）が担当 |
-| ロゴ検出 | 現状は自前実装していない（[E14](https://github.com/fetburner/Tachikaze/issues/89) で実装中。実装が終わったらこの行自体を外す予定）。旧記述「delogo 済み mp4 では原理的に不可」は実測していない仮定だった。実際には残っている入力がある（確認した4局はいずれも残存。未確認の局・解像度にまで一般化できるかは不明。[measurements.md](measurements.md)「ロゴの残存」） |
 | 映像の再エンコード | 数秒の CM 残りを許容する方針 |
 | 音声の再エンコード | 継ぎ目のノイズは残存 CM の範囲内 |
 | `auto` の複数入力・ディレクトリ一括処理（glob 展開） | 1プロセス1入力にすると exit code の意味が一意になる（#70）。繰り返しはシェル（`for` / `xargs -n1`）の仕事 |
