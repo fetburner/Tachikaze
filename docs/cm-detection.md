@@ -9,17 +9,17 @@
 CM 判定は 3 種類の「証拠」を集めて外部ツールが統合判定する分業になっている。
 
 ```
-                ┌─ ロゴの有無     … Amatsukaze 本体 (LogoScan.hpp)  ─┐
+                ┌─ ロゴの有無     … tachikaze 自前実装 (src/logo/) ─┐
 映像・音声 ─────┼─ 無音区間       … chapter_exe                     ├→ join_logo_scp
                 └─ シーンチェンジ … chapter_exe                     ─┘      ↓
                   ＋ PMT 変更点   … Amatsukaze 本体 (applyPmtCut)       Trim(a,b)++…
 ```
 
-**本プロジェクトではロゴと PMT を使わない**（mp4 に PMT はなく、ロゴは delogo 済み）。
+**本プロジェクトは PMT を使わない**（mp4 に PMT が無いため）。**ロゴは [E14](https://github.com/fetburner/Tachikaze/issues/89) で自前実装した**（`analyze --logo <path.lgd>` を指定したときだけ使う。省略時は従来どおりロゴ無しの経路のまま）。「delogo 済みの mp4 にはロゴが存在しない」という当初の前提は実測していない仮定で、実際には残っている入力があった（[measurements.md](measurements.md)「ロゴの残存」）。
 
-## ロゴ検出（使わないが理解のため）
+## ロゴ検出（自前実装、任意）
 
-日本の地上波は本編中は局ロゴが出て CM 中は消えるため、これが最も強い手がかりになる。Amatsukaze 自前実装で、最も作り込まれている部分。
+日本の地上波は本編中は局ロゴが出て CM 中は消えるため、これが最も強い手がかりになる。**移植元は Amatsukaze 自前実装（`LogoScan.hpp` の相関方式）**で、最も作り込まれている部分。なお相関方式とは別に、本家 **logoframe**（Yobi 版、GitHub 上の別ツール、GPLv2）という輝度閾値ベースの実装も存在する。Amatsukaze の `LogoFrame`（本プロジェクトが移植した対象）はその logoframe の再実装であり、輝度閾値を持たない相関方式に置き換えている点が異なる（このプロジェクトが移植したのは Amatsukaze 側の相関方式で、logoframe の GPLv2 コードは一切参照・移植していない）。
 
 ### モデル
 
@@ -52,10 +52,11 @@ CM 判定は 3 種類の「証拠」を集めて外部ツールが統合判定�
 
 最良位置だけでなく**可能性の範囲**を渡す（`LogoScan.hpp:1818`）。ロゴのフェードで境界は本質的に曖昧なので、確定させずに join_logo_scp に委ねる設計。形式は [pipeline.md](pipeline.md)。
 
-### mp4 で使えない理由
+**fade（フェード区間そのものの検出）と TOP/BTM（片フィールドロゴ、インターレースの上下フィールド別の表示区間）は出力しない**（[E14](https://github.com/fetburner/Tachikaze/issues/89) の方針、logoframe 形式の `fade` は常に `0`、`TOP`/`BTM` の区別は使わず常に `ALL` を書く。`src/logo/interval.rs`）。理由: (1) Amatsukaze 自身もこれらを出していない、(2) 本ツールはカットをキーフレーム境界（GOP 120 = 約4秒）に丸めるため、数フレーム単位の境界精度はどのみち残存 CM マージンに吸収されて利得が小さい。
 
-1. **delogo 済みならロゴは存在しない**
-2. 仮に残っていても**解像度が一致しないと評価がスキップされる**（`LogoScan.hpp:1550` で `logo.getImgWidth() != vi.width` なら評価しない）。1440x1080 の TS から作ったロゴデータは 1280x720 の mp4 に使えない
+### 解像度の制約（実装済みの前提）
+
+**ロゴデータは対象の mp4 と同じ解像度で作る必要がある**（Amatsukaze の `LogoScan.hpp:1550` の `logo.getImgWidth() != vi.width` なら評価しないという制約と同じ理由）。`tachikaze make-logo` は対象の mp4 自身から作るため、この制約は「対象ごとに作り直す」ことで満たす（1440x1080 の TS から作ったロゴデータを 1280x720 の mp4 に使うような不一致は起きない）。720p（1280x720）でロゴが残っているかどうかは未確認（[measurements.md](measurements.md)「ロゴの残存」の「見ていないこと」）。
 
 ## join_logo_scp の構造
 

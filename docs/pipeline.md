@@ -64,11 +64,11 @@ Amatsukaze 側では `-o` ではなく **stdout** を別に解析している（
 ### logoframe の出力（= join_logo_scp の `-inlogo`）
 
 **既定では使わない。`analyze --logo <path>` を指定したときだけ使う**（E14、#89）。
-当初は「対象は delogo 済みのため原理的に不可」としていたが、E14-2 の実測
-（`docs/measurements.md`「ロゴの残存」）でこの前提が誤りだと判明した
-（確認した4局はいずれもロゴが実際には残っていた）。形式そのものは
-Amatsukaze の `LogoScan.hpp:1818` が生成するもので、自前実装（`src/logo/`、
-`src/analyze.rs::detect_logo`）もこの形式でファイルを書く:
+当初は「対象は delogo 済みのためこの経路は使えない」という未実測の仮定を
+置いていたが、E14-2 の実測（`docs/measurements.md`「ロゴの残存」）でこの
+前提が誤りだと判明した（確認した4局はいずれもロゴが実際には残っていた）。
+形式そのものは Amatsukaze の `LogoScan.hpp:1818` が生成するもので、
+自前実装（`src/logo/`、`src/analyze.rs::detect_logo`）もこの形式でファイルを書く:
 
 ```
   1234 S 0 ALL   1220   1250     ← ロゴ開始: 最良位置 1234、可能性範囲 1220〜1250

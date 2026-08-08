@@ -273,6 +273,7 @@ struct DecodeIdx(u32);    // デコード順（mp4 のサンプル番号 / .dtvi
 6. 音声の丸め誤差の最大値をログ出力（`AudioDiffInfo` 相当）
 7. `--verify` 指定時は ffprobe のパケット単位 CRC32 で元ファイルとの一致を確認（[lossless-cut.md](lossless-cut.md)）
 8. `--cm-output` 指定時は保持側と CM 側でフレーム数の合計 == 総フレーム数、`DecodeIdx` の集合が互いに素
+9. `analyze --logo` 指定時: ffmpeg から読み取ったロゴ矩形のフレーム数が `.dtvi` の `frame_count` と一致するか（`src/logo/frames.rs::stream_luma_frames`、不一致なら明示エラーで停止。ロゴ検出は `cut` とは別の ffmpeg 供給経路を使うため、上記 4 とは別に必要な検査。[E14](https://github.com/fetburner/Tachikaze/issues/89) の「静かに壊れる仕組み」と同種の防御）
 
 ## 未対応の入力（`mp4io/support.rs` が明示エラーで落とす）
 
@@ -298,7 +299,8 @@ struct DecodeIdx(u32);    // デコード順（mp4 のサンプル番号 / .dtvi
 | `mp4io::read` のテストが並列実行で稀に落ちる | **未対応。** `src/mp4io/read.rs::tests::ffprobe_packets` が ffprobe の**起動失敗**を `.expect("ffprobe を起動できること")` で panic させる。多数の ffprobe を同時に起動すると稀に起動に失敗し、テストが落ちる（master で8回中4回再現）。同モジュールには起動できない場合をスキップ扱いにする `skip_if_ffprobe_missing` があるので、`ffprobe_packets` の起動失敗も同じ扱いにすれば直る。テストだけの問題で、製品コードには影響しない |
 | `analyze` のテストが `--include-ignored` で競合する | **未対応。** `src/analyze.rs::tests::analyze_run_produces_trim_list_with_real_tools` は `TOOL_PATH_ENV_LOCK` を取らずに実 `PATH` からツールを解決する一方、同モジュールの他3テストはそのロックの下でプロセス全体の `PATH` を差し替える。並列に走ると前者が差し替え後の `PATH` を読んで落ちうる。`--ignored` 単独では他3テストが走らないため出ず、`--include-ignored` でのみ再現する。前者にも同じロックを取らせれば直る |
 | キャッシュ鍵の弱さ | `<キャッシュの根>/<入力ごと>/`（既定 `~/.cache/tachikaze`、`--cache-dir` で変更可）のディレクトリ名は入力の**絶対パスのハッシュのみ**から決まる（`workdir::cache_dir_for_input`、FNV-1a）。同じパスに別内容のファイルが後から置かれても（録画ファイルの上書き・再利用）区別できず、古い `.dtvi` / `trim.avs` / `input_prepared.mp4` を新しい入力に対して誤って再利用しうる。`auto` は `analyze`/`prepare` を毎回作り直すことでこの穴を避けているが（`src/auto.rs` の doc comment）、`cut --dtvi` を省略してキャッシュから自動解決する経路には対策が無い。size + mtime の突き合わせなどの対策は、要求されていない現時点では追加しないと判断している（理由は `src/auto.rs` の doc comment参照） |
-| ロゴありの JL 設定の実測 | `analyze --logo`（E14-8、#97）は実装済みだが、`-inlogo` を渡した状態での join_logo_scp の挙動・チューニング（`docs/jls-settings.md`）はロゴ無し前提のまま未更新（[E14-9](https://github.com/fetburner/Tachikaze/issues/98)）。実測が済んだら `docs/jls-settings.md` を更新する |
+| `-CutMrgIn` / `-CutMrgOut` を CLI から渡す口 | **追加しないと決定（E14-9、#98）。** join_logo_scp の起動オプション（`-set` 変数ではない）で、シーンチェンジからロゴ表示開始/終了までの局固有の固定遅延を補正する。実測（BS11、`docs/jls-settings.md`「`-CutMrgIn`/`-CutMrgOut`」）では `JL_標準.txt` の自動判断（`-CutMrgWI 2`/`-CutMrgWO 2`）が既に妥当な値（`CutMrgIn=5 CutMrgOut=8`）を検出しており、`0`〜`20` の範囲で手動指定に変えても `trim.avs`/`detail.jls` に変化が無かった。**やらないと決めた理由**: 実測した1局では効果が確認できず、CLI にオプションを追加する（`--jls-set` と別の口が要る、`-set` ではないため）実装コストに見合う利得が無いと判断した。局によっては固定遅延が大きく効果が出る可能性は残るため、実際に精度不足が観測された局が出たら別 issue で対応を検討する |
+| 見逃し候補ヒューリスティックとロゴ | `src/report/missed.rs` は `.jls` のラベルを見ずギャップ長の一致だけで判定するため、ロゴの有無でロジックは変わらない。実測 2 本（BS11・TOKYO MX2、`docs/jls-settings.md`「ロゴありでの見逃し警告」）ではロゴあり/なしで見逃し候補の件数に変化が無かった（どちらも 0 件）。**この issue ではコードを変えない。** 検出済み CM ブロック長が揃わない番組でロゴありを試した実測が無いため、一般に誤警告が増えないとは言えない |
 
 ## 方針として作らないもの
 
@@ -308,6 +310,7 @@ struct DecodeIdx(u32);    // デコード順（mp4 のサンプル番号 / .dtvi
 | 映像の再エンコード | 数秒の CM 残りを許容する方針 |
 | 音声の再エンコード | 継ぎ目のノイズは残存 CM の範囲内 |
 | `auto` の複数入力・ディレクトリ一括処理（glob 展開） | 1プロセス1入力にすると exit code の意味が一意になる（#70）。繰り返しはシェル（`for` / `xargs -n1`）の仕事 |
+| ロゴ検出の fade（フェード区間そのもの）・TOP/BTM（片フィールドロゴ）の出力 | [E14](https://github.com/fetburner/Tachikaze/issues/89) の方針。Amatsukaze も出していない。カットはキーフレーム境界（GOP 120 = 約4秒）に丸めるため、数フレーム単位の境界精度は残存 CM マージンに吸収され利得が小さい（詳細は [cm-detection.md](cm-detection.md)「出力形式の要点」） |
 
 **ただし「境界 GOP だけ再エンコードすればフレーム精度になる」ことは覚えておく。** 実測で境界あたり 4 秒（120 フレーム）分のエンコードで済む。30 分番組・8 境界なら 32 秒分。方針が変わったときの逃げ道として安い。
 
