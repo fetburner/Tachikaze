@@ -90,9 +90,10 @@ pub struct AnalyzeArgs {
     pub jl_file: Option<PathBuf>,
 
     /// ロゴ検出に使う `.lgd`（Amatsukaze 形式ロゴデータ、`make-logo` で作る）。
-    /// 指定時のみロゴ検出を行い、検出フレーム割合が閾値以上なら logoframe を
-    /// キャッシュへ書いて join_logo_scp に `-inlogo` を渡す。閾値未満なら
-    /// 渡さない（`src/analyze.rs` の doc comment参照）。省略時は従来どおり
+    /// 指定時のみロゴ検出を行い、検出フレーム割合が閾値以上かつ logoframe の
+    /// 出力が空でなければキャッシュへ書いて join_logo_scp に `-inlogo` を渡す。
+    /// それ以外はフォールバックして渡さない（`src/analyze.rs` の doc comment
+    /// `inlogo_decision`参照）。省略時は従来どおり
     /// ロゴ無しの経路のまま（1バイトも変わらない、#97）。
     #[arg(long)]
     pub logo: Option<PathBuf>,

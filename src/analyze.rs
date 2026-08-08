@@ -17,9 +17,10 @@
 //! `-inlogo` は既定では付けない。E14-2（`docs/measurements.md`「ロゴの残存」）で
 //! 判明したとおり、対象素材は delogo 済みでもロゴが実際には残っている場合がある
 //! ため、`--logo <path>`（`.lgd`、`make-logo` で作る）を指定したときだけ自前の
-//! ロゴ検出（`crate::logo`）を通す。検出フレーム割合が閾値未満ならフォールバック
-//! して `-inlogo` を渡さない（[`detect_logo`] の doc comment参照、issue #97）。
-//! `--logo` を省略、または検出が閾値未満の場合は従来どおり付けず、join_logo_scp は
+//! ロゴ検出（`crate::logo`）を通す。検出フレーム割合が閾値未満、または
+//! logoframe の出力が空（[`inlogo_decision`] 参照）ならフォールバックして
+//! `-inlogo` を渡さない（[`detect_logo`] の doc comment参照、issue #97）。
+//! `--logo` を省略、またはフォールバックした場合は従来どおり付けず、join_logo_scp は
 //! 全フレームをロゴ表示中とみなす。
 
 use std::ffi::OsStr;
