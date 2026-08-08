@@ -88,6 +88,14 @@ pub struct AnalyzeArgs {
     /// JL コマンドファイル（既定は `JL_標準.txt`）を差し替える。
     #[arg(long = "jl-file")]
     pub jl_file: Option<PathBuf>,
+
+    /// ロゴ検出に使う `.lgd`（Amatsukaze 形式ロゴデータ、`make-logo` で作る）。
+    /// 指定時のみロゴ検出を行い、検出フレーム割合が閾値以上なら logoframe を
+    /// キャッシュへ書いて join_logo_scp に `-inlogo` を渡す。閾値未満なら
+    /// 渡さない（`src/analyze.rs` の doc comment参照）。省略時は従来どおり
+    /// ロゴ無しの経路のまま（1バイトも変わらない、#97）。
+    #[arg(long)]
+    pub logo: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -225,6 +233,10 @@ pub struct AutoArgs {
     /// （`analyze --jls-set` と同じ、`KEY=VALUE` 形式、繰り返し可）。
     #[arg(long = "jls-set")]
     pub jls_set: Vec<String>,
+
+    /// ロゴ検出に使う `.lgd`（`analyze --logo` と同じ）。
+    #[arg(long)]
+    pub logo: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]

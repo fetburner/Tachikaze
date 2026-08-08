@@ -33,6 +33,29 @@ pub fn aac_fixture_path() -> PathBuf {
     fixture_path_named("sample_aac.mp4")
 }
 
+/// `tests/fixtures/sample_logo.mp4`（H.264 + Opus、疑似ロゴを「本編」区間だけに
+/// 合成。#97 `analyze --logo` E2E 用）の絶対パスを返す。
+#[allow(dead_code)]
+pub fn logo_fixture_path() -> PathBuf {
+    fixture_path_named("sample_logo.mp4")
+}
+
+/// `tests/fixtures/sample_logo_train.mp4`（同上、疑似ロゴを常時合成した学習専用
+/// クリップ。`make-logo` で `.lgd` を作るのに使う）の絶対パスを返す。
+#[allow(dead_code)]
+pub fn logo_train_fixture_path() -> PathBuf {
+    fixture_path_named("sample_logo_train.mp4")
+}
+
+/// `tests/data/sample_logo.dtvi`（`sample_logo.mp4` に対する実 `dtvindex build`
+/// 出力の抜粋。ヘッダ全体 + 先頭40フレーム、`tests/data/sample.dtvi` と同じ
+/// truncation 規則）の絶対パスを返す。`analyze --logo` の E2E が使う偽
+/// `dtvindex` の出力元として使う。
+#[allow(dead_code)]
+pub fn logo_dtvi_path() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/sample_logo.dtvi")
+}
+
 /// 指定したフィクスチャが存在しない場合に true を返す。
 pub fn skip_if_fixture_missing_at(path: &Path) -> bool {
     if path.exists() {

@@ -96,6 +96,8 @@ pub struct AutoConfig {
     pub verify: bool,
     pub jl_file: Option<PathBuf>,
     pub jls_set: Vec<String>,
+    /// `--logo`（`analyze --logo` と同じ、ロゴ検出に使う `.lgd`）。
+    pub logo: Option<PathBuf>,
 }
 
 /// 入力1本の処理結果（失敗は `anyhow::Result::Err` で表す。`commands::run_auto`
@@ -240,6 +242,7 @@ fn process_one(
         cache_dir: config.cache_dir.clone(),
         jls_set: jls_set.to_vec(),
         jl_file: config.jl_file.clone(),
+        logo: config.logo.clone(),
     };
     eprintln!("[auto] analyze: {}", media_path.display());
     let analyze_output = analyze::run(&analyze_config)
@@ -550,6 +553,7 @@ mod tests {
             jl_file: None,
             jls_set: vec![],
             cache_dir: None,
+            logo: None,
         };
         let err = run(&config, Path::new("/a.mp4"))
             .expect_err("--cm-output 指定時の --snap inward は拒否するはず");
@@ -574,6 +578,7 @@ mod tests {
             jl_file: None,
             jls_set: vec![],
             cache_dir: None,
+            logo: None,
         };
         let err = run(&config, Path::new("/nonexistent-for-auto-test.mp4"))
             .expect_err("入力が無いのでエラーになるはず");
@@ -597,6 +602,7 @@ mod tests {
             jl_file: None,
             jls_set: vec![],
             cache_dir: None,
+            logo: None,
         };
         let err = run(&config, Path::new("/a.mp4")).expect_err("-o - は拒否するはず");
         assert!(err.to_string().contains("-o/--output"));
@@ -616,6 +622,7 @@ mod tests {
             jl_file: None,
             jls_set: vec![],
             cache_dir: None,
+            logo: None,
         };
         let err = run(&config, Path::new("/a.mp4")).expect_err("--cm-output - は拒否するはず");
         assert!(err.to_string().contains("--cm-output"));
@@ -635,6 +642,7 @@ mod tests {
             jl_file: None,
             jls_set: vec!["not-key-value".to_string()],
             cache_dir: None,
+            logo: None,
         };
         let err = run(&config, Path::new("/nonexistent-for-auto-test.mp4"))
             .expect_err("--jls-set の形式不正は事前に拒否するはず");

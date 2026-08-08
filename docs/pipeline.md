@@ -63,7 +63,12 @@ Amatsukaze 側では `-o` ではなく **stdout** を別に解析している（
 
 ### logoframe の出力（= join_logo_scp の `-inlogo`）
 
-**本ツールでは使わない**（delogo 済みのため）。形式は参考として記録する。Amatsukaze の `LogoScan.hpp:1818` が生成:
+**既定では使わない。`analyze --logo <path>` を指定したときだけ使う**（E14、#89）。
+当初は「対象は delogo 済みのため原理的に不可」としていたが、E14-2 の実測
+（`docs/measurements.md`「ロゴの残存」）でこの前提が誤りだと判明した
+（確認した4局はいずれもロゴが実際には残っていた）。形式そのものは
+Amatsukaze の `LogoScan.hpp:1818` が生成するもので、自前実装（`src/logo/`、
+`src/analyze.rs::detect_logo`）もこの形式でファイルを書く:
 
 ```
   1234 S 0 ALL   1220   1250     ← ロゴ開始: 最良位置 1234、可能性範囲 1220〜1250
@@ -72,7 +77,7 @@ Amatsukaze 側では `-o` ではなく **stdout** を別に解析している（
 
 最良位置だけでなく**可能性の範囲**を渡すのが要点。join_logo_scp 側は `rise` / `rise_l` / `rise_r` / `fall` / `fall_l` / `fall_r` として受け取る（`JlsDataset::displayLogo()` のデバッグ出力で確認できる）。
 
-`-inlogo` を省略すると join_logo_scp は**全フレームがロゴ表示中とみなす**。よって `:L` ラベルは「ロゴあり」ではなく「情報なし」を意味する。
+`-inlogo` を省略すると join_logo_scp は**全フレームがロゴ表示中とみなす**。よって `:L` ラベルは「ロゴあり」ではなく「情報なし」を意味する。`--logo` を指定してもロゴの検出フレーム割合が閾値未満なら、自前実装は誤ったロゴ情報で判定を崩すより現状維持を優先し `-inlogo` を渡さない（`src/analyze.rs::detect_logo` の doc comment参照）。
 
 ### join_logo_scp の `-o` 出力（Trim）
 

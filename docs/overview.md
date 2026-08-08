@@ -35,13 +35,13 @@ Amatsukaze は MPEG2-TS を入力して CM カットとエンコードを行い 
 - 音声パケットの区間選択とドリフト補正
 - **CM 側（除去した区間）の別ファイル出力**（検出が切りすぎていないかの目視確認用）
 - 自己検証（パケット数・表示順の連続性・同期サンプル）
+- ロゴ検出（`make-logo` で `.lgd` を作り、`analyze --logo` で join_logo_scp の `-inlogo` に渡す。Amatsukaze の相関方式を移植。[E14](https://github.com/fetburner/Tachikaze/issues/89)）
 
 **作らないもの**
 
 | 項目 | 理由 |
 |---|---|
 | CM 検出アルゴリズム | chapter_exe + join_logo_scp が担当 |
-| ロゴ検出 | 現状は自前実装していない（[E14](https://github.com/fetburner/Tachikaze/issues/89) で実装中）。旧記述「delogo 済み mp4 では原理的に使えない」は実測していない仮定だった。実際には残っている入力がある（確認した4局はいずれも残存。未確認の局・解像度にまで一般化できるかは不明。[measurements.md](measurements.md)「ロゴの残存」） |
 | 映像の再エンコード | 数秒の CM 残りを許容する方針のため不要 |
 | 音声の再エンコード | 継ぎ目のノイズは残存 CM の範囲に収まるため無視可 |
 | チャプター生成 | dtvindex に実装済み（`create_join_logo_scp_chapters`） |

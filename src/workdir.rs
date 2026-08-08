@@ -6,7 +6,8 @@
 //! 800 MB 級のファイルでもコピーは発生しない。
 //!
 //! 中間ファイルの名前（`work.mp4` / `work.mp4.dtvi` / `scp.txt` / `trim.avs` /
-//! `detail.jls` / `work.mp4.segmap.json`）はこのモジュールに集約し、他のモジュールは
+//! `detail.jls` / `work.mp4.segmap.json` / `logoframe.txt`）はこのモジュールに
+//! 集約し、他のモジュールは
 //! `WorkDir` のアクセサ、または `cut` 専用の [`cached_segment_map_path`]（`.dtvi` の
 //! [`cached_dtvi_path`] と同じ理由。`cut` は `WorkDir` を作らないため）経由でのみ
 //! パスを得る。
@@ -39,6 +40,10 @@ const SCP_FILE_NAME: &str = "scp.txt";
 const TRIM_FILE_NAME: &str = "trim.avs";
 const DETAIL_JLS_FILE_NAME: &str = "detail.jls";
 const SEGMENT_MAP_FILE_NAME: &str = "work.mp4.segmap.json";
+/// `--logo` 指定時、ロゴ検出結果（logoframe 形式）を書くファイル名
+/// （`join_logo_scp -inlogo` に渡す。E14-8、#97）。検出割合が閾値未満の場合は
+/// 書かない（`src/analyze.rs` の doc comment参照）。
+const LOGOFRAME_FILE_NAME: &str = "logoframe.txt";
 /// `prepare` が作る、elst 除去・字幕トラック除去後のメディアのファイル名。
 const INPUT_PREPARED_FILE_NAME: &str = "input_prepared.mp4";
 /// `prepare` が作る字幕サイドカーのベース名。拡張子（`ass` / `srt`）は
@@ -151,6 +156,13 @@ impl WorkDir {
     /// `detail.jls` のパス（`join_logo_scp -oscp` の出力）。
     pub fn detail_jls_path(&self) -> PathBuf {
         self.path.join(DETAIL_JLS_FILE_NAME)
+    }
+
+    /// `logoframe.txt` のパス（`--logo` 指定時、ロゴ検出結果を
+    /// `join_logo_scp -inlogo` に渡すために書く。`src/analyze.rs` の
+    /// doc comment参照。検出割合が閾値未満なら実際には書かれない）。
+    pub fn logoframe_path(&self) -> PathBuf {
+        self.path.join(LOGOFRAME_FILE_NAME)
     }
 
     /// 処理完了時に呼ぶ。
@@ -567,6 +579,10 @@ mod tests {
         assert_eq!(
             work.detail_jls_path().file_name().unwrap(),
             DETAIL_JLS_FILE_NAME
+        );
+        assert_eq!(
+            work.logoframe_path().file_name().unwrap(),
+            LOGOFRAME_FILE_NAME
         );
         work.finish(true);
         fs::remove_dir_all(&input_dir).ok();
