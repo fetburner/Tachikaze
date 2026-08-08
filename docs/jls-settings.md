@@ -12,7 +12,7 @@ join_logo_scp -inscp scp.txt -incmd JL/JL_標準.txt -o trim.avs -oscp detail.jl
               -set param_cuttr 1
 ```
 
-`-inlogo` は既定では付けない。省略すると全フレームがロゴ表示中とみなされる。`analyze --logo <path.lgd>` を指定すると自前実装のロゴ検出（`src/logo/`）を通し、検出フレーム割合が閾値以上のときだけ `-inlogo` を渡す（E14-8、#97、詳細は `src/analyze.rs::detect_logo` の doc comment）。当初「対象は delogo 済みのため `-inlogo` は原理的に使えない」としていたが、E14-2 の実測（[measurements.md](measurements.md)「ロゴの残存」）でこの前提が誤りだと判明し、この機能を追加した。**ロゴを渡した状態での join_logo_scp のチューニングは未実測**（[E14-9](https://github.com/fetburner/Tachikaze/issues/98)）。この節の残りの実測（`autocm_sub`/`param_cuttr` 等）はいずれもロゴ無し（`-inlogo` 省略）の状態で得たもの。
+`-inlogo` は既定では付けない。省略すると全フレームがロゴ表示中とみなされる。`analyze --logo <path.lgd>` を指定すると自前実装のロゴ検出（`src/logo/`）を通し、検出フレーム割合が閾値以上、かつ logoframe テキストが空でないときだけ `-inlogo` を渡す（E14-8、#97、詳細は `src/analyze.rs::detect_logo`/`inlogo_decision` の doc comment）。割合だけでは判定できない（`logo_frames` の数え上げと `text` の出力は別経路のため、割合が閾値以上でも `text` が空になるケースがある）。当初「対象は delogo 済みのため `-inlogo` は原理的に使えない」としていたが、E14-2 の実測（[measurements.md](measurements.md)「ロゴの残存」）でこの前提が誤りだと判明し、この機能を追加した。**ロゴを渡した状態での join_logo_scp のチューニングは未実測**（[E14-9](https://github.com/fetburner/Tachikaze/issues/98)）。この節の残りの実測（`autocm_sub`/`param_cuttr` 等）はいずれもロゴ無し（`-inlogo` 省略）の状態で得たもの。
 
 ### `autocm_sub` : 10 → 11（先頭の CM を切る）
 

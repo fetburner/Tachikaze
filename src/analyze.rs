@@ -113,11 +113,22 @@ pub struct AnalyzeOutput {
 /// の存在確認や作業ディレクトリの作成（既定のキャッシュディレクトリ使用時は
 /// 入力の `canonicalize` を伴う）より前に、探索場所を列挙したエラーで早期に
 /// 失敗させるため（`run_propagates_tool_resolution_failure_with_searched_locations`
-/// が実在しない入力パスでこの順序を検証している）。
+/// が実在しない入力パスでこの順序を検証している）。`--logo` 指定時は ffmpeg の
+/// 解決と `.lgd` の存在確認もここで行う（レビュー指摘: 以前は
+/// [`detect_logo`] の中、つまり dtvindex/chapter_exe の実行後にあったため、
+/// `.lgd` のパスを打ち間違えても外部プロセス2本ぶん待たされてから失敗して
+/// いた）。
 pub fn run(config: &AnalyzeConfig) -> Result<AnalyzeOutput> {
     let dtvindex_path = tools::resolve_tool(DTVINDEX)?;
     let chapter_exe_path = tools::resolve_tool(CHAPTER_EXE)?;
     let join_logo_scp_path = tools::resolve_tool(JOIN_LOGO_SCP)?;
+    let ffmpeg_path = match &config.logo {
+        Some(lgd_path) => {
+            fs::metadata(lgd_path).path_ctx("--logo で指定された .lgd の確認", lgd_path)?;
+            Some(tools::resolve_tool(FFMPEG)?)
+        }
+        None => None,
+    };
 
     let work = WorkDir::new(config.cache_dir.as_deref(), &config.input)?;
     let result = run_pipeline(
@@ -126,6 +137,7 @@ pub fn run(config: &AnalyzeConfig) -> Result<AnalyzeOutput> {
         &dtvindex_path,
         &chapter_exe_path,
         &join_logo_scp_path,
+        ffmpeg_path.as_deref(),
     );
     work.finish(result.is_ok());
     result
@@ -137,6 +149,7 @@ fn run_pipeline(
     dtvindex_path: &Path,
     chapter_exe_path: &Path,
     join_logo_scp_path: &Path,
+    ffmpeg_path: Option<&Path>,
 ) -> Result<AnalyzeOutput> {
     let work_mp4 = work.link_input(&config.input)?;
     let dtvi_path = work.dtvi_path();
@@ -194,6 +207,15 @@ fn run_pipeline(
     // 必ず join_logo_scp の起動前に済ませる）。
     let inlogo_path = match &config.logo {
         Some(lgd_path) => {
+            // `run()` が `--logo` 指定時に必ず ffmpeg を解決してから
+            // `run_pipeline` を呼ぶため、ここで `None` になることは無い
+            // （`run_pipeline` は `run()` からしか呼ばれない private 関数）。
+            let ffmpeg_path = ffmpeg_path.ok_or_else(|| {
+                anyhow!(
+                    "内部エラー: --logo 指定時に ffmpeg_path が解決されていません\
+                     （run() の実装を確認してください）"
+                )
+            })?;
             let dtvi_content_for_logo = fs::read_to_string(&dtvi_path).path_ctx(
                 "dtvindex が生成した .dtvi の読み込み（ロゴ検出用）",
                 &dtvi_path,
@@ -201,6 +223,7 @@ fn run_pipeline(
             let dtvi_for_logo = dtvi::parse(&dtvi_content_for_logo)
                 .map_err(|err| anyhow!("生成された .dtvi のパースに失敗しました: {err}"))?;
             detect_logo(
+                ffmpeg_path,
                 lgd_path,
                 &work_mp4,
                 work.path(),
@@ -279,18 +302,32 @@ fn run_pipeline(
 /// （[`run_pipeline`]）はこの時点でまだ `join_logo_scp` を起動していないため、
 /// この検査は必ず起動前に効く。
 ///
-/// 検出フレーム割合が閾値（[`logo_detection_threshold`]）以上なら logoframe
-/// テキストを `logoframe_path` に書いてそのパスを返す。閾値未満なら書かずに
-/// `None` を返し、理由を stderr に出す（誤ったロゴ情報で判定を崩すより現状
-/// 維持に倒す。issue #97「フォールバック」）。
+/// 検出フレーム割合が閾値（[`logo_detection_threshold`]）以上、**かつ**
+/// `LogoIntervals::text` が空でない場合にだけ logoframe テキストを
+/// `logoframe_path` に書いてそのパスを返す。
+///
+/// `logo_frames`（`Judgement::HasLogo` の数え上げ）と `text`（`build_text` の
+/// 出力）は別経路で計算される。`build_text` は精緻化の結果 `s_end >= e_end`
+/// になった区間を出力しないため、**検出割合が閾値以上でも `text` が空文字列に
+/// なりうる**（`logo::interval` のモジュール doc comment「呼び出し側への委譲」
+/// 節）。ここで `text` が空でないことも確認しないと、空の logoframe ファイルを
+/// 書いて `-inlogo` として渡してしまう。join_logo_scp は `-inlogo` を渡されて
+/// ロゴ情報が無ければ警告を出して全フレームをロゴ表示中として扱うため
+/// （issue #97「罠」）、これは避ける。
+///
+/// いずれかの条件を満たさない場合は書かずに `None` を返し、理由を stderr に
+/// 出す（誤ったロゴ情報で判定を崩すより現状維持に倒す。issue #97
+/// 「フォールバック」）。このとき、以前の実行でキャッシュに残っている
+/// `logoframe_path` があれば削除する（`-inlogo` には渡らないため実害は無いが、
+/// キャッシュを覗いたときに紛らわしいため）。
 fn detect_logo(
+    ffmpeg_path: &Path,
     lgd_path: &Path,
     work_mp4: &Path,
     cwd: &Path,
     dtvi: &Dtvi,
     logoframe_path: &Path,
 ) -> Result<Option<PathBuf>> {
-    let ffmpeg_path = tools::resolve_tool(FFMPEG)?;
     let logo_data = lgd::read(lgd_path)?;
     let mask = score::LogoMask::new(&logo_data)
         .map_err(|err| anyhow!(".lgd からロゴマスクを構築できませんでした: {err}"))?;
@@ -301,7 +338,7 @@ fn detect_logo(
 
     let mut scores: Vec<(f32, f32)> = Vec::new();
     frames::stream_luma_frames(
-        &ffmpeg_path,
+        ffmpeg_path,
         work_mp4,
         cwd,
         rect,
@@ -328,27 +365,100 @@ fn detect_logo(
     };
     let threshold = logo_detection_threshold(duration_seconds);
 
-    if fraction >= threshold {
-        fs::write(logoframe_path, &result.text)
-            .path_ctx("logoframe ファイルの書き出し", logoframe_path)?;
-        eprintln!(
-            "[analyze] ロゴ検出: {}/{}フレーム（割合 {:.3}、閾値 {:.3}）。\
-             logoframe を書き出しました: {}",
-            result.logo_frames,
-            result.total_frames,
-            fraction,
-            threshold,
-            logoframe_path.display()
-        );
-        Ok(Some(logoframe_path.to_path_buf()))
+    match inlogo_decision(fraction, threshold, &result.text) {
+        InlogoDecision::Use => {
+            fs::write(logoframe_path, &result.text)
+                .path_ctx("logoframe ファイルの書き出し", logoframe_path)?;
+            eprintln!(
+                "[analyze] ロゴ検出: {}/{}フレーム（割合 {:.3}、閾値 {:.3}）。\
+                 logoframe を書き出しました: {}",
+                result.logo_frames,
+                result.total_frames,
+                fraction,
+                threshold,
+                logoframe_path.display()
+            );
+            Ok(Some(logoframe_path.to_path_buf()))
+        }
+        InlogoDecision::FallbackEmptyText => {
+            // logo_frames の割合は閾値以上だが、build_text の精緻化で全区間が
+            // 捨てられ text が空になったケース（上の doc comment参照）。
+            // fraction 未満の通常フォールバックとは原因が違うので、メッセージを
+            // 分けて残す（実際に起きたときに原因の切り分けができるように）。
+            eprintln!(
+                "[analyze] ロゴ検出割合は閾値以上ですが、区間の精緻化後に text が空に\
+                 なったため -inlogo を渡しません（割合 {fraction:.3} >= 閾値 {threshold:.3}、\
+                 検出 {}/{}フレーム、logoframe の区間数 0）。空の logoframe を\
+                 join_logo_scp に渡すと警告の上で全フレームをロゴ表示中として\
+                 扱われてしまうため、渡しません。",
+                result.logo_frames, result.total_frames
+            );
+            clear_stale_logoframe(logoframe_path);
+            Ok(None)
+        }
+        InlogoDecision::FallbackBelowThreshold => {
+            eprintln!(
+                "[analyze] ロゴ検出割合が閾値未満のため -inlogo を渡しません（割合 {fraction:.3} \
+                 < 閾値 {threshold:.3}、検出 {}/{}フレーム）。誤ったロゴ情報で判定を崩すより\
+                 現状維持（ロゴ無し）に倒します。",
+                result.logo_frames, result.total_frames
+            );
+            clear_stale_logoframe(logoframe_path);
+            Ok(None)
+        }
+    }
+}
+
+/// [`inlogo_decision`] の結果。`-inlogo` を渡すかどうかと、渡さない場合の
+/// 原因を区別する（原因ごとに stderr のメッセージを分けるため）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InlogoDecision {
+    /// `-inlogo` を渡す（`fraction >= threshold` かつ `text` が空でない）。
+    Use,
+    /// `fraction >= threshold` だが `text` が空だったため渡さない
+    /// （`build_text` が `s_end >= e_end` の区間を出力しないことによる。
+    /// `logo_interval` のモジュール doc comment参照）。
+    FallbackEmptyText,
+    /// `fraction < threshold` のため渡さない（通常のフォールバック）。
+    FallbackBelowThreshold,
+}
+
+/// `-inlogo` を渡すかどうかを決める（issue #97「フォールバック」、レビュー
+/// 指摘: `fraction >= threshold` だけでは `text` が空のケースを見落とす）。
+///
+/// プロセス（ffmpeg 等）を起動せずに検証できるよう、`detect_logo` から分離した
+/// 純粋関数にしている。
+fn inlogo_decision(fraction: f64, threshold: f64, text: &str) -> InlogoDecision {
+    if fraction < threshold {
+        InlogoDecision::FallbackBelowThreshold
+    } else if text.trim().is_empty() {
+        InlogoDecision::FallbackEmptyText
     } else {
-        eprintln!(
-            "[analyze] ロゴ検出割合が閾値未満のため -inlogo を渡しません（割合 {fraction:.3} \
-             < 閾値 {threshold:.3}、検出 {}/{}フレーム）。誤ったロゴ情報で判定を崩すより\
-             現状維持（ロゴ無し）に倒します。",
-            result.logo_frames, result.total_frames
-        );
-        Ok(None)
+        InlogoDecision::Use
+    }
+}
+
+/// フォールバック（`-inlogo` を渡さない）ときに、以前の実行でキャッシュに
+/// 残っている `logoframe_path` を削除する。`-inlogo` には渡らないため実害は
+/// 無いが、キャッシュを覗いたときに古い検出結果が残っていると紛らわしい
+/// （レビュー指摘、issue #97）。削除に失敗しても `detect_logo` 自体は失敗
+/// させない（`clear_stale_cached_segment_map`、`src/commands.rs` と同じ扱い）。
+fn clear_stale_logoframe(logoframe_path: &Path) {
+    match fs::remove_file(logoframe_path) {
+        Ok(()) => {
+            eprintln!(
+                "[analyze] 古い logoframe を削除しました: {}",
+                logoframe_path.display()
+            );
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            eprintln!(
+                "[analyze] 古い logoframe の削除に失敗しました（警告のみ、処理は続行します）: \
+                 {} ({err})",
+                logoframe_path.display()
+            );
+        }
     }
 }
 
@@ -755,6 +865,119 @@ mod tests {
             LOGO_DETECTION_THRESHOLD
         );
         assert_eq!(logo_detection_threshold(3600.0), LOGO_DETECTION_THRESHOLD);
+    }
+
+    // --- inlogo_decision: レビュー指摘（fraction >= threshold でも text が
+    // 空になりうる）の防御 ---
+
+    #[test]
+    fn inlogo_decision_uses_inlogo_when_fraction_and_text_are_both_ok() {
+        assert_eq!(
+            inlogo_decision(0.5, LOGO_DETECTION_THRESHOLD, "0 S 0 ALL 0 0\n"),
+            InlogoDecision::Use
+        );
+    }
+
+    #[test]
+    fn inlogo_decision_falls_back_when_fraction_below_threshold() {
+        assert_eq!(
+            inlogo_decision(0.05, LOGO_DETECTION_THRESHOLD, "0 S 0 ALL 0 0\n"),
+            InlogoDecision::FallbackBelowThreshold
+        );
+    }
+
+    #[test]
+    fn inlogo_decision_falls_back_when_text_is_empty_even_if_fraction_is_high() {
+        // fraction が閾値以上でも text が空（＝build_text が区間を1つも
+        // 出力しなかった）なら Use にしてはいけない。
+        assert_eq!(
+            inlogo_decision(0.96, LOGO_DETECTION_THRESHOLD, ""),
+            InlogoDecision::FallbackEmptyText
+        );
+        // 空白だけの文字列も「空」とみなす。
+        assert_eq!(
+            inlogo_decision(0.96, LOGO_DETECTION_THRESHOLD, "  \n"),
+            InlogoDecision::FallbackEmptyText
+        );
+    }
+
+    #[test]
+    fn inlogo_decision_below_threshold_takes_priority_over_empty_text_label() {
+        // fraction が閾値未満で text も空の場合、原因は「閾値未満」であって
+        // 「text が空」ではない（メッセージの正しさの確認）。
+        assert_eq!(
+            inlogo_decision(0.0, LOGO_DETECTION_THRESHOLD, ""),
+            InlogoDecision::FallbackBelowThreshold
+        );
+    }
+
+    /// レビューで再現された不具合の再現テスト: `logo_frames` の数え上げ
+    /// （割合 96.2%、閾値 0.1 を大きく上回る）に対して `build_text` の出力
+    /// （`text`）が空になるスコア分布を作り、それでも `inlogo_decision` が
+    /// `Use` を返さないことを確認する。
+    ///
+    /// スコアは `scores[i] = (4.4, 0.0)`（21 の倍数の位置）/ `(0.0, 0.0)`
+    /// （それ以外）を 600 フレーム分、fps は本ツールの既定値 30000/1001 で
+    /// 作る（レビューコメントの再現条件そのもの）。`(4.4, 0.0)` は
+    /// `raw = corr0.max(0.0) + corr1.min(0.0) = 4.4` という強い「ロゴあり」
+    /// スコアだが、21 フレームに1回しか出ないスパイクのため 1 秒移動平均
+    /// （`AVG_DUR_SEC = 1.0`、fps ≈ 30 なので窓は約31フレーム）に均されると
+    /// `THRESH = 0.2` を超えず、MinMax 判定（前後 0.5 秒の最大値の小さい方）
+    /// だけがロゴありと判定してしまう区間ができる。この食い違いが
+    /// `fill_unknown_runs` の穴埋め結果と `build_text` の精緻化の間でずれ、
+    /// `s_end >= e_end` になった区間が出力から丸ごと落ちる。
+    #[test]
+    fn detect_logo_fallback_reproduces_review_case_high_fraction_empty_text() {
+        const N: usize = 600;
+        let scores: Vec<(f32, f32)> = (0..N)
+            .map(|i| if i % 21 == 0 { (4.4, 0.0) } else { (0.0, 0.0) })
+            .collect();
+        let fps = 30000.0 / 1001.0;
+
+        let result = logo_interval::write_result(&scores, fps);
+
+        // レビューの再現条件どおり: logo_frames の割合は閾値を大きく上回るが
+        // text は空になる。
+        let fraction = result.logo_frames as f64 / result.total_frames as f64;
+        assert!(
+            fraction >= LOGO_DETECTION_THRESHOLD,
+            "再現条件が崩れている（割合 {fraction} が閾値 {LOGO_DETECTION_THRESHOLD} 未満）"
+        );
+        assert!(
+            result.text.trim().is_empty(),
+            "再現条件が崩れている（text が空でない: {:?}）",
+            result.text
+        );
+
+        // この入力に対して inlogo_decision が Use を返してはいけない
+        // （空の logoframe を書いて -inlogo として渡してしまうバグの防御）。
+        assert_eq!(
+            inlogo_decision(fraction, LOGO_DETECTION_THRESHOLD, &result.text),
+            InlogoDecision::FallbackEmptyText,
+            "fraction が閾値以上でも text が空なら Use にしてはいけない"
+        );
+    }
+
+    // --- clear_stale_logoframe: フォールバック時の残骸削除 ---
+
+    #[test]
+    fn clear_stale_logoframe_removes_existing_file() {
+        let dir = unique_scratch_dir("clear-stale-logoframe");
+        let path = dir.join("logoframe.txt");
+        fs::write(&path, "0 S 0 ALL 0 0\n0 E 0 ALL 0 0\n").unwrap();
+        clear_stale_logoframe(&path);
+        assert!(!path.exists(), "既存の logoframe.txt が削除されているはず");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn clear_stale_logoframe_is_a_noop_when_file_does_not_exist() {
+        // ファイルが元々無い場合はエラーにならない（panic しないことの確認）。
+        let dir = unique_scratch_dir("clear-stale-logoframe-missing");
+        let path = dir.join("logoframe.txt");
+        clear_stale_logoframe(&path);
+        assert!(!path.exists());
+        fs::remove_dir_all(&dir).ok();
     }
 
     // --- run(): resolve_tool のエラーがそのまま伝播することの確認 ---

@@ -36,11 +36,19 @@ tachikaze analyze IN.mp4 [-o trim.avs|-] [--report] [--cache-dir DIR]
                                    の `detect_logo`）を行い、検出フレーム割合が
                                    閾値（既定 0.1、映像長7分以下は 0.03。
                                    Amatsukaze `CMAnalyze.hpp:301` と同じ規則）
-                                   以上なら logoframe をキャッシュへ書いて
-                                   `-inlogo` を 3 に渡す（`-set` 群より前に置く。
-                                   E14-8、#97）。閾値未満なら `-inlogo` を渡さず
+                                   以上、かつ logoframe テキスト（`logo::interval`
+                                   の `build_text`）が空でない場合にだけ logoframe
+                                   をキャッシュへ書いて `-inlogo` を 3 に渡す
+                                   （`-set` 群より前に置く。E14-8、#97）。割合が
+                                   閾値未満、または割合は閾値以上でも精緻化で
+                                   text が空になった場合は `-inlogo` を渡さず
                                    3 へ進む（誤ったロゴ情報で判定を崩すより現状
-                                   維持）。`.dtvi` の `frame_count` と読み取った
+                                   維持。`logo_frames`（判定の数え上げ）と
+                                   `text`（`build_text` の出力）は別経路のため、
+                                   割合だけでは text が空のケースを見落とす。
+                                   `src/analyze.rs::inlogo_decision`）。フォール
+                                   バック時はキャッシュに残る古い logoframe.txt
+                                   を削除する。`.dtvi` の `frame_count` と読み取った
                                    フレーム数が食い違う場合は 3 を実行せず中断
                                    する（CLAUDE.md 罠3、この検査は省略不可）
     4. --report で以下を stderr に出力
