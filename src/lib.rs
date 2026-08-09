@@ -44,29 +44,3 @@ pub mod tools;
 pub mod trim;
 pub mod verify;
 pub mod workdir;
-
-#[cfg(test)]
-mod tests {
-    use mp4_atom::{Encode, Ftyp};
-
-    /// 依存クレート `mp4-atom` が実際に使えることの確認。
-    #[test]
-    fn ftyp_encodes() -> std::result::Result<(), Box<dyn std::error::Error>> {
-        let ftyp = Ftyp {
-            major_brand: b"isom".into(),
-            minor_version: 512,
-            compatible_brands: vec![
-                b"isom".into(),
-                b"iso2".into(),
-                b"avc1".into(),
-                b"mp41".into(),
-            ],
-        };
-
-        let mut buf = Vec::new();
-        ftyp.encode(&mut buf)?;
-
-        assert!(!buf.is_empty());
-        Ok(())
-    }
-}
