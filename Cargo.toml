@@ -3,6 +3,11 @@ name = "tachikaze"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
+description = "Lossless CM cutting for already-converted mp4 recordings (no re-encode)"
+repository = "https://github.com/fetburner/Tachikaze"
+readme = "README.md"
+keywords = ["mp4", "video", "cm-cut", "lossless"]
+categories = ["command-line-utilities", "multimedia"]
 
 [dependencies]
 anyhow = "1.0.104"
