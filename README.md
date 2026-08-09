@@ -2,7 +2,16 @@
 
 mp4 に変換済みの録画ファイルを、**再エンコードせずに CM カット**するツールです。
 
-CM 検出は既存ツール（chapter_exe → join_logo_scp）に任せ、本ツールは「Trim リスト → ロスレス出力」を担います。
+## Amatsukaze について
+
+本プロジェクトは [nekopanda/Amatsukaze](https://github.com/nekopanda/Amatsukaze) に**強く影響を受けています**。Amatsukaze は MPEG2-TS を入力に CM カットとエンコードを行い mp4 を出力する、録画まわりの定番ツールです。Tachikaze は次のような動機から始まっています。
+
+- **一度 mp4 にしてしまった録画**にも、Amatsukaze 流の CM カットを後から適用したい
+- 同じ系統の処理を **macOS / Linux でも動かしたい**（Amatsukaze 本体は Windows 向けで、移植対象にはしていない）
+
+パイプラインの考え方（無音・シーンチェンジ検出 → join_logo_scp 系の判定 → Trim に基づくカット）、ロゴ検出まわりの設計など、実装面でも Amatsukaze と周辺エコシステムから多くを学んでいます。Amatsukaze および作者の Nekopanda 氏、関連ツール作者の方々に感謝します。
+
+Tachikaze 本体が担うのは主に「Trim リスト → ロスレスな mp4 切り出し」です。CM 検出自体は既存ツール（chapter_exe → join_logo_scp）に任せます。
 
 ## 最短の使い方
 
@@ -69,6 +78,13 @@ $ make install          # 既定は /usr/local。PREFIX=$HOME/.local も可
 | [docs/docker.md](docs/docker.md) | Docker で使う方法 |
 | [docs/toolchain-macos.md](docs/toolchain-macos.md) | 外部ツールのビルドとインストール |
 
-## ライセンス
+## ライセンスと帰属
 
-本体は [MIT](LICENSE) です。外部ツール・移植コードの表記は [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) を参照してください（GPL の外部ツールは子プロセスとして起動するだけです）。
+- **Tachikaze 本体**は [MIT](LICENSE) です（Copyright (c) 2026 Masayuki Mizuno）。
+- **Amatsukaze 本体は移植していません。** Windows API 依存が大きく、アルゴリズムやパイプラインの**参照元・着想源**として扱っています（[docs/overview.md](docs/overview.md)）。
+- **ロゴ検出の一部は Amatsukaze 由来の MIT コードを移植しています。**  
+  `src/logo/score.rs` / `src/logo/interval.rs` は Amatsukaze の `LogoScan.hpp` 等に基づく移植で、原典どおり MIT（Copyright (c) 2017-2019 Nekopanda）。著作権表示とライセンス文の保持義務に従っています。
+- **ライセンスが不明な delogo 由来のコード（MakKi 氏）は移植していません。** 該当処理は数式から書き下ろしています（詳細は [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)）。
+- **実行時に呼ぶ外部ツール**（chapter_exe / join_logo_scp / dtvindex / ffmpeg）は GPL 系が多いですが、**別プロセスとして起動するだけ**で、リンクや同一アドレス空間の共有はありません。したがって本体の MIT には及びません。受け渡しはファイルとコマンドライン引数のみです。
+
+表記の詳細・根拠は [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) にまとめています。Docker イメージを配布する場合は外部ツール同梱の条件が別途付くため、現状は Dockerfile の公開にとどめています。
