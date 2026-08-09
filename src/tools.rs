@@ -48,14 +48,6 @@ fn is_executable_file(path: &Path) -> bool {
     path.is_file()
 }
 
-/// パスが読み取り専用データファイルとして使えるかを判定する。
-///
-/// 実行権限は問わない（データファイルなので）。[`is_executable_file`] とは
-/// 判定基準が異なるため別関数にしている。
-fn is_regular_file(path: &Path) -> bool {
-    path.is_file()
-}
-
 /// `PATH` の探索で実際に調べた候補パスを記録しつつ、最初の当たりを返す。
 #[derive(Debug, Default)]
 struct SearchTrace {
@@ -67,10 +59,6 @@ struct SearchTrace {
 }
 
 impl SearchTrace {
-    fn new() -> Self {
-        Self::default()
-    }
-
     /// `PATH` に列挙された各ディレクトリを順に調べる。
     fn try_path_env(&mut self, name: &str) -> Option<PathBuf> {
         let Some(path_var) = env::var_os("PATH") else {
@@ -126,7 +114,7 @@ impl SearchTrace {
 /// 列挙したエラーを返す。`ffprobe` のように必須ではないツールは、呼び出し側で
 /// `Result` を見て `.ok()` などに変換し、警告に留めるかどうかを判断する。
 pub fn resolve_tool(name: &str) -> Result<PathBuf> {
-    let mut trace = SearchTrace::new();
+    let mut trace = SearchTrace::default();
     let found = trace
         .try_path_env(name)
         .ok_or_else(|| trace.not_found_error(name))?;
@@ -167,7 +155,7 @@ pub fn default_jl_command_file(join_logo_scp_path: &Path) -> Result<PathBuf> {
         });
 
     if let Some(candidate) = &candidate {
-        if is_regular_file(candidate) {
+        if candidate.is_file() {
             return Ok(candidate.clone());
         }
     }
