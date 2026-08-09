@@ -7,3 +7,7 @@
 /tests/fixtures/sample_elst_aac.mp4
 /tests/fixtures/sample_logo.mp4
 /tests/fixtures/sample_logo_train.mp4
+/tests/fixtures/sample_CMcut.mp4
+/tests/fixtures/sample_partial.mp4
+/tests/fixtures/*_CMcut.mp4
+.claude/
