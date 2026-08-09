@@ -5,9 +5,13 @@ on:
     branches: [master]
   pull_request:
 
+# 本 CI は fmt / clippy / 単体テストのみで
+# 外部3ツールや ffmpeg も要らないため、1 vCPU の ubuntu-slim で足りる。
+# 制約: ジョブ上限 15 分・特権操作不可（Docker-in-Docker 等）。
+# コールドビルドが 15 分に近づくようなら ubuntu-latest に戻す。
 jobs:
   test:
-    runs-on: macos-latest
+    runs-on: ubuntu-slim
     steps:
       - uses: actions/checkout@v4
 
