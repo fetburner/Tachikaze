@@ -14,7 +14,7 @@ Linux (arm64) で**実際に `docker build` / `docker run` を実行して確認
 | `dtvindex` の Linux ビルド | ✓ 無修正 |
 | `chapter_exe` の Linux ビルド | ✓ **無修正**（[toolchain-macos.md](toolchain-macos.md) の3点パッチはいずれも不要。下記「macOS の3点パッチが不要だった理由」） |
 | `chapter_exe -v` の起動ログ | `AviSynth=enabled, dtvindex=enabled`、`Motion SIMD: NEON`（SSE2 用パッチなしで NEON が自動選択される） |
-| `cargo build --release --locked`（tachikaze 本体） | ✓（`rustup` で入れた stable、Ubuntu 24.04 上） |
+| `cargo build --release --locked`（tachikaze 本体） | ✓（公式 `rust:1-trixie` イメージ上） |
 | `docker build -t tachikaze .` | ✓ arm64 で通る（`--no-cache` で初回ビルド約1分27秒、レイヤーキャッシュ後は数秒） |
 | `docker run` での `auto` 一連動作（`tests/fixtures/sample.mp4`、`--cache-dir` 使用） | ✓（`prepare`→`analyze`→gate→`cut`→自己検証→`--verify` の CRC32 検証まで完走） |
 | `cut --cache-dir` のみ（`--dtvi` 省略）での `.dtvi` 自動解決 | ✓（`analyze` が作ったキャッシュから `cut` が自動的に見つける） |
@@ -38,7 +38,7 @@ runtime ステージを `gcr.io/distroless/cc-debian12` に変えられないか
 
 ### 1. `ldd` で共有ライブラリの依存数を数えた
 
-現行の `ubuntu:24.04` ベースの runtime イメージ上で、6バイナリすべてに `ldd` を実行した:
+当時の `ubuntu:24.04` ベースの runtime イメージ上で、6バイナリすべてに `ldd` を実行した:
 
 | バイナリ | 動的リンクしている共有ライブラリの数（`ldd` の実行結果、重複除去後） |
 |---|---|
@@ -53,7 +53,7 @@ runtime ステージを `gcr.io/distroless/cc-debian12` に変えられないか
 
 ### 2. glibc バージョン不一致を実機で確認した
 
-`distroless/cc-debian12` は Debian 12 (bookworm) 相当で glibc 2.36。現行の builder（`ubuntu:24.04`）は glibc 2.39。ビルド済みの `tachikaze` / `join_logo_scp` バイナリを `gcr.io/distroless/cc-debian12:latest` の上に `COPY` して実行すると、実際に次のエラーで起動できないことを確認した:
+`distroless/cc-debian12` は Debian 12 (bookworm) 相当で glibc 2.36。当時の単一 builder（`ubuntu:24.04`）は glibc 2.39 で、ビルド済みの `tachikaze` / `join_logo_scp` バイナリを `gcr.io/distroless/cc-debian12:latest` の上に `COPY` して実行すると、実際に次のエラーで起動できないことを確認した:
 
 ```
 /usr/local/bin/tachikaze: /lib/aarch64-linux-gnu/libc.so.6: version `GLIBC_2.39' not found (required by /usr/local/bin/tachikaze)
@@ -61,13 +61,13 @@ runtime ステージを `gcr.io/distroless/cc-debian12` に変えられないか
 /usr/local/bin/join_logo_scp: /usr/lib/aarch64-linux-gnu/libstdc++.so.6: version `GLIBCXX_3.4.32' not found (required by /usr/local/bin/join_logo_scp)
 ```
 
-これは builder のベースイメージを `debian:bookworm`（distroless と同じ Debian 12 系）に変えれば解消できる問題で、**`tachikaze` / `join_logo_scp` の2本だけなら distroless 化は技術的に可能**だとわかった。
+builder を distroless と同じ Debian 世代に揃えれば **`tachikaze` / `join_logo_scp` の2本だけなら distroless 化は技術的に可能**だとわかった。現行は tools / runtime とも `debian:trixie`（Debian 13）なので、対応する distroless 世代が揃った時点で再検討の余地がある（ただし下記 3. の理由で、依存ライブラリ数の問題は残る）。
 
 ### 3. それでも見送った理由: コンテナは1つで、4ツール全部が同じファイルシステムに要る
 
 `tachikaze` は `chapter_exe` / `dtvindex` / `join_logo_scp` / `ffmpeg` / `ffprobe` を `PATH` 経由の子プロセスとして起動する（`src/tools.rs::resolve_tool`）。**これらは同じコンテナ・同じファイルシステムに揃っていないと動かない。** つまり最終イメージは「`tachikaze` と `join_logo_scp` だけ distroless、残りは通常の Debian/Ubuntu」という形にはできず、**イメージ全体を distroless にするか、しないか**の二択になる。
 
-イメージ全体を distroless にするには、`chapter_exe` / `dtvindex` / `ffmpeg` / `ffprobe` が要求する 130〜212 本の共有ライブラリを `COPY --from=builder` で個別に持ってくる必要がある。これは技術的に不可能ではないが:
+イメージ全体を distroless にするには、`chapter_exe` / `dtvindex` / `ffmpeg` / `ffprobe` が要求する 130〜212 本の共有ライブラリを `COPY --from=tools` 等で個別に持ってくる必要がある。これは技術的に不可能ではないが:
 
 - distroless には `apt` / `dpkg` が無いため、`ldd` の出力から**手作業でファイルリストを組み、バージョンが変わるたびに追随する**運用になる（アップストリームの `chapter_exe` / `dtvindex` / `ffmpeg` はバージョン固定していないため、依存ライブラリの集合が変わりうる。上記「結果まとめ」参照）
 - 共有ライブラリ本体だけでなく、`libfontconfig` の設定ファイル・`ca-certificates` のバンドル・`iconv` の `gconv` モジュールなど、**ファイル以外の実行時データも一致させる必要がある**（今回は未検証だが、`ffmpeg` が TLS 系ライブラリ（`libgnutls` / `libssl`）を含んでいることから、証明書バンドルが必要になる場面はありうる）
@@ -81,8 +81,11 @@ runtime ステージを `gcr.io/distroless/cc-debian12` に変えられないか
 
 マルチステージ（`Dockerfile`）:
 
-1. **builder**: `ubuntu:24.04` + `build-essential` / `pkg-config` / ffmpeg の `-dev` パッケージ群 + `rustup`（Ubuntu 24.04 の apt 版 `cargo` は edition 2021 の依存クレートに対して古すぎるため使わない）。`join_logo_scp` / `dtvindex` / `chapter_exe` を `git clone --depth 1` してビルドし、`tachikaze` 本体も `cargo build --release --locked` する。`chapter_exe` のビルド直後に `chapter_exe -v` の出力へ `dtvindex=enabled` が含まれるかを `RUN` の中で検証し、含まれなければビルドを失敗させる（`dtvindex=disabled` でビルドされた `chapter_exe` は入力経路が無く、エラーを出さずに動かなくなる。ビルドの時点でこれを検出して止める）
-2. **runtime**: `ubuntu:24.04` + `ffmpeg` パッケージ（`prepare` と `--verify` が使う `ffmpeg` / `ffprobe` 本体と、`chapter_exe` / `dtvindex` が実行時に要求する `libavformat.so.60` 等の共有ライブラリを兼ねる。builder の `-dev` パッケージと同じ Ubuntu 24.04 の apt リポジトリなのでバージョンが揃う）。4つのバイナリを `/usr/local/bin/` に、`JL/` を `/usr/local/share/join_logo_scp/JL/` に置く
+1. **tools**: `debian:trixie` + `build-essential` / `pkg-config` / ffmpeg の `-dev` パッケージ群。`join_logo_scp` / `dtvindex` / `chapter_exe` を `git clone --depth 1` してビルドする。`chapter_exe` のビルド直後に `chapter_exe -v` の出力へ `dtvindex=enabled` が含まれるかを `RUN` の中で検証し、含まれなければビルドを失敗させる（`dtvindex=disabled` でビルドされた `chapter_exe` は入力経路が無く、エラーを出さずに動かなくなる。ビルドの時点でこれを検出して止める）。runtime と同じ Debian 13 (trixie) でビルドし、`libavformat` 等の共有ライブラリ版を揃える
+2. **tachikaze**: 公式 `rust:1-trixie` で `cargo build --release --locked`。`rustup` や apt の `cargo` は使わない（Debian の apt 版は edition 2021 の依存クレートに対して古すぎることがあるため）。tools / runtime と同じ trixie ベース
+3. **runtime**: `debian:trixie` + `ffmpeg` パッケージ（`prepare` と `--verify` が使う `ffmpeg` / `ffprobe` 本体と、`chapter_exe` / `dtvindex` が実行時に要求する `libavformat` 等の共有ライブラリを兼ねる。tools の `-dev` パッケージと同じ trixie の apt リポジトリなのでバージョンが揃う）。4つのバイナリを `/usr/local/bin/` に、`JL/` を `/usr/local/share/join_logo_scp/JL/` に置く
+
+`apt-get` と `cargo` は BuildKit の cache mount（`/var/cache/apt`・`/var/lib/apt`・cargo registry/git・`target/`）を使う。キャッシュはイメージレイヤーに入らないので、`rm -rf /var/lib/apt/lists/*` でレイヤーを掃除する必要はない。Debian のベースイメージが持つ `docker-clean`（install 後に apt キャッシュを消す設定）は、cache mount が効くように各ステージで削除している。
 
 `ENTRYPOINT ["tachikaze"]` なので `docker run tachikaze <サブコマンド> ...` がそのまま `tachikaze <サブコマンド> ...` になる。
 
@@ -152,7 +155,7 @@ $ docker run --rm -v "$MEDIA_DIR":"$MEDIA_DIR" -v "$CACHE_DIR":"$CACHE_DIR" tach
 
 ## 既知の制約
 
-- **イメージサイズ**: `--no-install-recommends` を builder・runtime 両方の `apt-get install` に付けた状態で実測 **753MB**（付ける前は 1.14GB、-34%）。X11・フォント関連ライブラリなど推奨パッケージの分が減る。`--no-install-recommends` を付けた状態でも `auto --verify` のフルパイプラインが通ることを確認済み。`ffmpeg` パッケージ自体が持ち込む必須の共有ライブラリ（`libavformat` 系一式）は削れないため、これ以上詰めるなら ffmpeg を静的ビルドする、または `apt` の代わりに BtbN の静的ビルド済みバイナリを使う方法があるが、本 issue の範囲では対応しない
+- **イメージサイズ**: `--no-install-recommends` を tools・runtime 両方の `apt-get install` に付けた状態で、当時 ubuntu:24.04 ベースで実測 **753MB**（付ける前は 1.14GB、-34%）。X11・フォント関連ライブラリなど推奨パッケージの分が減る。現行の `debian:trixie` でも同程度。`--no-install-recommends` を付けた状態でも `auto --verify` のフルパイプラインが通ることを確認済み。`ffmpeg` パッケージ自体が持ち込む必須の共有ライブラリ（`libavformat` 系一式）は削れないため、これ以上詰めるなら ffmpeg を静的ビルドする、または `apt` の代わりに BtbN の静的ビルド済みバイナリを使う方法があるが、本 issue の範囲では対応しない
 - 3ツールはバージョン固定していない（上記「Dockerfile の構成」参照）。ビルドのたびに upstream の最新 HEAD を取るため、upstream 側の変更で本書の実測（パッチ不要）が将来変わる可能性がある。**再現性だけでなくライセンス上の要件でもある**: `chapter_exe` / `join_logo_scp` / `dtvindex` は GPL 系（[THIRD-PARTY-NOTICES.md](../THIRD-PARTY-NOTICES.md)）で、GPL の義務は配布時に発生する。現在は `Dockerfile`（レシピ）を置いているだけなので義務は生じないが、ビルド済みイメージをレジストリに push して配布するなら「対応する完全なソース」の提供義務が生じ、そのためには**イメージを公開する前に各 `git clone` を commit SHA 固定にする**必要がある（固定していないと、後から対応ソースを再現できない）
 - **キャッシュは再実行を省略しない**（上記「実行例で確認したこと」）。`--cache-dir` を共有しても2回目以降の `analyze` が速くなるわけではない
 - **arm64 イメージが必須**。Apple Silicon（`darwin/arm64` ホスト、Colima も `linux/arm64` サーバ）で使う前提のため、`docker build` は arm64 ネイティブで行う。x86_64 のみのイメージを arm64 ホストで動かすと QEMU エミュレーションが挟まり極端に遅くなる（本書の実測はすべて `linux/arm64` ネイティブで行っており、QEMU 経由の速度は未検証）
