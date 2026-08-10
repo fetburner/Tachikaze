@@ -15,7 +15,7 @@ CM 判定は 3 種類の「証拠」を集めて外部ツールが統合判定�
                   ＋ PMT 変更点   … Amatsukaze 本体 (applyPmtCut)       Trim(a,b)++…
 ```
 
-**本プロジェクトは PMT を使わない**（mp4 に PMT が無いため）。**ロゴは [E14](https://github.com/fetburner/Tachikaze/issues/89) で自前実装した**（`analyze --logo <path.lgd>` を指定したときだけ使う。省略時は従来どおりロゴ無しの経路のまま）。「delogo 済みの mp4 にはロゴが存在しない」という当初の前提は実測していない仮定で、実際には残っている入力があった（[measurements.md](measurements.md)「ロゴの残存」）。
+**本プロジェクトは PMT を使わない**（mp4 に PMT が無いため）。**ロゴ検出は自前実装している**（`analyze --logo <path.lgd>` を指定したときだけ使う。省略時はロゴ無しの経路になる）。対象の mp4 には局ロゴが残っていることが多い（[measurements.md](measurements.md)「ロゴの残存」）。
 
 ## ロゴ検出（自前実装、任意）
 
@@ -23,9 +23,9 @@ CM 判定は 3 種類の「証拠」を集めて外部ツールが統合判定�
 
 ### モデル
 
-ロゴデータは画素ごとに係数 `a`, `b` を持つ。`background = a × observed + b × maxv` というアルファ合成の逆算式（`LogoScan.hpp:231` の `EvaluateLogo`）。
+ロゴデータは画素ごとに係数 `a`, `b` を持つ。`background = a × observed + b × maxv` というアルファ合成の逆算式（`LogoScan.hpp::EvaluateLogo`）。
 
-### 特徴点の選び方（`LogoScan.hpp:112`）
+### 特徴点の選び方（`LogoScan.hpp`）
 
 1. 32 段階の均一グレー背景にロゴを合成した画像を生成
 2. 各画素を中心とする 5×5 窓の分散を計算し、**分散が大きい上位 `maskratio` 割（検出時は 0.35）の画素だけ**を評価対象にする
@@ -34,7 +34,7 @@ CM 判定は 3 種類の「証拠」を集めて外部ツールが統合判定�
 
 つまり**ロゴのエッジだけを見て、局所平均を引いた相関**を取る。単純に画素を掛け合わせると画像背景の濃淡に影響されるため。
 
-### 1 フレームで 2 回評価する（`LogoScan.hpp:1544`）
+### 1 フレームで 2 回評価する（`LogoScan.hpp`）
 
 - **`corr0`**（そのまま相関）— 大きいほど「ロゴがある」証拠
 - **`corr1`**（ロゴを除去してから相関）— 本当にロゴがあれば除去後は 0 付近。無いのに除去すると画像にロゴ形の凹みが刻まれて**負に振れる**
@@ -50,13 +50,13 @@ CM 判定は 3 種類の「証拠」を集めて外部ツールが統合判定�
 
 ### 出力形式の要点
 
-最良位置だけでなく**可能性の範囲**を渡す（`LogoScan.hpp:1818`）。ロゴのフェードで境界は本質的に曖昧なので、確定させずに join_logo_scp に委ねる設計。形式は [pipeline.md](pipeline.md)。
+最良位置だけでなく**可能性の範囲**を渡す（`LogoScan.hpp`）。ロゴのフェードで境界は本質的に曖昧なので、確定させずに join_logo_scp に委ねる設計。形式は [pipeline.md](pipeline.md)。
 
-**fade（フェード区間そのものの検出）と TOP/BTM（片フィールドロゴ、インターレースの上下フィールド別の表示区間）は出力しない**（[E14](https://github.com/fetburner/Tachikaze/issues/89) の方針、logoframe 形式の `fade` は常に `0`、`TOP`/`BTM` の区別は使わず常に `ALL` を書く。`src/logo/interval.rs`）。理由: (1) Amatsukaze 自身もこれらを出していない、(2) 本ツールはカットをキーフレーム境界（GOP 120 = 約4秒）に丸めるため、数フレーム単位の境界精度はどのみち残存 CM マージンに吸収されて利得が小さい。
+**fade（フェード区間そのものの検出）と TOP/BTM（片フィールドロゴ、インターレースの上下フィールド別の表示区間）は出力しない**（logoframe 形式の `fade` は常に `0`、`TOP`/`BTM` の区別は使わず常に `ALL` を書く。`src/logo/interval.rs`）。理由: (1) Amatsukaze 自身もこれらを出していない、(2) 本ツールはカットをキーフレーム境界（GOP 120 = 約4秒）に丸めるため、数フレーム単位の境界精度はどのみち残存 CM マージンに吸収されて利得が小さい。
 
 ### 解像度の制約（実装済みの前提）
 
-**ロゴデータは対象の mp4 と同じ解像度で作る必要がある**（Amatsukaze の `LogoScan.hpp:1550` の `logo.getImgWidth() != vi.width` なら評価しないという制約と同じ理由）。`tachikaze make-logo` は対象の mp4 自身から作るため、この制約は「対象ごとに作り直す」ことで満たす（1440x1080 の TS から作ったロゴデータを 1280x720 の mp4 に使うような不一致は起きない）。720p（1280x720）でロゴが残っているかどうかは未確認（[measurements.md](measurements.md)「ロゴの残存」の「見ていないこと」）。
+**ロゴデータは対象の mp4 と同じ解像度で作る必要がある**（Amatsukaze の `LogoScan.hpp` も `logo.getImgWidth() != vi.width` なら評価しない）。`tachikaze make-logo` は対象の mp4 自身から作るため、この制約は自動的に満たす。
 
 ## join_logo_scp の構造
 
@@ -99,7 +99,7 @@ JlsIF                     ← CLI
 
 ### Auto 系 = 15 秒格子への当てはめ
 
-中核は `ScpArType` 列挙（`src/JlsNameSpace.hpp:37`）:
+中核は `ScpArType` 列挙（`src/JlsNameSpace.hpp`）:
 
 ```cpp
 SCP_AR_L_UNIT,     // ロゴ有 １５秒単位
@@ -128,7 +128,7 @@ secWCompSPMax,     // Autoコマンド番組提供で標準最大秒数
 
 ### `detail.jls` のラベル一覧
 
-`JlsDataset::outputResultDetailGetLineLabel()`（`src/JlsDataset.cpp:2602`）が生成:
+`src/JlsDataset.cpp` の `JlsDataset::outputResultDetailGetLineLabel()` が生成:
 
 | ラベル | 意味 |
 |---|---|
@@ -144,11 +144,11 @@ secWCompSPMax,     // Autoコマンド番組提供で標準最大秒数
 
 `(cut-cancel)` は「カット対象と判定したが設定でキャンセルした」。→ [jls-settings.md](jls-settings.md)
 
-Amatsukaze の `MakeChapter`（`CMAnalyze.hpp:582`）はこれらを `startsWith` で分類してチャプター名にしている。
+Amatsukaze の `CMAnalyze.hpp::MakeChapter`はこれらを `startsWith` で分類してチャプター名にしている。
 
 ## ML 系言語との相性（余談）
 
-join_logo_scp は**独自スクリプト言語のインタプリタ＋構成分類器**であり、代数的データ型とパターンマッチが向く題材。`JlsScriptDecode.cpp:545` に
+join_logo_scp は**独自スクリプト言語のインタプリタ＋構成分類器**であり、代数的データ型とパターンマッチが向く題材。`JlsScriptDecode.cpp` に
 
 ```cpp
 castErrInternal("(numArg) type:" + static_cast<int>(orgOptType));

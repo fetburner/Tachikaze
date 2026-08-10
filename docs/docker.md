@@ -2,9 +2,9 @@
 
 → 入口: [overview.md](overview.md)
 
-外部3ツール（chapter_exe / join_logo_scp / dtvindex）と ffmpeg を自分でビルド・配置したくない人向けに、`Dockerfile` を用意してある。**変えないもの**: `cut`/`auto` の出力先は `-o`（必須、#73）で明示指定し、`remap-subs` を単体実行したときだけ入力の隣に既定の出力名を置く。`analyze` はキャッシュに入力への symlink（`work.mp4`）を張って `chapter_exe` を走らせる。これらはコンテナ内でも同じ（[architecture.md](architecture.md)「パス解決」節）。
+外部3ツール（chapter_exe / join_logo_scp / dtvindex）と ffmpeg を自分でビルド・配置したくない人向けに、`Dockerfile` を用意してある。**変えないもの**: `cut`/`auto` の出力先は `-o`（必須）で明示指定し、`remap-subs` を単体実行したときだけ入力の隣に既定の出力名を置く。`analyze` はキャッシュに入力への symlink（`work.mp4`）を張って `chapter_exe` を走らせる。これらはコンテナ内でも同じ（[architecture.md](architecture.md)「パス解決」節）。
 
-Linux (arm64) で**実際に `docker build` / `docker run` を実行して確認済み**（2026 年 8 月時点。Apple Silicon 上の Colima、`docker` サーバは `linux/arm64`）。この文書はキャッシュの置き場所を `--cache-dir` 1本に統合した後（`src/workdir.rs` の E12-2）の CLI を前提に書いてある。
+Linux (arm64) で**実際に `docker build` / `docker run` を実行して確認済み**（2026 年 8 月時点）。この文書はキャッシュの置き場所を `--cache-dir` 1本に統合した後の CLI を前提に書いてある（`src/workdir.rs`）。
 
 ## 結果まとめ（実測）
 
@@ -24,7 +24,7 @@ Linux (arm64) で**実際に `docker build` / `docker run` を実行して確認
 
 ## macOS の3点パッチが不要だった理由
 
-[toolchain-macos.md](toolchain-macos.md)「chapter_exe」に書いた3点（`malloc.h` が無い / `memalign()` が無い / `uname -m` が `arm64` を返して SIMD 分岐が外れる）は、いずれも **BSD libc（macOS）と glibc（Linux）の差**、または**古い Makefile の `uname -m` 分岐**が原因だった。Linux 上の `chapter_exe`（本 issue 作業時点の upstream HEAD）では:
+[toolchain-macos.md](toolchain-macos.md)「chapter_exe」に書いた3点（`malloc.h` が無い / `memalign()` が無い / `uname -m` が `arm64` を返して SIMD 分岐が外れる）は、いずれも **BSD libc（macOS）と glibc（Linux）の差**、または**古い Makefile の `uname -m` 分岐**が原因だった。Linux 上の `chapter_exe`（この検証時点の upstream HEAD）では:
 
 - `malloc.h` は glibc に存在する（Linux 固有ヘッダなので macOS だけ無かった）
 - `memalign()` は glibc に存在する（POSIX 標準ではないが glibc は独自に提供している）
@@ -75,7 +75,7 @@ builder を distroless と同じ Debian 世代に揃えれば **`tachikaze` / `j
 
 一方 `tachikaze` / `join_logo_scp` の2本だけを distroless にしても、**同じイメージ内に `chapter_exe` / `dtvindex` / `ffmpeg` 用の Debian ベースレイヤーを残す必要がある**ため、イメージサイズも攻撃面（シェル・パッケージマネージャの有無）も変わらない。得られる利益がない。
 
-**将来 distroless 化の余地が生まれる条件**: `chapter_exe` / `dtvindex` が `libavformat` 等を静的リンク（`.a`）した上でビルドされ、`ffmpeg` / `ffprobe` も静的ビルド（BtbN の static build 相当）に切り替われば、実行時に必要な共有ライブラリは `libc` / `libm` / `libgcc_s` / `libstdc++` だけになり、4ツールすべてを distroless に載せられる可能性がある。ただしこれは FFmpeg を静的リンク向けにソースから構成し直す作業で、本 issue の範囲を大きく超えるため今回は実施しない。
+**将来 distroless 化の余地が生まれる条件**: `chapter_exe` / `dtvindex` が `libavformat` 等を静的リンク（`.a`）した上でビルドされ、`ffmpeg` / `ffprobe` も静的ビルド（BtbN の static build 相当）に切り替われば、実行時に必要な共有ライブラリは `libc` / `libm` / `libgcc_s` / `libstdc++` だけになり、4ツールすべてを distroless に載せられる可能性がある。ただしこれは FFmpeg を静的リンク向けにソースから構成し直す作業で、この文書の範囲を大きく超えるため実施しない。
 
 ## Dockerfile の構成
 
@@ -132,7 +132,7 @@ $ docker run --rm -v "$MEDIA_DIR":"$MEDIA_DIR" -v "$CACHE_DIR":"$CACHE_DIR" tach
 
 ## 実行例で確認したこと（実測）
 
-`tests/fixtures/gen.sh` で作った `sample.mp4`（H.264 + Opus, 20秒, GOP 120 固定）を `$MEDIA_DIR` に置き、`auto --cache-dir $CACHE_DIR --verify --ignore-gate -o $MEDIA_DIR/sample_CMcut.mp4` を実行して確認した（コマンドは #73 のフラグ改名に合わせて更新。`--cm-output` を指定していないため CM 側は作られない。以下の実測結果自体はフラグ改名前に確認したもので、フラグの意味は変わっていない）:
+`tests/fixtures/gen.sh` で作った `sample.mp4`（H.264 + Opus, 20秒, GOP 120 固定）を `$MEDIA_DIR` に置き、`auto --cache-dir $CACHE_DIR --verify --ignore-gate -o $MEDIA_DIR/sample_CMcut.mp4` を実行して確認した（`--cm-output` を指定していないため CM 側は作られない）:
 
 - `dtvindex build` → `chapter_exe -v` → `join_logo_scp` が3つとも正常終了する
 - `chapter_exe` がメディアファイルの隣ではなく `--cache-dir` 配下（`<hash>-sample/`）の `work.mp4`（symlink）の隣に `.dtvi` を作る（コンテナ内でもホスト同様、`analyze` の symlink 回避が効いている）。ディレクトリ名は実測で `c567f3179fe4d702-sample`（`<入力絶対パスのハッシュ>-<stem>`）
@@ -140,13 +140,13 @@ $ docker run --rm -v "$MEDIA_DIR":"$MEDIA_DIR" -v "$CACHE_DIR":"$CACHE_DIR" tach
 - `cut --dtvi` を省略しても、直前に `analyze` した同じ入力なら `--cache-dir` から `.dtvi` を自動解決できる（実測: `cut` を `--dtvi` 無しで実行して成功）
 - 出力（`sample_CMcut.mp4`）がホスト側のメディアディレクトリに書き戻される（rw マウントが機能している）
 
-**`--cm-output` を付けなかった理由**: `auto` は `--cm-output` を指定したときだけ CM 側を出す（#73。以前は既定で `*_CM.mp4` を出す仕様で、抑止用のフラグを別に用意していた）。`sample.mp4` は CM 検出テスト用ではなく単体テスト用の合成素材で、実際の CM ブロックを含まない。`join_logo_scp` はこの入力全体を保持区間と判定するため、CM 側を出そうとすると保持区間が空になり、`cut` が「出力に含まれるトラックが1本もありません」で失敗する。これは**この合成フィクスチャの内容に起因する既知の挙動**で、Docker 環境固有の問題ではない（ネイティブ実行でも同じ入力・同じオプションなら同じ結果になる）。実際の録画ファイル（CM を含む）であれば `--cm-output` を付けて構わない。
+**`--cm-output` を付けなかった理由**: `auto` は `--cm-output` を指定したときだけ CM 側を出す。`sample.mp4` は CM 検出テスト用ではなく単体テスト用の合成素材で、実際の CM ブロックを含まない。`join_logo_scp` はこの入力全体を保持区間と判定するため、CM 側を出そうとすると保持区間が空になり、`cut` が「出力に含まれるトラックが1本もありません」で失敗する。これは**この合成フィクスチャの内容に起因する既知の挙動**で、Docker 環境固有の問題ではない（ネイティブ実行でも同じ入力・同じオプションなら同じ結果になる）。実際の録画ファイル（CM を含む）であれば `--cm-output` を付けて構わない。
 
 `--ignore-gate` を付けた理由: 同じ理由（検出対象の CM がそもそも無い合成素材）で gate が「除去フレーム数 0 → 疑わしいので止める」と判定するため、smoke test として最後まで通す目的で判定を無視した。実際の運用では gate の停止判定を無視せず、`trim.avs` を確認してから `--ignore-gate` するか `cut` を直接叩くこと。
 
 ### キャッシュは再実行を省略しない（実測）
 
-同じ入力・同じ `--cache-dir`（ホストにマウント済み、内容も共有できる状態）で `auto` に `-f`（既存出力の上書き、#73）を付けて2回連続実行し、両回のログを比較した。**2回目も `dtvindex build` / `chapter_exe -v` / `join_logo_scp` が3つとも全く同じコマンドラインで再実行される。** これは Docker 固有の問題ではなく tachikaze 共通の挙動で、`analyze` に「既存の成果物があれば再実行をスキップする」判定が無いため（キャッシュは「`cut` が `.dtvi` を自動解決できるようにするための受け渡し場所」であって、再実行を省略する仕組みではない）。したがって「キャッシュを共有すれば2回目以降が速くなる」という期待は**外れる**。速くなるとしたら OS のページキャッシュ（同じファイルの再読み込みが速くなる）程度で、`dtvindex`/`chapter_exe`/`join_logo_scp` の実行自体は毎回フルで走る。
+同じ入力・同じ `--cache-dir`（ホストにマウント済み、内容も共有できる状態）で `auto` に `-f`（既存出力の上書き）を付けて2回連続実行し、両回のログを比較した。**2回目も `dtvindex build` / `chapter_exe -v` / `join_logo_scp` が3つとも全く同じコマンドラインで再実行される。** これは Docker 固有の問題ではなく tachikaze 共通の挙動で、`analyze` に「既存の成果物があれば再実行をスキップする」判定が無いため（キャッシュは「`cut` が `.dtvi` を自動解決できるようにするための受け渡し場所」であって、再実行を省略する仕組みではない）。したがって「キャッシュを共有すれば2回目以降が速くなる」という期待は**外れる**。速くなるとしたら OS のページキャッシュ（同じファイルの再読み込みが速くなる）程度で、`dtvindex`/`chapter_exe`/`join_logo_scp` の実行自体は毎回フルで走る。
 
 ### CM 側出力・字幕サイドカーの確認（実測）
 
@@ -155,7 +155,7 @@ $ docker run --rm -v "$MEDIA_DIR":"$MEDIA_DIR" -v "$CACHE_DIR":"$CACHE_DIR" tach
 
 ## 既知の制約
 
-- **イメージサイズ**: `--no-install-recommends` を tools・runtime 両方の `apt-get install` に付けた状態で、当時 ubuntu:24.04 ベースで実測 **753MB**（付ける前は 1.14GB、-34%）。X11・フォント関連ライブラリなど推奨パッケージの分が減る。現行の `debian:trixie` でも同程度。`--no-install-recommends` を付けた状態でも `auto --verify` のフルパイプラインが通ることを確認済み。`ffmpeg` パッケージ自体が持ち込む必須の共有ライブラリ（`libavformat` 系一式）は削れないため、これ以上詰めるなら ffmpeg を静的ビルドする、または `apt` の代わりに BtbN の静的ビルド済みバイナリを使う方法があるが、本 issue の範囲では対応しない
+- **イメージサイズ**: `--no-install-recommends` を tools・runtime 両方の `apt-get install` に付けた状態で、当時 ubuntu:24.04 ベースで実測 **753MB**（付ける前は 1.14GB、-34%）。X11・フォント関連ライブラリなど推奨パッケージの分が減る。現行の `debian:trixie` でも同程度。`--no-install-recommends` を付けた状態でも `auto --verify` のフルパイプラインが通ることを確認済み。`ffmpeg` パッケージ自体が持ち込む必須の共有ライブラリ（`libavformat` 系一式）は削れないため、これ以上詰めるなら ffmpeg を静的ビルドする、または `apt` の代わりに BtbN の静的ビルド済みバイナリを使う方法があるが、この文書の範囲では対応しない
 - 3ツールはバージョン固定していない（上記「Dockerfile の構成」参照）。ビルドのたびに upstream の最新 HEAD を取るため、upstream 側の変更で本書の実測（パッチ不要）が将来変わる可能性がある。**再現性だけでなくライセンス上の要件でもある**: `chapter_exe` / `join_logo_scp` / `dtvindex` は GPL 系（[THIRD-PARTY-NOTICES.md](../THIRD-PARTY-NOTICES.md)）で、GPL の義務は配布時に発生する。現在は `Dockerfile`（レシピ）を置いているだけなので義務は生じないが、ビルド済みイメージをレジストリに push して配布するなら「対応する完全なソース」の提供義務が生じ、そのためには**イメージを公開する前に各 `git clone` を commit SHA 固定にする**必要がある（固定していないと、後から対応ソースを再現できない）
 - **キャッシュは再実行を省略しない**（上記「実行例で確認したこと」）。`--cache-dir` を共有しても2回目以降の `analyze` が速くなるわけではない
-- **arm64 イメージが必須**。Apple Silicon（`darwin/arm64` ホスト、Colima も `linux/arm64` サーバ）で使う前提のため、`docker build` は arm64 ネイティブで行う。x86_64 のみのイメージを arm64 ホストで動かすと QEMU エミュレーションが挟まり極端に遅くなる（本書の実測はすべて `linux/arm64` ネイティブで行っており、QEMU 経由の速度は未検証）
+- **arm64 イメージが必須**。Apple Silicon で使う場合は `linux/arm64` をネイティブ実行する。x86_64 イメージでは QEMU エミュレーションが挟まり遅くなる

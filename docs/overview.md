@@ -35,7 +35,7 @@ Amatsukaze は MPEG2-TS を入力して CM カットとエンコードを行い 
 - 音声パケットの区間選択とドリフト補正
 - **CM 側（除去した区間）の別ファイル出力**（検出が切りすぎていないかの目視確認用）
 - 自己検証（パケット数・表示順の連続性・同期サンプル）
-- ロゴ検出（`make-logo` で `.lgd` を作り、`analyze --logo` で join_logo_scp の `-inlogo` に渡す。Amatsukaze の相関方式を移植。[E14](https://github.com/fetburner/Tachikaze/issues/89)）
+- ロゴ検出（`make-logo` で `.lgd` を作り、`analyze --logo` で join_logo_scp の `-inlogo` に渡す。Amatsukaze の相関方式を移植）
 
 **作らないもの**
 
