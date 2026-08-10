@@ -59,16 +59,15 @@ CHAPTER06NAME=30フレーム ★ SCPos:5458 5457
 - 先頭の「Nフレーム」は無音の長さ
 - `★` / `＿` / `＠` は候補の強さを示す印。`★` は 15 秒間隔で並んでいる候補（＝ CM の可能性が高い）
 
-Amatsukaze 側では `-o` ではなく **stdout** を別に解析している（`CMAnalyze.hpp:329` で stdout をファイルに落とし、`CMAnalyze.hpp:411-439` で `mute N: a - b` と `SCPos: N` を正規表現で抽出）。本ツールでは `-o` 出力を join_logo_scp に渡すだけでよい。
+Amatsukaze 側では `-o` ではなく **stdout** を別に解析している（`CMAnalyze.hpp` で stdout をファイルに落とし、`mute N: a - b` と `SCPos: N` を正規表現で抽出）。本ツールでは `-o` 出力を join_logo_scp に渡すだけでよい。
 
 ### logoframe の出力（= join_logo_scp の `-inlogo`）
 
-**既定では使わない。`analyze --logo <path>` を指定したときだけ使う**（E14、#89）。
-当初は「対象は delogo 済みのためこの経路は使えない」という未実測の仮定を
-置いていたが、E14-2 の実測（`docs/measurements.md`「ロゴの残存」）でこの
-前提が誤りだと判明した（確認した4局はいずれもロゴが実際には残っていた）。
-形式そのものは Amatsukaze の `LogoScan.hpp:1818` が生成するもので、
-自前実装（`src/logo/`、`src/analyze.rs::detect_logo`）もこの形式でファイルを書く:
+**既定では使わない。`analyze --logo <path>` を指定したときだけ使う。** 対象の
+mp4 には局ロゴが残っていることが多く（実測は [measurements.md](measurements.md)
+「ロゴの残存」）、残っていればこれが最も強い CM の手がかりになる。形式そのものは
+Amatsukaze の `LogoScan.hpp` が生成するもので、自前実装（`src/logo/`、
+`src/analyze.rs::detect_logo`）もこの形式でファイルを書く:
 
 ```
   1234 S 0 ALL   1220   1250     ← ロゴ開始: 最良位置 1234、可能性範囲 1220〜1250
@@ -86,7 +85,7 @@ Trim(66,34201) ++ Trim(37798,53591) ++ Trim(57189,70974)
 ```
 
 - `Trim(s,e)` は **両端含む**フレーム範囲。半開区間に直すと `[s, e+1)`
-- Amatsukaze の実装は `CMAnalyze.hpp:377` の `readTrimAVS`（正規表現 1 本、終端に +1）
+- Amatsukaze の実装は `CMAnalyze.hpp::readTrimAVS`（正規表現 1 本、終端に +1）
 
 ### join_logo_scp の `-oscp` 出力（detail.jls）
 
@@ -150,9 +149,9 @@ target_is_leading         0
 
 | 処理 | 場所 |
 |---|---|
-| Trim パース | `CMAnalyze.hpp:377` |
-| シーンチェンジ抽出 | `CMAnalyze.hpp:411-439` |
-| チャプター生成 | `CMAnalyze.hpp:462-679`（`MakeChapter`） |
-| フレーム番号の写像 | `CMAnalyze.hpp:604`（`lower_bound` で切り詰め後の番号へ変換） |
-| 音声の同期追従 | `StreamReform.hpp:1287-1420`（`fillAudioFrames`） |
-| Mux コマンド組み立て | `TranscodeSetting.hpp:263`（`makeMuxerArgs`） |
+| Trim パース | `CMAnalyze.hpp::readTrimAVS` |
+| シーンチェンジ抽出 | `CMAnalyze.hpp`（`mute N: a - b` と `SCPos: N` を正規表現で抽出） |
+| チャプター生成 | `CMAnalyze.hpp::MakeChapter` |
+| フレーム番号の写像 | `CMAnalyze.hpp`（`lower_bound` で切り詰め後の番号へ変換） |
+| 音声の同期追従 | `StreamReform.hpp::fillAudioFrames` |
+| Mux コマンド組み立て | `TranscodeSetting.hpp::makeMuxerArgs` |
