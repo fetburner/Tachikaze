@@ -70,20 +70,19 @@ E2E で実検証済みか、認識のみ（未検証）かの区別は [measurem
 ### 入力検証（破損／悪意ある MP4 向け）
 
 サンプル表の `u32` は信頼しない。
-確保・展開ループの**前**に検証し、失敗時はパニックではなく **`Err` で停止**する（OOM を起こさない）。
+確保・減算・範囲生成の**前**に検証し、失敗時はパニックや `unwrap_or(0)` での続行ではなく
+**`Err` で停止**する（静かな誤オフセットを出さない）。
 
 | 対象 | 検証内容 |
 |---|---|
 | `stsz` | 件数は `file_len` 以下（`size=0` でも巨大 `count` を許さない）。`Identical` は `count * size` を `checked_mul`。`Different` はサイズ総和を `checked_add`。いずれも `file_len` 超でエラー。これで `write.rs` の `copy_buf.resize(s.size)` に届く `size` もファイル長以下に束縛される |
 | `stts` / `ctts` | 展開前に `sample_count` を `checked_add` で合計し、`stsz` の総数と一致することを確認する。一致後だけ、既に束縛済みの件数を capacity / ループ上限に使う（`take(total)` で矛盾を隠さない） |
+| `stsc` | `first_chunk == 0`・非昇順・チャンク数超過・`samples_per_chunk == 0` を展開前に拒否する。範囲外チャンクを `unwrap_or(0)` で offset 0 に化けさせない。展開後のサンプル数が `stsz` と一致することと、オフセット加算の `checked_add` も必須 |
 
 `file_len` は入力ファイルの実バイト長（それ以上に厳しい検証済み mdat 範囲でも可）。
 マジックなメモリ上限は持ち込まず、「mdat に収まらない件数・サイズは定義上あり得ない」として束縛する。
 
-`stsc` の `first_chunk` 検証（wrap / 静かな誤オフセット防止）は別途扱う。
-
 **やらないこと**: `mp4-atom` のボックスパーサ自体の改修（検証は `samples()` 側で足りる）。
-
 ## トップレベルから moov を取り出す
 
 ```rust
