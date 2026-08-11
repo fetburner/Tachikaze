@@ -52,25 +52,33 @@ E2E で実検証済みか、認識のみ（未検証）かの区別は [measurem
 
 ## サンプル表の復元
 
-`stbl` からデコード順の `SampleInfo`（`file_offset`, `size`, `duration`, `cts_offset`, `is_sync`）を組み立てる。実装は `src/mp4io/read.rs::samples(stbl, file_len) -> Result<Vec<SampleInfo>>`。
+`stbl` からデコード順の `SampleInfo` を組み立てる。
+フィールドは `file_offset` / `size` / `duration` / `cts_offset` / `is_sync`。
+実装は `src/mp4io/read.rs::samples(stbl, file_len) -> Result<Vec<SampleInfo>>`。
 
 ### 組み立て手順
 
 1. `stsz` から各サンプルのサイズ列を得る（`Identical` / `Different`）
 2. `stco` または `co64` からチャンク先頭オフセットを得る
-3. `stts` / `ctts` を展開して duration / cts_offset 列を得る（`stss` は 1 始まり。無いトラックは全サンプル同期扱い）
-4. `stsc` をチャンクごとに展開し、チャンク先頭オフセットに直前サンプルのサイズを積算して各サンプルの `file_offset` を求める（**O(n)**。チャンク内で毎回 0 から積み直す O(n²) に戻さないこと。10 万サンプルで線形であることを確認するテストあり）
+3. `stts` / `ctts` を展開して duration / cts_offset 列を得る
+   （`stss` は 1 始まり。無いトラックは全サンプル同期扱い）
+4. `stsc` をチャンクごとに展開し、チャンク先頭オフセットに直前サンプルのサイズを積算して
+   各サンプルの `file_offset` を求める（**O(n)**）。
+   チャンク内で毎回 0 から積み直す O(n²) に戻さないこと。
+   10 万サンプルで線形であることを確認するテストあり。
 
 ### 入力検証（破損／悪意ある MP4 向け）
 
-サンプル表の `u32` は信頼しない。確保・展開ループの**前**に検証し、失敗時はパニックではなく **`Err` で停止**する（OOM を起こさない）。
+サンプル表の `u32` は信頼しない。
+確保・展開ループの**前**に検証し、失敗時はパニックではなく **`Err` で停止**する（OOM を起こさない）。
 
 | 対象 | 検証内容 |
 |---|---|
-| `stsz` | 件数は `file_len` 以下（`size=0` でも巨大 `count` を許さない）。`Identical` は `count * size` を `checked_mul`、`Different` はサイズ総和を `checked_add`。いずれも `file_len` 超でエラー。これで `write.rs` の `copy_buf.resize(s.size)` に届く `size` もファイル長以下に束縛される |
-| `stts` / `ctts` | 展開前に `sample_count` を `checked_add` で合計し、`stsz` の総数と一致することを確認。一致後だけ、既に束縛済みの件数を capacity / ループ上限に使う（`take(total)` で矛盾を隠さない） |
+| `stsz` | 件数は `file_len` 以下（`size=0` でも巨大 `count` を許さない）。`Identical` は `count * size` を `checked_mul`。`Different` はサイズ総和を `checked_add`。いずれも `file_len` 超でエラー。これで `write.rs` の `copy_buf.resize(s.size)` に届く `size` もファイル長以下に束縛される |
+| `stts` / `ctts` | 展開前に `sample_count` を `checked_add` で合計し、`stsz` の総数と一致することを確認する。一致後だけ、既に束縛済みの件数を capacity / ループ上限に使う（`take(total)` で矛盾を隠さない） |
 
-`file_len` は入力ファイルの実バイト長（それ以上に厳しい検証済み mdat 範囲でも可）。マジックなメモリ上限は持ち込まず、「mdat に収まらない件数・サイズは定義上あり得ない」として束縛する。
+`file_len` は入力ファイルの実バイト長（それ以上に厳しい検証済み mdat 範囲でも可）。
+マジックなメモリ上限は持ち込まず、「mdat に収まらない件数・サイズは定義上あり得ない」として束縛する。
 
 `stsc` の `first_chunk` 検証（wrap / 静かな誤オフセット防止）は別途扱う。
 
