@@ -119,7 +119,7 @@ output_pts(i) = T_{k-1} + source_pts(i) - dts_src(S_k)
 
 音声サンプルの `duration` は一定と仮定してはいけない。実データでは**先頭パケットがエンコーダのプライミング分だけ大幅に長い**（実測: 20 ms が並ぶ中で先頭だけ 80 ms 相当）。`audio_samples[0].duration` を frame_size とみなして除算すると、この 1 個の外れ値で全境界がずれる。各サンプルの実際の `duration` を累積した表に対して最近傍を探す。
 
-Amatsukaze の `fillAudioFrames`（`StreamReform.hpp::fillAudioFrames`）が同じことをしている（「映像の時刻まで音声を進める、足りなければ水増し、行き過ぎればスキップ」＋ `AudioDiffInfo` で統計出力）。TS の PTS が乱れる前提の複雑な実装だが、mp4 では PTS が連続なのでソース時刻からの直接引き当てに簡略化できる。
+Amatsukaze の `fillAudioFrames`（`StreamReform.hpp::fillAudioFrames`）が同じことをしている。内容は「映像の時刻まで音声を進める、足りなければ水増し、行き過ぎればスキップ」＋ `AudioDiffInfo` での統計出力。TS の PTS が乱れる前提の複雑な実装だが、mp4 では PTS が連続なのでソース時刻からの直接引き当てに簡略化できる。
 
 **実測**: 5 区間の出力で映像 2754.690 秒 / 音声 2754.659 秒（差 **-31 ms**）。ただし**これは合計の長さしか見ていない測定であり、下記の位置ずれを検出できなかった**。
 

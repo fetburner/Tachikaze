@@ -15,6 +15,8 @@ Tachikaze 本体が担うのは主に「Trim リスト → ロスレスな mp4 �
 
 ## 最短の使い方
 
+実行には外部ツールのセットアップが必要です（下記「依存」→「ビルド / インストール」の順に用意してください）。
+
 ```console
 $ tachikaze auto IN.mp4 -o OUT.mp4
 ```
@@ -37,13 +39,6 @@ $ for f in *.mp4; do
   done
 ```
 
-## ビルド / インストール
-
-```console
-$ cargo build --release --locked
-$ make install          # 既定は /usr/local。PREFIX=$HOME/.local も可
-```
-
 ## 依存
 
 本体に加え、次の外部ツールが `PATH` 上に必要です。
@@ -58,25 +53,44 @@ $ make install          # 既定は /usr/local。PREFIX=$HOME/.local も可
 - macOS でのビルド手順: [docs/toolchain-macos.md](docs/toolchain-macos.md)
 - 外部ツールを自分でビルドせず試す: [docs/docker.md](docs/docker.md)（Dockerfile あり。ビルド済みイメージのレジストリ配布はしていません）
 
+## ビルド / インストール
+
+```console
+$ cargo build --release --locked
+$ make install          # 既定は /usr/local。PREFIX=$HOME/.local も可
+```
+
 ## 既知の制限
 
+- 動作確認済みの環境は **macOS（Apple Silicon）と Linux（arm64、Docker）**。Windows は未対応
 - **映像は H.264**、音声は `mp4-atom` が認識する Codec（代表例 Opus / AAC）
 - GOP をキーフレーム境界に丸めるため、**カット境界あたり平均 2.1〜2.5 秒の CM が残る**（許容する方針）
 - 1 プロセスにつき入力は 1 本
 
-未対応の入力・構成は [docs/architecture.md](docs/architecture.md) を参照してください。
+未対応の入力・構成は [docs/architecture.md](docs/architecture.md)「未対応の入力」を参照してください。
 
 ## ドキュメント
 
 詳細な入口は **[docs/overview.md](docs/overview.md)** です。目的別のルーティング表があります。
 
+使う人向け:
+
 | 文書 | 内容 |
 |---|---|
-| [docs/overview.md](docs/overview.md) | スコープと重要事実 |
-| [docs/architecture.md](docs/architecture.md) | コマンド構成・パス解決・未対応入力 |
-| [docs/pipeline.md](docs/pipeline.md) | 処理の流れと外部ツールの入出力 |
+| [docs/overview.md](docs/overview.md) | 文書索引と重要事実 |
+| [docs/architecture.md](docs/architecture.md) | コマンド構成・パス解決・未対応入力（前半が利用者向け） |
+| [docs/jls-settings.md](docs/jls-settings.md) | CM 検出が外れたときの調整 |
 | [docs/docker.md](docs/docker.md) | Docker で使う方法 |
 | [docs/toolchain-macos.md](docs/toolchain-macos.md) | 外部ツールのビルドとインストール |
+
+開発する人向け:
+
+| 文書 | 内容 |
+|---|---|
+| [docs/pipeline.md](docs/pipeline.md) | 処理の流れと外部ツールの入出力 |
+| [docs/lossless-cut.md](docs/lossless-cut.md) | ロスレスカットの実装知識 |
+| [docs/mp4-atom.md](docs/mp4-atom.md) | mp4 読み書きの検証済みコードと落とし穴 |
+| [docs/measurements.md](docs/measurements.md) | 実測データ |
 
 ## ライセンスと帰属
 

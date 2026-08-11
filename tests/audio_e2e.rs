@@ -784,7 +784,7 @@ fn cut_audio_is_bitwise_copy_and_matches_expected_count() {
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }
 
-/// 【最重要】自己検証の検査5（`docs/architecture.md`「自己検証（手順10）」の
+/// 【最重要】自己検証の検査5（`docs/architecture.md`「自己検証」の
 /// 検査5）に対応する e2e テスト: 出力の**各区間の先頭音声パケット**の CRC32 が、
 /// 元ファイルの**その区間のソース上の絶対開始時刻**付近のパケットの CRC32 と
 /// 一致すること。

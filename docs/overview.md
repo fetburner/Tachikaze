@@ -1,29 +1,35 @@
-# Tachikaze — 概要と文書索引
+# Tachikaze — 文書索引
 
-mp4 に変換済みの録画ファイルを、**再エンコードせずに CM カット**するツール。
-
-Amatsukaze は MPEG2-TS を入力して CM カットとエンコードを行い mp4 を出力するが、一度 mp4 にしてしまったファイルは扱えない。そのまま録画してしまったファイルを後から CM カットしたい、という需要に応える。
+mp4 に変換済みの録画ファイルを、再エンコードせずに CM カットするツール。プロジェクトの紹介・使い方の入口・インストール・ライセンスは [README](../README.md) にある。この文書は docs/ の索引と、全文書の前提になる事実をまとめる。
 
 **状態**: 実装完了（`analyze` / `cut` / `prepare` / `remap-subs` / `auto` が動作し、E2E テストでビット一致を確認済み）。残っている未対応構成は [architecture.md](architecture.md) に一覧がある。
 
-**このファイルは入口です。必要な文書だけを開いてください。** 各文書は独立して読めるように書かれています。
+**このファイルは索引です。必要な文書だけを開いてください。** 各文書は独立して読めるように書かれています。
 
 ## 目的別ルーティング
 
+**使う人向け**
+
 | やりたいこと | 読む文書 |
 |---|---|
-| なぜ Rust / mp4-atom なのか、他をなぜ却下したか | [tech-stack.md](tech-stack.md) |
-| 処理の流れと外部ツールの入出力形式を知る | [pipeline.md](pipeline.md) |
+| 手元の mp4 を一連で CM カットする | `tachikaze auto`（`prepare`→`analyze`→gate→`cut`→`remap-subs` を対話なしで合成、説明は [architecture.md](architecture.md)「コマンド構成」） |
+| コマンドの引数・キャッシュの場所・未対応の入力を知る | [architecture.md](architecture.md)（前半が利用者向け） |
 | CM 検出が外れる・当たらない原因を調べる | [jls-settings.md](jls-settings.md) |
+| 外部ツールを macOS でビルドする | [toolchain-macos.md](toolchain-macos.md) |
+| リポジトリを参照できない場所へインストールして使う | [architecture.md](architecture.md)「パス解決」節、[toolchain-macos.md](toolchain-macos.md)「ビルド後の配置とインストール」 |
+| 外部3ツールを自分でビルドせず Docker で使う | [docker.md](docker.md) |
+
+**開発する人向け**
+
+| やりたいこと | 読む文書 |
+|---|---|
+| 処理の流れと外部ツールの入出力形式を知る | [pipeline.md](pipeline.md) |
+| なぜ Rust / mp4-atom なのか、他をなぜ却下したか | [tech-stack.md](tech-stack.md) |
 | CM 検出の仕組みを理解する（背景知識） | [cm-detection.md](cm-detection.md) |
 | カット処理を実装する / バグを直す | [lossless-cut.md](lossless-cut.md) |
 | mp4 の読み書きコードを書く | [mp4-atom.md](mp4-atom.md) |
-| 外部ツールを macOS でビルドする | [toolchain-macos.md](toolchain-macos.md) |
 | 実測値（GOP 長・カット精度・検出品質）を見る | [measurements.md](measurements.md) |
-| 現在の構成・自己検証・未対応の入力・未解決事項を知る | [architecture.md](architecture.md) |
-| 手元の mp4 を一連で CM カットする | `tachikaze auto`（`prepare`→`analyze`→gate→`cut`→`remap-subs` を対話なしで合成、説明は [architecture.md](architecture.md)「コマンド構成」） |
-| リポジトリを参照できない場所へインストールして使う | [architecture.md](architecture.md)「パス解決」節、[toolchain-macos.md](toolchain-macos.md)「ビルド後の配置とインストール」 |
-| 外部3ツールを自分でビルドせず Docker で使う | [docker.md](docker.md) |
+| モジュール構成・自己検証・未解決事項を知る | [architecture.md](architecture.md)（後半が開発者向け） |
 
 ## スコープ
 
@@ -70,10 +76,6 @@ Amatsukaze は MPEG2-TS を入力して CM カットとエンコードを行い 
 | [tobitti0/chapter_exe](https://github.com/tobitti0/chapter_exe) | 無音・シーンチェンジ検出 |
 | [tobitti0/join_logo_scp](https://github.com/tobitti0/join_logo_scp) | CM 判定（Trim 生成） |
 | [tobitti0/dtvindex](https://github.com/tobitti0/dtvindex) | 共通フレーム番号の索引・Trim/jls パーサ・チャプター生成 |
-
-## ライセンス
-
-本体は MIT（[LICENSE](../LICENSE)）。外部ツール・移植コードの表記は [THIRD-PARTY-NOTICES.md](../THIRD-PARTY-NOTICES.md)。
 
 ## 記述の約束
 
