@@ -42,7 +42,10 @@ docs/docker.md              インストールせず Docker で使う方法
 $ cargo test                  # 単体テスト
 $ cargo test -- --ignored     # E2E（要 ffmpeg / ffprobe / 外部3ツールとフィクスチャ）
 $ bash tests/fixtures/gen.sh   # フィクスチャ生成（コミットされていない）
+$ npm ci && npm run docs-lint  # ドキュメントの文面検査（CI の docs-lint と同じ）
 ```
+
+**ドキュメント（`README.md` / このファイル / `THIRD-PARTY-NOTICES.md` / `docs/` 以下）を編集したら `npm run docs-lint` を通すこと**。規則は `.textlintrc.json`（1文120字・読点5個までなど）。textlint の版は `package-lock.json` で固定してある。
 
 外部3ツール（chapter_exe / join_logo_scp / dtvindex）の用意は [docs/toolchain-macos.md](docs/toolchain-macos.md)。**テストは3ツールが有る環境でも無い環境でも通る**（どちらか一方でしか通らない状態にしないこと）。「ツールが見つからない」ことを期待するテストは、ツールを `PATH` に入れた環境では前提が崩れる。そのため子プロセスの `PATH` を空にして自分で条件を作る。例は `tests/auto_e2e.rs` の `run_auto_without_tools`。`src/analyze.rs` の `run_propagates_tool_resolution_failure_with_searched_locations` も同様。
 
