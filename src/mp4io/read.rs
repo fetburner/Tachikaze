@@ -151,17 +151,17 @@ pub struct SampleInfo {
 ///
 /// # 入力の検証
 ///
-/// サンプル表の `u32` は信頼しない。確保・展開ループの**前**に次を確認し、
-/// 失敗時はパニックではなく `Err` を返す（破損／悪意ある MP4 で OOM しないため）。
+/// サンプル表の `u32` は信頼しない。確保・減算・範囲生成の**前**に次を確認し、
+/// 失敗時はパニックや `unwrap_or(0)` での続行ではなく `Err` を返す
+/// （破損／悪意ある MP4 で OOM や silent な誤オフセットを起こさないため）。
 ///
 /// - `stsz` の件数・サイズ（および `count * size` / サイズ総和）が `file_len` 以下
 /// - `stts` / `ctts` の `sample_count` 合計が `stsz` の総数と一致（一致後だけ展開）
+/// - `stsc` の `first_chunk` が 1 始まり・厳密昇順・チャンク数以内、`samples_per_chunk != 0`
+/// - 展開後のサンプル数が `stsz` と一致、オフセット加算が overflow しない
 ///
 /// `file_len` は入力ファイルの実バイト長（それ以上に厳しい検証済み mdat 範囲でも可）。
 /// マジックなメモリ上限は持ち込まず、mdat に収まらない表を定義上あり得ないとして弾く。
-///
-/// `stsc` の `first_chunk` 検証（wrap / 静かな誤オフセット防止）は本関数の件数・サイズ
-/// 検証とは別関心として後続で扱う。
 pub fn samples(stbl: &Stbl, file_len: u64) -> anyhow::Result<Vec<SampleInfo>> {
     let sizes = validate_and_collect_sizes(&stbl.stsz.samples, file_len)?;
     let total = sizes.len();
@@ -171,6 +171,12 @@ pub fn samples(stbl: &Stbl, file_len: u64) -> anyhow::Result<Vec<SampleInfo>> {
         (_, Some(co64)) => co64.entries.clone(),
         _ => vec![],
     };
+    let n_chunks = u32::try_from(chunk_offsets.len()).map_err(|_| {
+        anyhow::anyhow!(
+            "stco/co64 のチャンク数({})が u32::MAX を超えています",
+            chunk_offsets.len()
+        )
+    })?;
 
     let durations = expand_stts(&stbl.stts.entries, total)?;
     let cts_offsets = expand_ctts(stbl.ctts.as_ref(), total)?;
@@ -184,8 +190,11 @@ pub fn samples(stbl: &Stbl, file_len: u64) -> anyhow::Result<Vec<SampleInfo>> {
         .map(|stss| stss.entries.iter().copied().collect())
         .unwrap_or_default();
 
+    validate_stsc(&stbl.stsc.entries, n_chunks)?;
+
     // stsc をチャンクごとに展開しながら、チャンク先頭オフセットに直前サンプルの
     // サイズを積算してオフセットを求める。内側ループが無いため O(n)。
+    // 事前条件は validate_stsc 済みなので first_chunk - 1 は underflow しない。
     let mut out = Vec::with_capacity(total);
     let mut sample_index = 0usize;
     let stsc_entries = &stbl.stsc.entries;
@@ -193,16 +202,22 @@ pub fn samples(stbl: &Stbl, file_len: u64) -> anyhow::Result<Vec<SampleInfo>> {
     for (i, entry) in stsc_entries.iter().enumerate() {
         let last_chunk = match stsc_entries.get(i + 1) {
             Some(next) => next.first_chunk - 1,
-            None => chunk_offsets.len() as u32,
+            None => n_chunks,
         };
 
         for chunk in entry.first_chunk..=last_chunk {
-            let chunk_index = chunk as usize - 1;
-            let mut offset = chunk_offsets.get(chunk_index).copied().unwrap_or(0);
+            let chunk_index = (chunk as usize) - 1;
+            let mut offset = *chunk_offsets.get(chunk_index).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "stsc が指す chunk {chunk} が stco/co64 の範囲外です（チャンク数 {n_chunks}）"
+                )
+            })?;
 
             for _ in 0..entry.samples_per_chunk {
                 if sample_index >= total {
-                    break;
+                    anyhow::bail!(
+                        "stsc が stsz のサンプル数({total})を超えるサンプルを生成しようとしました"
+                    );
                 }
 
                 let size = sizes[sample_index];
@@ -215,10 +230,21 @@ pub fn samples(stbl: &Stbl, file_len: u64) -> anyhow::Result<Vec<SampleInfo>> {
                     is_sync: all_sync || sync_samples.contains(&sample_number),
                 });
 
-                offset += u64::from(size);
+                offset = offset.checked_add(u64::from(size)).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "サンプル {sample_index} の file_offset 加算が overflow しました \
+                         (offset={offset}, size={size})"
+                    )
+                })?;
                 sample_index += 1;
             }
         }
+    }
+
+    if sample_index != total {
+        anyhow::bail!(
+            "stsc が生成したサンプル数({sample_index})が stsz のサンプル数({total})と一致しません"
+        );
     }
 
     Ok(out)
@@ -335,6 +361,35 @@ fn sum_sample_counts(counts: impl Iterator<Item = u32>, table: &str) -> anyhow::
         })?;
     }
     Ok(sum)
+}
+
+/// `stsc` 展開前の事前条件。満たせば `first_chunk - 1` は underflow しない。
+fn validate_stsc(entries: &[mp4_atom::StscEntry], n_chunks: u32) -> anyhow::Result<()> {
+    let mut prev_first: Option<u32> = None;
+    for (i, entry) in entries.iter().enumerate() {
+        if entry.first_chunk == 0 {
+            anyhow::bail!("stsc[{i}] の first_chunk が 0 です（MP4 仕様では 1 始まり）");
+        }
+        if entry.first_chunk > n_chunks {
+            anyhow::bail!(
+                "stsc[{i}] の first_chunk ({}) がチャンク数 ({n_chunks}) を超えています",
+                entry.first_chunk
+            );
+        }
+        if entry.samples_per_chunk == 0 {
+            anyhow::bail!("stsc[{i}] の samples_per_chunk が 0 です");
+        }
+        if let Some(prev) = prev_first {
+            if entry.first_chunk <= prev {
+                anyhow::bail!(
+                    "stsc[{i}] の first_chunk ({}) が前エントリ ({prev}) 以下です（厳密な昇順が必要）",
+                    entry.first_chunk
+                );
+            }
+        }
+        prev_first = Some(entry.first_chunk);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -862,7 +917,7 @@ mod tests {
         );
     }
 
-    // --- サンプル表の検証（E17: 過大確保・整数 wrap を拒否） ---
+    // --- サンプル表の検証（件数・サイズ・stsc の不正値を拒否） ---
 
     /// 最小限の正常 stbl（1 チャンク・1 サンプル）をベースに壊す。
     fn minimal_valid_stbl() -> Stbl {
@@ -1020,5 +1075,146 @@ mod tests {
             format!("{err:#}").contains("ctts"),
             "ctts 検証であること: {err:#}"
         );
+    }
+
+    #[test]
+    fn samples_rejects_stsc_first_chunk_zero() {
+        let mut stbl = minimal_valid_stbl();
+        stbl.stsc.entries[0].first_chunk = 0;
+        let err = samples(&stbl, SYNTH_FILE_LEN).expect_err("first_chunk=0");
+        assert!(
+            format!("{err:#}").contains("first_chunk"),
+            "first_chunk 検証であること: {err:#}"
+        );
+    }
+
+    #[test]
+    fn samples_rejects_stsc_non_ascending_first_chunk() {
+        use mp4_atom::{Stco, StscEntry};
+        let mut stbl = minimal_valid_stbl();
+        stbl.stsz.samples = StszSamples::Identical { count: 2, size: 10 };
+        stbl.stts.entries[0].sample_count = 2;
+        stbl.stco = Some(Stco {
+            entries: vec![0, 100],
+        });
+        stbl.stsc.entries = vec![
+            StscEntry {
+                first_chunk: 1,
+                samples_per_chunk: 1,
+                sample_description_index: 1,
+            },
+            StscEntry {
+                first_chunk: 1, // 昇順でない
+                samples_per_chunk: 1,
+                sample_description_index: 1,
+            },
+        ];
+        let err = samples(&stbl, SYNTH_FILE_LEN).expect_err("非昇順");
+        assert!(
+            format!("{err:#}").contains("昇順") || format!("{err:#}").contains("first_chunk"),
+            "昇順検証であること: {err:#}"
+        );
+    }
+
+    #[test]
+    fn samples_rejects_stsc_first_chunk_beyond_chunk_count() {
+        let mut stbl = minimal_valid_stbl();
+        stbl.stsc.entries[0].first_chunk = 2; // チャンクは 1 個だけ
+        let err = samples(&stbl, SYNTH_FILE_LEN).expect_err("チャンク数超過");
+        assert!(
+            format!("{err:#}").contains("チャンク数") || format!("{err:#}").contains("first_chunk"),
+            "チャンク数超過であること: {err:#}"
+        );
+    }
+
+    #[test]
+    fn samples_rejects_stsc_samples_per_chunk_zero() {
+        let mut stbl = minimal_valid_stbl();
+        stbl.stsc.entries[0].samples_per_chunk = 0;
+        let err = samples(&stbl, SYNTH_FILE_LEN).expect_err("samples_per_chunk=0");
+        assert!(
+            format!("{err:#}").contains("samples_per_chunk"),
+            "samples_per_chunk 検証であること: {err:#}"
+        );
+    }
+
+    #[test]
+    fn samples_rejects_stsc_sample_count_shortfall() {
+        let mut stbl = minimal_valid_stbl();
+        stbl.stsz.samples = StszSamples::Identical { count: 3, size: 10 };
+        stbl.stts.entries[0].sample_count = 3;
+        // stsc は 1 サンプルしか出さない
+        stbl.stsc.entries[0].samples_per_chunk = 1;
+        let err = samples(&stbl, SYNTH_FILE_LEN).expect_err("サンプル不足");
+        assert!(
+            format!("{err:#}").contains("一致しません") || format!("{err:#}").contains("stsc"),
+            "サンプル数不一致であること: {err:#}"
+        );
+    }
+
+    #[test]
+    fn samples_rejects_offset_overflow() {
+        use mp4_atom::{Co64, StscEntry, SttsEntry};
+        let mut stbl = Stbl::default();
+        stbl.stsz.samples = StszSamples::Identical {
+            count: 2,
+            size: 100,
+        };
+        // チャンク先頭がほぼ u64::MAX なので size 加算で overflow（co64 で u64 オフセット）
+        stbl.co64 = Some(Co64 {
+            entries: vec![u64::MAX - 50],
+        });
+        stbl.stsc.entries = vec![StscEntry {
+            first_chunk: 1,
+            samples_per_chunk: 2,
+            sample_description_index: 1,
+        }];
+        stbl.stts.entries = vec![SttsEntry {
+            sample_count: 2,
+            sample_delta: 1,
+        }];
+        // file_len はサイズ総和だけ満たす（オフセット自体はファイル長検証対象外）
+        let err = samples(&stbl, 200).expect_err("offset overflow");
+        assert!(
+            format!("{err:#}").contains("overflow"),
+            "offset overflow であること: {err:#}"
+        );
+    }
+
+    #[test]
+    fn samples_valid_multi_stsc_unchanged() {
+        use mp4_atom::{Stco, StscEntry, SttsEntry};
+        // samples_with_identical_stsz_sizes と同じ表を、検証経路でも結果が不変であることを固定
+        let mut stbl = Stbl::default();
+        stbl.stsz.samples = StszSamples::Identical {
+            count: 5,
+            size: 100,
+        };
+        stbl.stco = Some(Stco {
+            entries: vec![1000, 2000],
+        });
+        stbl.stsc.entries = vec![
+            StscEntry {
+                first_chunk: 1,
+                samples_per_chunk: 3,
+                sample_description_index: 1,
+            },
+            StscEntry {
+                first_chunk: 2,
+                samples_per_chunk: 2,
+                sample_description_index: 1,
+            },
+        ];
+        stbl.stts.entries = vec![SttsEntry {
+            sample_count: 5,
+            sample_delta: 1000,
+        }];
+
+        let got = samples(&stbl, SYNTH_FILE_LEN).expect("正常");
+        assert_eq!(
+            got.iter().map(|s| s.file_offset).collect::<Vec<_>>(),
+            vec![1000, 1100, 1200, 2000, 2100]
+        );
+        assert!(got.iter().all(|s| s.size == 100 && s.duration == 1000));
     }
 }
