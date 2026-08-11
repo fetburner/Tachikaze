@@ -148,7 +148,10 @@ fn run_make_logo(args: MakeLogoArgs) -> anyhow::Result<()> {
     let (video_trak, _) = mp4io::read::find_video_track(&moov)
         .ok_or_else(|| anyhow!("映像トラックが見つかりません"))?;
     let video_size = video_size_from_trak(video_trak)?;
-    let frame_count = mp4io::read::samples(&video_trak.mdia.minf.stbl).len() as u64;
+    let file_len = fs::metadata(&input)
+        .path_ctx("入力 mp4 の metadata 取得", &input)?
+        .len();
+    let frame_count = mp4io::read::samples(&video_trak.mdia.minf.stbl, file_len)?.len() as u64;
 
     let ffmpeg = tools::resolve_tool(tools::FFMPEG)?;
     let cwd = std::env::current_dir().context("カレントディレクトリの取得に失敗しました")?;
@@ -610,7 +613,10 @@ pub(crate) fn execute_cut(params: CutParams) -> anyhow::Result<CutOutcome> {
         .ok_or_else(|| anyhow!("映像トラックが見つかりません"))?;
     let video_track_index = track_index(&moov, TrackKind::Video)
         .ok_or_else(|| anyhow!("映像トラックが見つかりません"))?;
-    let video_samples = mp4io::read::samples(&video_trak.mdia.minf.stbl);
+    let file_len = fs::metadata(&input)
+        .path_ctx("入力 mp4 の metadata 取得", &input)?
+        .len();
+    let video_samples = mp4io::read::samples(&video_trak.mdia.minf.stbl, file_len)?;
 
     let map = mp4io::order_map::DisplayDecodeMap::build(&video_samples)?;
     let sync_display = map.sync_display_indices();
@@ -644,7 +650,8 @@ pub(crate) fn execute_cut(params: CutParams) -> anyhow::Result<CutOutcome> {
     };
     let audio_samples: Option<Vec<SampleInfo>> = audio_track
         .as_ref()
-        .map(|(trak, _)| mp4io::read::samples(&trak.mdia.minf.stbl));
+        .map(|(trak, _)| mp4io::read::samples(&trak.mdia.minf.stbl, file_len))
+        .transpose()?;
     let audio_timescale = audio_track.as_ref().map(|(_, info)| info.timescale);
 
     let pipeline = CutPipeline {

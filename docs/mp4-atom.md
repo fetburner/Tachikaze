@@ -52,64 +52,37 @@ E2E で実検証済みか、認識のみ（未検証）かの区別は [measurem
 
 ## サンプル表の復元
 
-`stbl` から `(offset, size, duration, cts_offset, is_sync)` を組み立てる。検証済みコード:
+`stbl` からデコード順の `SampleInfo` を組み立てる。
+フィールドは `file_offset` / `size` / `duration` / `cts_offset` / `is_sync`。
+実装は `src/mp4io/read.rs::samples(stbl, file_len) -> Result<Vec<SampleInfo>>`。
 
-```rust
-fn samples(stbl: &Stbl) -> Vec<(u64, u32, u32, i64, bool)> {
-    let sizes: Vec<u32> = match &stbl.stsz.samples {
-        StszSamples::Identical { count, size } => vec![*size; *count as usize],
-        StszSamples::Different { sizes } => sizes.clone(),
-    };
-    let chunk_offsets: Vec<u64> = match (&stbl.stco, &stbl.co64) {
-        (Some(stco), _) => stco.entries.iter().map(|&o| o as u64).collect(),
-        (_, Some(co64)) => co64.entries.clone(),
-        _ => vec![],
-    };
-    // stsc を展開して sample -> chunk を得る
-    let mut samp_chunk = vec![];
-    {
-        let e = &stbl.stsc.entries;
-        let mut si = 0usize;
-        for (i, ent) in e.iter().enumerate() {
-            let last = if i + 1 < e.len() { e[i+1].first_chunk - 1 }
-                       else { chunk_offsets.len() as u32 };
-            for c in ent.first_chunk..=last {
-                for _ in 0..ent.samples_per_chunk {
-                    if si < sizes.len() { samp_chunk.push(c as usize - 1); si += 1; }
-                }
-            }
-        }
-    }
-    let mut durs = vec![];
-    for e in &stbl.stts.entries {
-        for _ in 0..e.sample_count { durs.push(e.sample_delta); }
-    }
-    let mut ctss = vec![0i64; sizes.len()];
-    if let Some(ctts) = &stbl.ctts {
-        let mut i = 0usize;
-        for e in &ctts.entries {
-            for _ in 0..e.sample_count {
-                if i < ctss.len() { ctss[i] = e.sample_offset; i += 1; }
-            }
-        }
-    }
-    // stss は 1 始まり。存在しない場合は全サンプルが同期扱い（音声など）
-    let sync: std::collections::HashSet<u32> = stbl.stss.as_ref()
-        .map(|s| s.entries.iter().cloned().collect()).unwrap_or_default();
+### 組み立て手順
 
-    let mut out = vec![];
-    for i in 0..sizes.len() {
-        let c = samp_chunk[i];
-        let mut off = chunk_offsets[c];
-        for j in 0..i { if samp_chunk[j] == c { off += sizes[j] as u64; } }
-        out.push((off, sizes[i], *durs.get(i).unwrap_or(&0), ctss[i],
-                  sync.is_empty() || sync.contains(&(i as u32 + 1))));
-    }
-    out
-}
-```
+1. `stsz` から各サンプルのサイズ列を得る（`Identical` / `Different`）
+2. `stco` または `co64` からチャンク先頭オフセットを得る
+3. `stts` / `ctts` を展開して duration / cts_offset 列を得る
+   （`stss` は 1 始まり。無いトラックは全サンプル同期扱い）
+4. `stsc` をチャンクごとに展開し、チャンク先頭オフセットに直前サンプルのサイズを積算して
+   各サンプルの `file_offset` を求める（**O(n)**）。
+   チャンク内で毎回 0 から積み直す O(n²) に戻さないこと。
+   10 万サンプルで線形であることを確認するテストあり。
 
-**性能上の注意**: 上の内側ループ（`for j in 0..i`）は O(n²)。10 万サンプルでは実測で許容範囲だった。しかし本実装（`src/mp4io/read.rs` の `samples`）では**チャンク先頭のオフセットに前サンプルのサイズを積算していく O(n) の形に直してある**（10 万サンプルで線形であることを確認するテストあり）。この内側ループを再導入しないこと。
+### 入力検証（破損／悪意ある MP4 向け）
+
+サンプル表の `u32` は信頼しない。
+確保・展開ループの**前**に検証し、失敗時はパニックではなく **`Err` で停止**する（OOM を起こさない）。
+
+| 対象 | 検証内容 |
+|---|---|
+| `stsz` | 件数は `file_len` 以下（`size=0` でも巨大 `count` を許さない）。`Identical` は `count * size` を `checked_mul`。`Different` はサイズ総和を `checked_add`。いずれも `file_len` 超でエラー。これで `write.rs` の `copy_buf.resize(s.size)` に届く `size` もファイル長以下に束縛される |
+| `stts` / `ctts` | 展開前に `sample_count` を `checked_add` で合計し、`stsz` の総数と一致することを確認する。一致後だけ、既に束縛済みの件数を capacity / ループ上限に使う（`take(total)` で矛盾を隠さない） |
+
+`file_len` は入力ファイルの実バイト長（それ以上に厳しい検証済み mdat 範囲でも可）。
+マジックなメモリ上限は持ち込まず、「mdat に収まらない件数・サイズは定義上あり得ない」として束縛する。
+
+`stsc` の `first_chunk` 検証（wrap / 静かな誤オフセット防止）は別途扱う。
+
+**やらないこと**: `mp4-atom` のボックスパーサ自体の改修（検証は `samples()` 側で足りる）。
 
 ## トップレベルから moov を取り出す
 
@@ -138,31 +111,32 @@ Ftyp { major_brand: b"isom".into(), minor_version: 512,
     .encode(&mut buf)?;
 
 // 2. mdat 本体を組み立てつつ新しいオフセットを記録
+//    samples() は file_len で件数・サイズを検証し Result を返す
 let mdat_body_start = buf.len() as u64 + 8;   // mdat ヘッダ 8 バイト
 for (ti, trak) in moov.trak.iter().enumerate() {
-    let s = samples(&trak.mdia.minf.stbl);
+    let s = samples(&trak.mdia.minf.stbl, file_len)?;
     for &i in &keep[ti] {
         offs.push(mdat_body_start + mdat.len() as u64);
-        // 元ファイルの s[i].0 から s[i].1 バイト読んで mdat に追記
+        // 元ファイルの s[i].file_offset から s[i].size バイト読んで mdat に追記
     }
 }
 
 // 3. moov を clone してテーブルだけ差し替え
 let mut nmoov = moov.clone();
 for (ti, trak) in nmoov.trak.iter_mut().enumerate() {
-    let s = samples(&moov.trak[ti].mdia.minf.stbl);
+    let s = samples(&moov.trak[ti].mdia.minf.stbl, file_len)?;
     let k = &keep[ti];
     let stbl = &mut trak.mdia.minf.stbl;
     stbl.stsz = Stsz { samples: StszSamples::Different {
-        sizes: k.iter().map(|&i| s[i].1).collect() } };
+        sizes: k.iter().map(|&i| s[i].size).collect() } };
     stbl.stts = Stts { entries: k.iter()
-        .map(|&i| SttsEntry { sample_count: 1, sample_delta: s[i].2 }).collect() };
+        .map(|&i| SttsEntry { sample_count: 1, sample_delta: s[i].duration }).collect() };
     stbl.ctts = moov.trak[ti].mdia.minf.stbl.ctts.as_ref().map(|_| Ctts {
         entries: k.iter()
-            .map(|&i| CttsEntry { sample_count: 1, sample_offset: s[i].3 }).collect() });
+            .map(|&i| CttsEntry { sample_count: 1, sample_offset: s[i].cts_offset }).collect() });
     stbl.stss = moov.trak[ti].mdia.minf.stbl.stss.as_ref().map(|_| Stss {
         entries: k.iter().enumerate()
-            .filter(|&(_, &i)| s[i].4).map(|(n, _)| n as u32 + 1).collect() });
+            .filter(|&(_, &i)| s[i].is_sync).map(|(n, _)| n as u32 + 1).collect() });
     stbl.stsc = Stsc { entries: vec![StscEntry {
         first_chunk: 1, samples_per_chunk: k.len() as u32,
         sample_description_index: 1 }] };

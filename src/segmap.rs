@@ -373,7 +373,10 @@ mod tests {
         let input_path = PathBuf::from(FIXTURE);
         let moov = read_moov(&input_path).expect("moov を読めること");
         let (video_trak, video_info) = find_video_track(&moov).expect("映像トラックが見つかること");
-        let video_samples = samples(&video_trak.mdia.minf.stbl);
+        let file_len = std::fs::metadata(&input_path)
+            .expect("fixture metadata")
+            .len();
+        let video_samples = samples(&video_trak.mdia.minf.stbl, file_len).expect("samples");
         let total_frames = video_samples.len() as u32;
 
         let map = DisplayDecodeMap::build(&video_samples).expect("同値の合成時刻は無いはず");

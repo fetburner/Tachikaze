@@ -280,6 +280,16 @@ pub fn write_mp4<P: AsRef<Path>>(
         moov.trak.len()
     );
 
+    let input_path = input_path.as_ref();
+    let file_len = std::fs::metadata(input_path)
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "入力ファイル({})の metadata 取得に失敗しました: {e}",
+                input_path.display()
+            )
+        })?
+        .len();
+
     // 元ファイルのトラックごとのサンプル表(デコード順)を復元し、keep リストが
     // 指す実際のサンプルを解決しておく。
     let kept_samples: Vec<Vec<SampleInfo>> = moov
@@ -288,7 +298,7 @@ pub fn write_mp4<P: AsRef<Path>>(
         .zip(keep_per_track.iter())
         .enumerate()
         .map(|(ti, (trak, keep))| {
-            let all = samples(&trak.mdia.minf.stbl);
+            let all = samples(&trak.mdia.minf.stbl, file_len)?;
             resolve_kept_samples(ti, keep, &all)
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
@@ -581,6 +591,10 @@ mod tests {
     // cwd 非依存にする（`external::tests` がプロセスの cwd を一時的に変えるため）。
     const FIXTURE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/sample.mp4");
 
+    fn fixture_file_len() -> u64 {
+        std::fs::metadata(FIXTURE).expect("fixture metadata").len()
+    }
+
     fn skip_if_fixture_missing() -> bool {
         if Path::new(FIXTURE).exists() {
             return false;
@@ -660,8 +674,10 @@ mod tests {
         let (audio_trak, _) =
             crate::mp4io::read::find_audio_track(&moov).expect("音声トラックがあること");
 
-        let video_samples = samples(&video_trak.mdia.minf.stbl);
-        let audio_samples = samples(&audio_trak.mdia.minf.stbl);
+        let video_samples =
+            samples(&video_trak.mdia.minf.stbl, fixture_file_len()).expect("samples");
+        let audio_samples =
+            samples(&audio_trak.mdia.minf.stbl, fixture_file_len()).expect("samples");
 
         // 全サンプルを keep する(このテストの主眼はカット処理の正しさではなく
         // 書き出しパイプラインが有効な mp4 を生成できること)。
@@ -669,7 +685,9 @@ mod tests {
             .trak
             .iter()
             .map(|trak| {
-                let n = samples(&trak.mdia.minf.stbl).len();
+                let n = samples(&trak.mdia.minf.stbl, fixture_file_len())
+                    .expect("samples")
+                    .len();
                 (0..n as u32).map(DecodeIdx).collect()
             })
             .collect();
@@ -704,7 +722,8 @@ mod tests {
         let moov = crate::mp4io::read::read_moov(FIXTURE).expect("moov を読めること");
         let (video_trak, _) =
             crate::mp4io::read::find_video_track(&moov).expect("映像トラックがあること");
-        let video_samples = samples(&video_trak.mdia.minf.stbl);
+        let video_samples =
+            samples(&video_trak.mdia.minf.stbl, fixture_file_len()).expect("samples");
 
         // 音声トラックの keep リストを空にして、音声を含めない出力を作る
         // (--video-only 相当)。
@@ -717,7 +736,9 @@ mod tests {
                     Some(mp4_atom::Codec::Avc1(_))
                 );
                 if codec_is_video {
-                    let n = samples(&trak.mdia.minf.stbl).len();
+                    let n = samples(&trak.mdia.minf.stbl, fixture_file_len())
+                        .expect("samples")
+                        .len();
                     (0..n as u32).map(DecodeIdx).collect()
                 } else {
                     Vec::new()
@@ -849,7 +870,9 @@ mod tests {
             .trak
             .iter()
             .map(|trak| {
-                let n = samples(&trak.mdia.minf.stbl).len();
+                let n = samples(&trak.mdia.minf.stbl, fixture_file_len())
+                    .expect("samples")
+                    .len();
                 (0..n as u32).map(DecodeIdx).collect()
             })
             .collect();
@@ -1043,13 +1066,16 @@ mod tests {
         let moov = crate::mp4io::read::read_moov(FIXTURE).expect("moov を読めること");
         let (video_trak, _) =
             crate::mp4io::read::find_video_track(&moov).expect("映像トラックがあること");
-        let video_samples = samples(&video_trak.mdia.minf.stbl);
+        let video_samples =
+            samples(&video_trak.mdia.minf.stbl, fixture_file_len()).expect("samples");
 
         let keep_per_track: Vec<Vec<DecodeIdx>> = moov
             .trak
             .iter()
             .map(|trak| {
-                let n = samples(&trak.mdia.minf.stbl).len();
+                let n = samples(&trak.mdia.minf.stbl, fixture_file_len())
+                    .expect("samples")
+                    .len();
                 (0..n as u32).map(DecodeIdx).collect()
             })
             .collect();
@@ -1122,14 +1148,18 @@ mod tests {
             crate::mp4io::read::find_video_track(&moov).expect("映像トラックがあること");
         let (audio_trak, _) =
             crate::mp4io::read::find_audio_track(&moov).expect("音声トラックがあること");
-        let orig_video_samples = samples(&video_trak.mdia.minf.stbl);
-        let orig_audio_samples = samples(&audio_trak.mdia.minf.stbl);
+        let orig_video_samples =
+            samples(&video_trak.mdia.minf.stbl, fixture_file_len()).expect("samples");
+        let orig_audio_samples =
+            samples(&audio_trak.mdia.minf.stbl, fixture_file_len()).expect("samples");
 
         let keep_per_track: Vec<Vec<DecodeIdx>> = moov
             .trak
             .iter()
             .map(|trak| {
-                let n = samples(&trak.mdia.minf.stbl).len();
+                let n = samples(&trak.mdia.minf.stbl, fixture_file_len())
+                    .expect("samples")
+                    .len();
                 (0..n as u32).map(DecodeIdx).collect()
             })
             .collect();
@@ -1149,8 +1179,10 @@ mod tests {
             crate::mp4io::read::find_video_track(&out_moov).expect("映像トラックがあること");
         let (out_audio_trak, _) =
             crate::mp4io::read::find_audio_track(&out_moov).expect("音声トラックがあること");
-        let out_video_samples = samples(&out_video_trak.mdia.minf.stbl);
-        let out_audio_samples = samples(&out_audio_trak.mdia.minf.stbl);
+        let out_video_samples =
+            samples(&out_video_trak.mdia.minf.stbl, fixture_file_len()).expect("samples");
+        let out_audio_samples =
+            samples(&out_audio_trak.mdia.minf.stbl, fixture_file_len()).expect("samples");
 
         assert_eq!(out_video_samples.len(), orig_video_samples.len());
         assert_eq!(out_audio_samples.len(), orig_audio_samples.len());
@@ -1206,7 +1238,9 @@ mod tests {
             .trak
             .iter()
             .map(|trak| {
-                let n = samples(&trak.mdia.minf.stbl).len();
+                let n = samples(&trak.mdia.minf.stbl, fixture_file_len())
+                    .expect("samples")
+                    .len();
                 (0..n as u32).map(DecodeIdx).collect()
             })
             .collect();
@@ -1311,7 +1345,9 @@ mod tests {
             .trak
             .iter()
             .map(|trak| {
-                let n = samples(&trak.mdia.minf.stbl).len();
+                let n = samples(&trak.mdia.minf.stbl, fixture_file_len())
+                    .expect("samples")
+                    .len();
                 (0..n as u32).map(DecodeIdx).collect()
             })
             .collect();
