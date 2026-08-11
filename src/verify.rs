@@ -256,10 +256,26 @@ fn verify_written_output(
             tmp_path.display()
         )
     })?;
+    let output_file_len = std::fs::metadata(tmp_path)
+        .with_context(|| {
+            format!(
+                "検証のため出力ファイル({})の metadata 取得に失敗しました",
+                tmp_path.display()
+            )
+        })?
+        .len();
+    let input_file_len = std::fs::metadata(input_path)
+        .with_context(|| {
+            format!(
+                "検証のため入力ファイル({})の metadata 取得に失敗しました",
+                input_path.display()
+            )
+        })?
+        .len();
 
     let (output_video_trak, _) = find_video_track(&output_moov)
         .ok_or_else(|| anyhow::anyhow!("出力ファイルに映像トラックが見つかりません"))?;
-    let output_video_samples = samples(&output_video_trak.mdia.minf.stbl);
+    let output_video_samples = samples(&output_video_trak.mdia.minf.stbl, output_file_len)?;
 
     // 検査1・3: 区間ごとのパケット数と、各区間先頭が同期サンプルであること。
     verify_video_ranges(&output_video_samples, snapped_video_ranges)?;
@@ -268,7 +284,7 @@ fn verify_written_output(
     verify_display_order_is_contiguous(&output_video_samples)?;
 
     // 検査4: 元ファイルの自前導出が .dtvi と一致すること（設計判断1参照）。
-    verify_dtvi_consistency(original_moov, video_order, dtvi)?;
+    verify_dtvi_consistency(original_moov, video_order, dtvi, input_file_len)?;
 
     // 検査5: 音声が正しい位置から取れていること（--video-only ならスキップ）。
     // 出力ファイルの音声トラックの SampleInfo は、音声を含む場合だけここで読む
@@ -280,7 +296,7 @@ fn verify_written_output(
                     "検査5(音声の位置)に失敗: 出力ファイルに音声トラックが見つかりません"
                 )
             })?;
-            Some(samples(&output_audio_trak.mdia.minf.stbl))
+            Some(samples(&output_audio_trak.mdia.minf.stbl, output_file_len)?)
         }
         None => None,
     };
@@ -295,7 +311,8 @@ fn verify_written_output(
             let (original_video_trak, _) = find_video_track(original_moov).ok_or_else(|| {
                 anyhow::anyhow!("検査5(音声の位置)に失敗: 元ファイルに映像トラックが見つかりません")
             })?;
-            let original_video_samples = samples(&original_video_trak.mdia.minf.stbl);
+            let original_video_samples =
+                samples(&original_video_trak.mdia.minf.stbl, input_file_len)?;
             Some(independent_video_segment_source_starts(
                 snapped_video_ranges,
                 video_order,
@@ -423,11 +440,12 @@ fn verify_dtvi_consistency(
     original_moov: &Moov,
     video_order: &OrderMap,
     dtvi: &Dtvi,
+    input_file_len: u64,
 ) -> anyhow::Result<()> {
     let (orig_video_trak, _) = find_video_track(original_moov).ok_or_else(|| {
         anyhow::anyhow!("検査4(.dtvi突き合わせ)に失敗: 元ファイルに映像トラックが見つかりません")
     })?;
-    let orig_video_samples = samples(&orig_video_trak.mdia.minf.stbl);
+    let orig_video_samples = samples(&orig_video_trak.mdia.minf.stbl, input_file_len)?;
 
     // video_order が今まさに検証しようとしている元ファイルの映像トラックから作られた
     // ものであることの安価な整合性チェック(対応数の一致)。古い/別ファイル由来の
@@ -1220,9 +1238,12 @@ mod tests {
     fn build_fixture() -> Fixture {
         let input_path = PathBuf::from(FIXTURE);
         let moov = read_moov(&input_path).expect("moov を読めること");
+        let file_len = std::fs::metadata(&input_path)
+            .expect("fixture metadata")
+            .len();
 
         let (video_trak, video_info) = find_video_track(&moov).expect("映像トラックが見つかること");
-        let video_samples = samples(&video_trak.mdia.minf.stbl);
+        let video_samples = samples(&video_trak.mdia.minf.stbl, file_len).expect("samples");
         let total_frames = video_samples.len() as u32;
 
         let map = DisplayDecodeMap::build(&video_samples).expect("同値の合成時刻は無いはず");
@@ -1237,7 +1258,7 @@ mod tests {
         let video_keep = plan::keep_list(&snapped, &map.order).expect("keep_list が成功すること");
 
         let (audio_trak, audio_info) = find_audio_track(&moov).expect("音声トラックが見つかること");
-        let audio_samples = samples(&audio_trak.mdia.minf.stbl);
+        let audio_samples = samples(&audio_trak.mdia.minf.stbl, file_len).expect("samples");
 
         // 区間ごとの映像再生時間(音声ドリフト計算用)。keep_list と同じ区切り方をする。
         let mut video_segment_durations = Vec::new();
@@ -1983,7 +2004,10 @@ mod tests {
         let output_moov = read_moov(&output_path).expect("出力moovを読めること");
         let (output_video_trak, _) =
             find_video_track(&output_moov).expect("出力に映像トラックがあること");
-        let output_samples = samples(&output_video_trak.mdia.minf.stbl);
+        let out_len = std::fs::metadata(&output_path)
+            .expect("output metadata")
+            .len();
+        let output_samples = samples(&output_video_trak.mdia.minf.stbl, out_len).expect("samples");
         let target = &output_samples[5];
         assert!(target.size > 4, "壊すのに十分なサイズのサンプルであること");
 

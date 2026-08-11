@@ -216,7 +216,8 @@ fn video_only_cut_matches_source_packets_by_crc32() {
 
     let moov = read_moov(&fixture).expect("moov を読めること");
     let (video_trak, _) = find_video_track(&moov).expect("映像トラックが見つかること");
-    let video_samples = samples(&video_trak.mdia.minf.stbl);
+    let file_len = std::fs::metadata(&fixture).expect("fixture metadata").len();
+    let video_samples = samples(&video_trak.mdia.minf.stbl, file_len).expect("samples");
     let total_frames = video_samples.len() as u32;
     assert_eq!(
         total_frames, 599,

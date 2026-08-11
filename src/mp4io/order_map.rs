@@ -228,7 +228,8 @@ mod tests {
     fn video_samples() -> Vec<SampleInfo> {
         let moov = read_moov(FIXTURE).expect("moov を読めること");
         let (video_trak, _) = find_video_track(&moov).expect("映像トラックが見つかること");
-        samples(&video_trak.mdia.minf.stbl)
+        let file_len = std::fs::metadata(FIXTURE).expect("fixture metadata").len();
+        samples(&video_trak.mdia.minf.stbl, file_len).expect("samples")
     }
 
     // --- 完了条件1: 実フィクスチャで .dtvi と全行一致する ---

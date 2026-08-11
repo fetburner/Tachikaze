@@ -148,11 +148,22 @@ pub struct SampleInfo {
 /// `stsc` を展開する際、チャンク先頭のオフセットに前サンプルのサイズを積算していく
 /// ことで、各サンプルのオフセットを O(n) で求める（内側ループで毎回積算し直す
 /// O(n^2) 実装を避けている）。
-pub fn samples(stbl: &Stbl) -> Vec<SampleInfo> {
-    let sizes: Vec<u32> = match &stbl.stsz.samples {
-        StszSamples::Identical { count, size } => vec![*size; *count as usize],
-        StszSamples::Different { sizes } => sizes.clone(),
-    };
+///
+/// # 入力の検証
+///
+/// サンプル表の `u32` は信頼しない。確保・展開ループの**前**に次を確認し、
+/// 失敗時はパニックではなく `Err` を返す（破損／悪意ある MP4 で OOM しないため）。
+///
+/// - `stsz` の件数・サイズ（および `count * size` / サイズ総和）が `file_len` 以下
+/// - `stts` / `ctts` の `sample_count` 合計が `stsz` の総数と一致（一致後だけ展開）
+///
+/// `file_len` は入力ファイルの実バイト長（それ以上に厳しい検証済み mdat 範囲でも可）。
+/// マジックなメモリ上限は持ち込まず、mdat に収まらない表を定義上あり得ないとして弾く。
+///
+/// `stsc` の `first_chunk` 検証（wrap / 静かな誤オフセット防止）は本関数の件数・サイズ
+/// 検証とは別関心として後続で扱う。
+pub fn samples(stbl: &Stbl, file_len: u64) -> anyhow::Result<Vec<SampleInfo>> {
+    let sizes = validate_and_collect_sizes(&stbl.stsz.samples, file_len)?;
     let total = sizes.len();
 
     let chunk_offsets: Vec<u64> = match (&stbl.stco, &stbl.co64) {
@@ -161,25 +172,8 @@ pub fn samples(stbl: &Stbl) -> Vec<SampleInfo> {
         _ => vec![],
     };
 
-    let mut durations = Vec::with_capacity(total);
-    for entry in &stbl.stts.entries {
-        for _ in 0..entry.sample_count {
-            durations.push(entry.sample_delta);
-        }
-    }
-
-    let mut cts_offsets = vec![0i64; total];
-    if let Some(ctts) = &stbl.ctts {
-        let mut i = 0usize;
-        for entry in &ctts.entries {
-            for _ in 0..entry.sample_count {
-                if i < cts_offsets.len() {
-                    cts_offsets[i] = entry.sample_offset;
-                    i += 1;
-                }
-            }
-        }
-    }
+    let durations = expand_stts(&stbl.stts.entries, total)?;
+    let cts_offsets = expand_ctts(stbl.ctts.as_ref(), total)?;
 
     // stss が無いトラック（音声など）は全サンプルが同期扱い。
     // stss は 1 始まりのサンプル番号を持つ。
@@ -216,18 +210,131 @@ pub fn samples(stbl: &Stbl) -> Vec<SampleInfo> {
                 out.push(SampleInfo {
                     file_offset: offset,
                     size,
-                    duration: durations.get(sample_index).copied().unwrap_or(0),
+                    duration: durations[sample_index],
                     cts_offset: cts_offsets[sample_index],
                     is_sync: all_sync || sync_samples.contains(&sample_number),
                 });
 
-                offset += size as u64;
+                offset += u64::from(size);
                 sample_index += 1;
             }
         }
     }
 
-    out
+    Ok(out)
+}
+
+/// `stsz` をファイル長で束縛し、確保前に件数・サイズを検証する。
+fn validate_and_collect_sizes(samples: &StszSamples, file_len: u64) -> anyhow::Result<Vec<u32>> {
+    match samples {
+        StszSamples::Identical { count, size } => {
+            // size=0 でも巨大 count を許さない（件数自体をファイル長以下に束縛）。
+            if u64::from(*count) > file_len {
+                anyhow::bail!(
+                    "stsz sample count ({count}) が入力ファイル長 ({file_len}) を超えています"
+                );
+            }
+            if *count > 0 {
+                if u64::from(*size) > file_len {
+                    anyhow::bail!(
+                        "stsz sample size ({size}) が入力ファイル長 ({file_len}) を超えています"
+                    );
+                }
+                let total_bytes =
+                    u64::from(*count)
+                        .checked_mul(u64::from(*size))
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "stsz count ({count}) * size ({size}) が u64 を overflow します"
+                            )
+                        })?;
+                if total_bytes > file_len {
+                    anyhow::bail!(
+                        "stsz の合計サイズ ({total_bytes}) が入力ファイル長 ({file_len}) を超えています"
+                    );
+                }
+            }
+            let count_usize = usize::try_from(*count).map_err(|_| {
+                anyhow::anyhow!("stsz sample count ({count}) が usize に収まりません")
+            })?;
+            Ok(vec![*size; count_usize])
+        }
+        StszSamples::Different { sizes } => {
+            let count = sizes.len() as u64;
+            if count > file_len {
+                anyhow::bail!(
+                    "stsz sample count ({count}) が入力ファイル長 ({file_len}) を超えています"
+                );
+            }
+            let mut total_bytes: u64 = 0;
+            for (i, &size) in sizes.iter().enumerate() {
+                if u64::from(size) > file_len {
+                    anyhow::bail!(
+                        "stsz sample[{i}] size ({size}) が入力ファイル長 ({file_len}) を超えています"
+                    );
+                }
+                total_bytes = total_bytes.checked_add(u64::from(size)).ok_or_else(|| {
+                    anyhow::anyhow!("stsz のサイズ総和が u64 を overflow します（sample {i}）")
+                })?;
+            }
+            if total_bytes > file_len {
+                anyhow::bail!(
+                    "stsz の合計サイズ ({total_bytes}) が入力ファイル長 ({file_len}) を超えています"
+                );
+            }
+            Ok(sizes.clone())
+        }
+    }
+}
+
+/// `stts` の `sample_count` 合計が `total` と一致することを確認してから展開する。
+fn expand_stts(entries: &[mp4_atom::SttsEntry], total: usize) -> anyhow::Result<Vec<u32>> {
+    let sum = sum_sample_counts(entries.iter().map(|e| e.sample_count), "stts")?;
+    if sum != total as u64 {
+        anyhow::bail!(
+            "stts の sample_count 合計 ({sum}) が stsz のサンプル数 ({total}) と一致しません"
+        );
+    }
+    let mut durations = Vec::with_capacity(total);
+    for entry in entries {
+        for _ in 0..entry.sample_count {
+            durations.push(entry.sample_delta);
+        }
+    }
+    Ok(durations)
+}
+
+/// `ctts` の `sample_count` 合計が `total` と一致することを確認してから展開する。
+/// `ctts` が無い場合は全 0。
+fn expand_ctts(ctts: Option<&mp4_atom::Ctts>, total: usize) -> anyhow::Result<Vec<i64>> {
+    let mut cts_offsets = vec![0i64; total];
+    let Some(ctts) = ctts else {
+        return Ok(cts_offsets);
+    };
+    let sum = sum_sample_counts(ctts.entries.iter().map(|e| e.sample_count), "ctts")?;
+    if sum != total as u64 {
+        anyhow::bail!(
+            "ctts の sample_count 合計 ({sum}) が stsz のサンプル数 ({total}) と一致しません"
+        );
+    }
+    let mut i = 0usize;
+    for entry in &ctts.entries {
+        for _ in 0..entry.sample_count {
+            cts_offsets[i] = entry.sample_offset;
+            i += 1;
+        }
+    }
+    Ok(cts_offsets)
+}
+
+fn sum_sample_counts(counts: impl Iterator<Item = u32>, table: &str) -> anyhow::Result<u64> {
+    let mut sum: u64 = 0;
+    for count in counts {
+        sum = sum.checked_add(u64::from(count)).ok_or_else(|| {
+            anyhow::anyhow!("{table} の sample_count 合計が u64 を overflow します")
+        })?;
+    }
+    Ok(sum)
 }
 
 #[cfg(test)]
@@ -472,6 +579,15 @@ mod tests {
 
     // --- サンプル表の復元 ---
 
+    /// 合成 stbl 用。オフセット・サイズが収まる十分大きな「ファイル長」。
+    const SYNTH_FILE_LEN: u64 = 1_000_000;
+
+    fn file_len(path: &str) -> u64 {
+        std::fs::metadata(path)
+            .unwrap_or_else(|e| panic!("{path} の metadata 取得に失敗: {e}"))
+            .len()
+    }
+
     fn skip_if_ffprobe_missing() -> bool {
         match std::process::Command::new("ffprobe")
             .arg("-version")
@@ -555,7 +671,7 @@ mod tests {
         }
         let moov = read_moov(FIXTURE).expect("moov を読めること");
         let (video_trak, _) = find_video_track(&moov).expect("映像トラックが見つかること");
-        let ours = samples(&video_trak.mdia.minf.stbl);
+        let ours = samples(&video_trak.mdia.minf.stbl, file_len(FIXTURE)).expect("samples");
         let expected = ffprobe_packets("v:0");
 
         assert_eq!(ours.len(), expected.len(), "サンプル数が一致すること");
@@ -586,7 +702,7 @@ mod tests {
             StszSamples::Different { .. }
         ));
 
-        let ours = samples(&audio_trak.mdia.minf.stbl);
+        let ours = samples(&audio_trak.mdia.minf.stbl, file_len(FIXTURE)).expect("samples");
         let expected = ffprobe_packets("a:0");
 
         assert_eq!(ours.len(), expected.len(), "サンプル数が一致すること");
@@ -632,7 +748,7 @@ mod tests {
             sample_delta: 1000,
         }];
 
-        let got = samples(&stbl);
+        let got = samples(&stbl, SYNTH_FILE_LEN).expect("正常な表は成功すること");
 
         let expected_offsets = [1000u64, 1100, 1200, 2000, 2100];
         assert_eq!(got.len(), 5);
@@ -685,7 +801,7 @@ mod tests {
             entries: vec![1, 3],
         });
 
-        let got = samples(&stbl);
+        let got = samples(&stbl, SYNTH_FILE_LEN).expect("正常な表は成功すること");
 
         assert_eq!(got.len(), 4);
         let expected_offsets = [0u64, 10, 30, 60];
@@ -733,14 +849,176 @@ mod tests {
             sample_delta: 1,
         }];
 
+        // N * 100 バイトが収まるファイル長。
+        let file_len = (N as u64) * 100;
         let start = Instant::now();
-        let got = samples(&stbl);
+        let got = samples(&stbl, file_len).expect("正常な表は成功すること");
         let elapsed = start.elapsed();
 
         assert_eq!(got.len(), N);
         assert!(
             elapsed.as_millis() < BUDGET_MS,
             "O(n) 実装なら 10 万サンプルは高速なはず(実測 {elapsed:?})。O(n^2) に戻っていないか確認すること。"
+        );
+    }
+
+    // --- サンプル表の検証（E17: 過大確保・整数 wrap を拒否） ---
+
+    /// 最小限の正常 stbl（1 チャンク・1 サンプル）をベースに壊す。
+    fn minimal_valid_stbl() -> Stbl {
+        use mp4_atom::{Stco, StscEntry, SttsEntry};
+        let mut stbl = Stbl::default();
+        stbl.stsz.samples = StszSamples::Identical { count: 1, size: 10 };
+        stbl.stco = Some(Stco { entries: vec![0] });
+        stbl.stsc.entries = vec![StscEntry {
+            first_chunk: 1,
+            samples_per_chunk: 1,
+            sample_description_index: 1,
+        }];
+        stbl.stts.entries = vec![SttsEntry {
+            sample_count: 1,
+            sample_delta: 1,
+        }];
+        stbl
+    }
+
+    #[test]
+    fn samples_rejects_huge_identical_stsz_count_before_alloc() {
+        let mut stbl = minimal_valid_stbl();
+        stbl.stsz.samples = StszSamples::Identical {
+            count: u32::MAX,
+            size: 0, // size=0 でも巨大 count は拒否
+        };
+        stbl.stts.entries[0].sample_count = u32::MAX;
+        let err = samples(&stbl, 100).expect_err("巨大 count はエラー");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("stsz sample count"),
+            "確保前の件数エラーであること: {msg}"
+        );
+    }
+
+    #[test]
+    fn samples_rejects_huge_identical_stsz_size() {
+        let mut stbl = minimal_valid_stbl();
+        stbl.stsz.samples = StszSamples::Identical {
+            count: 1,
+            size: u32::MAX,
+        };
+        let err = samples(&stbl, 100).expect_err("巨大 size はエラー");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("stsz sample size"),
+            "サイズ検証エラーであること: {msg}"
+        );
+    }
+
+    #[test]
+    fn samples_rejects_identical_stsz_count_times_size_overflow() {
+        let mut stbl = minimal_valid_stbl();
+        // count * size が u64 を overflow（両方が大きな値）
+        stbl.stsz.samples = StszSamples::Identical {
+            count: u32::MAX,
+            size: u32::MAX,
+        };
+        // file_len を大きくして件数チェックをすり抜けさせ、乗算 overflow を狙う
+        let err = samples(&stbl, u64::from(u32::MAX)).expect_err("count*size overflow");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("overflow") || msg.contains("超えて"),
+            "乗算 overflow または合計超過であること: {msg}"
+        );
+    }
+
+    #[test]
+    fn samples_rejects_identical_stsz_total_exceeding_file_len() {
+        let mut stbl = minimal_valid_stbl();
+        stbl.stsz.samples = StszSamples::Identical {
+            count: 10,
+            size: 20,
+        };
+        stbl.stts.entries[0].sample_count = 10;
+        stbl.stsc.entries[0].samples_per_chunk = 10;
+        // 10 * 20 = 200 > 100
+        let err = samples(&stbl, 100).expect_err("合計サイズ超過");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("合計サイズ") || msg.contains("stsz"),
+            "合計サイズ検証であること: {msg}"
+        );
+    }
+
+    #[test]
+    fn samples_rejects_different_stsz_size_sum_overflow_and_mismatch() {
+        // 個別 size が file_len 超
+        let mut stbl = minimal_valid_stbl();
+        stbl.stsz.samples = StszSamples::Different {
+            sizes: vec![50, 60],
+        };
+        stbl.stts.entries[0].sample_count = 2;
+        stbl.stsc.entries[0].samples_per_chunk = 2;
+        let err = samples(&stbl, 55).expect_err("個別 size 超過");
+        assert!(
+            format!("{err:#}").contains("size"),
+            "size 超過であること: {err:#}"
+        );
+
+        // 総和が file_len 超（個別は file_len 以下）
+        stbl.stsz.samples = StszSamples::Different {
+            sizes: vec![40, 40],
+        };
+        let err = samples(&stbl, 70).expect_err("総和超過");
+        assert!(
+            format!("{err:#}").contains("合計サイズ"),
+            "総和超過であること: {err:#}"
+        );
+    }
+
+    #[test]
+    fn samples_rejects_stts_sample_count_mismatch_and_huge_before_expand() {
+        let mut stbl = minimal_valid_stbl();
+        // stsz は 1 なのに stts が巨大 → 展開前に不一致で落ちる（OOM しない）
+        stbl.stts.entries[0].sample_count = u32::MAX;
+        let err = samples(&stbl, SYNTH_FILE_LEN).expect_err("stts 不一致");
+        assert!(
+            format!("{err:#}").contains("stts"),
+            "stts 検証であること: {err:#}"
+        );
+
+        // 合計が overflow しうる複数エントリ
+        use mp4_atom::SttsEntry;
+        stbl.stts.entries = vec![
+            SttsEntry {
+                sample_count: u32::MAX,
+                sample_delta: 1,
+            },
+            SttsEntry {
+                sample_count: u32::MAX,
+                sample_delta: 1,
+            },
+        ];
+        let err = samples(&stbl, SYNTH_FILE_LEN).expect_err("stts sum overflow or mismatch");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("stts") || msg.contains("overflow"),
+            "stts 合計の検証であること: {msg}"
+        );
+    }
+
+    #[test]
+    fn samples_rejects_ctts_sample_count_mismatch() {
+        use mp4_atom::{Ctts, CttsEntry};
+        let mut stbl = minimal_valid_stbl();
+        stbl.ctts = Some(Ctts {
+            entries: vec![CttsEntry {
+                sample_count: u32::MAX,
+                sample_offset: 0,
+            }],
+        });
+        let err = samples(&stbl, SYNTH_FILE_LEN).expect_err("ctts 不一致");
+        assert!(
+            format!("{err:#}").contains("ctts"),
+            "ctts 検証であること: {err:#}"
         );
     }
 }
