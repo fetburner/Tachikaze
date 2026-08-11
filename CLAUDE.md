@@ -2,7 +2,7 @@
 
 mp4 に変換済みの録画ファイルを、**再エンコードせずに CM カット**するツール。CM 検出は既存ツール（chapter_exe → join_logo_scp）に任せ、本ツールは「Trim リスト → ロスレス出力」だけを担う。
 
-**状態**: `analyze` / `cut` / `prepare` / `remap-subs` / `auto` は**実装完了**（エピック E1〜E11 とそれぞれのサブ issue はすべてクローズ済み。経緯は `git log` の `[E1-1]`〜`[E11-7]`。E11 は字幕の保持と `auto`、#56）。言語は Rust、mp4 の読み書きは `mp4-atom` クレート。
+**状態**: `analyze` / `cut` / `prepare` / `remap-subs` / `auto` は**実装完了**。エピック E1〜E11 とそれぞれのサブ issue はすべてクローズ済み（経緯は `git log` の `[E1-1]`〜`[E11-7]`。E11 は字幕の保持と `auto`、#56）。言語は Rust、mp4 の読み書きは `mp4-atom` クレート。
 
 ```console
 $ tachikaze analyze IN.mp4 -o trim.avs --report
@@ -13,7 +13,7 @@ $ for f in *.mp4; do case "$f" in *_CMcut.mp4) continue;; esac; tachikaze auto "
 
 `--cache-dir` / `--dtvi` は省略可（既定 `~/.cache/tachikaze/<入力ごと>/` から自動的に繋がる。探索順は [docs/architecture.md](docs/architecture.md)「パス解決」節）。インストールして使う場合の配置先は [docs/toolchain-macos.md](docs/toolchain-macos.md)「ビルド後の配置とインストール」。外部3ツールを自分でビルドせず使いたい場合は [docs/docker.md](docs/docker.md)。
 
-手元のファイルを一通しで処理するときは `tachikaze auto`（gate が疑わしいと判定したら cut せず exit code 3 で停止し、直して `cut` するコマンド例を出す。`--ignore-gate` で無視できるが gate の判定だけを無視する。引数の誤りは clap の既定 exit code（2）のまま、gate 停止だけを3に分けている）。判断を挟みながら進めたい場合は従来どおり `analyze` → 目視 → `cut`。1プロセスにつき入力は1本で、繰り返しはシェルのループに任せる。
+手元のファイルを一通しで処理するときは `tachikaze auto`。gate が疑わしいと判定したら cut せず exit code 3 で停止し、直して `cut` するコマンド例を出す。`--ignore-gate` で無視できるが、無視されるのは gate の判定だけ。引数の誤りは clap の既定 exit code（2）のまま、gate 停止だけを3に分けている。判断を挟みながら進めたい場合は従来どおり `analyze` → 目視 → `cut`。1プロセスにつき入力は1本で、繰り返しはシェルのループに任せる。
 
 現在のコマンド構成・モジュール構成・自己検証の一覧は
 [docs/architecture.md](docs/architecture.md)。
@@ -23,7 +23,7 @@ $ for f in *.mp4; do case "$f" in *_CMcut.mp4) continue;; esac; tachikaze auto "
 **[docs/overview.md](docs/overview.md) に目的別のルーティング表がある。** 必要な文書だけを開くこと。各文書は独立して読める。
 
 ```
-docs/overview.md            入口。スコープと重要事実
+docs/overview.md            文書索引。スコープと重要事実（入口は README.md）
 docs/tech-stack.md          技術選定の根拠（却下した選択肢も）
 docs/pipeline.md            処理の流れと外部ツールの入出力形式
 docs/cm-detection.md        CM 検出の仕組み（背景知識）
@@ -44,7 +44,7 @@ $ cargo test -- --ignored     # E2E（要 ffmpeg / ffprobe / 外部3ツールと
 $ bash tests/fixtures/gen.sh   # フィクスチャ生成（コミットされていない）
 ```
 
-外部3ツール（chapter_exe / join_logo_scp / dtvindex）の用意は [docs/toolchain-macos.md](docs/toolchain-macos.md)。**テストは3ツールが有る環境でも無い環境でも通る**（どちらか一方でしか通らない状態にしないこと）。「ツールが見つからない」ことを期待するテストは、ツールを `PATH` に入れた環境では前提が崩れるため、子プロセスの `PATH` を空にして自分で条件を作る（`tests/auto_e2e.rs` の `run_auto_without_tools`、`src/analyze.rs` の `run_propagates_tool_resolution_failure_with_searched_locations`）。
+外部3ツール（chapter_exe / join_logo_scp / dtvindex）の用意は [docs/toolchain-macos.md](docs/toolchain-macos.md)。**テストは3ツールが有る環境でも無い環境でも通る**（どちらか一方でしか通らない状態にしないこと）。「ツールが見つからない」ことを期待するテストは、ツールを `PATH` に入れた環境では前提が崩れる。そのため子プロセスの `PATH` を空にして自分で条件を作る。例は `tests/auto_e2e.rs` の `run_auto_without_tools`。`src/analyze.rs` の `run_propagates_tool_resolution_failure_with_searched_locations` も同様。
 
 フィクスチャの**音声は時間変化する信号**にしてある（定常サイン波ではコーデックによって音声パケットが同一バイト列になり、罠 4 を検出できない）。`gen.sh` は Opus 版 `sample.mp4` と AAC 版 `sample_aac.mp4` を同じ映像条件で生成する。映像側のパラメータを変えると `tests/data/sample.dtvi` が使えなくなるので変えないこと。
 

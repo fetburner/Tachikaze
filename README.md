@@ -71,7 +71,7 @@ $ make install          # 既定は /usr/local。PREFIX=$HOME/.local も可
 
 ## ドキュメント
 
-詳細な入口は **[docs/overview.md](docs/overview.md)** です。目的別のルーティング表があります。
+詳細な文書索引は **[docs/overview.md](docs/overview.md)** です。目的別のルーティング表があります。
 
 使う人向け:
 

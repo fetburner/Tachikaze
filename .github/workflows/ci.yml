@@ -5,12 +5,12 @@ on:
     branches: [master]
   pull_request:
 
-# 本 CI は fmt / clippy / 単体テストのみで
-# 外部3ツールや ffmpeg も要らないため、1 vCPU の ubuntu-slim で足りる。
+# 本 CI は docs-lint（textlint）と test（fmt / clippy / 単体テスト）の2ジョブ。
+# どちらも外部3ツールや ffmpeg は要らないため、1 vCPU の ubuntu-slim で足りる。
 # 制約: ジョブ上限 15 分・特権操作不可（Docker-in-Docker 等）。
 # コールドビルドが 15 分に近づくようなら ubuntu-latest に戻す。
 jobs:
-  # 日本語ドキュメントの文面検査（ルールは .textlintrc.json）。
+  # 日本語ドキュメントの文面検査（ルールは .textlintrc.json、版は package-lock.json で固定）。
   # no-doubled-joshi / ja-no-mixed-period 等は技術文書では誤検知が多いため無効化し、
   # 文長(120字)・読点数など読みやすさに直結する規則だけを効かせている。
   docs-lint:
@@ -20,12 +20,10 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 20
+          cache: npm
+      - run: npm ci
       - name: textlint
-        run: >
-          npx --yes
-          --package textlint
-          --package textlint-rule-preset-ja-technical-writing
-          -- textlint README.md 'docs/*.md'
+        run: npm run docs-lint
 
   test:
     runs-on: ubuntu-slim
