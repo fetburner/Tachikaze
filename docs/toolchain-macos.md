@@ -76,7 +76,7 @@ Makefile が `aarch64` だけを見ているため、macOS では `SYS_ARM64` �
 
 暫定的には `-DSYS_ARM64` を渡すだけでよい。
 
-**現 upstream では不要（実測）**: [docker.md](docker.md) で `git clone --depth 1` した upstream HEAD の `chapter_exe/src/Makefile` は、この `UNAME_MACHINE` 分岐そのものを持たない書き方（`SIMD_BACKEND ?= auto` で NEON / SSE2 / スカラーを自動判定し、`WITH_DTVINDEX ?= auto` で dtvindex 連携も自動検出する）に既に置き換わっていた。Linux (arm64) 上で無修正の `make` を実行すると `chapter_exe motion SIMD: auto` → 実行時ログ `Motion SIMD: NEON` になる。パッチ1（`malloc.h`）・パッチ2（`memalign()`）は macOS 固有の libc の差なので今も必要（[docker.md](docker.md)「macOS の3点パッチが不要だった理由」）。
+**現 upstream では不要（実測）**: [docker.md](docker.md) で `git clone --depth 1` した upstream HEAD を確認した。その `chapter_exe/src/Makefile` は、この `UNAME_MACHINE` 分岐そのものを持たない書き方に既に置き換わっていた。新しい書き方は `SIMD_BACKEND ?= auto` で NEON / SSE2 / スカラーを自動判定し、`WITH_DTVINDEX ?= auto` で dtvindex 連携も自動検出する。Linux (arm64) 上で無修正の `make` を実行すると `chapter_exe motion SIMD: auto` → 実行時ログ `Motion SIMD: NEON` になる。パッチ1（`malloc.h`）・パッチ2（`memalign()`）は macOS 固有の libc の差なので今も必要（[docker.md](docker.md)「macOS の3点パッチが不要だった理由」）。
 
 ### ビルド（dtvindex 連携あり）
 

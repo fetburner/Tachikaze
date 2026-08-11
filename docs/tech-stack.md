@@ -41,7 +41,7 @@ FFmpeg へのリンク、C++ への FFI はいずれも不要。
 
 Amatsukaze の GUI / Server は C#（`AmatsukazeServer.csproj` の `TargetFrameworkVersion` = **v4.5**）。WPF + Livet + .NET Framework 4.5 で macOS では動かない。.NET 8 + Avalonia への書き換えは別プロジェクトの規模。
 
-なお Amatsukaze の C# 側は `AmatsukazeCLI.exe` をサブプロセスとして起動する構成（`AmatsukazeServer/Server/EncodeServer.cs`）なので、**別言語のツールを足すこと自体は既存の作法**である。
+なお Amatsukaze の C# 側は `AmatsukazeCLI.exe` をサブプロセスとして起動する構成である（`AmatsukazeServer/Server/EncodeServer.cs`）。そのため**別言語のツールを足すこと自体は既存の作法**である。
 
 ### Go — 悪くないが Rust で足りた
 

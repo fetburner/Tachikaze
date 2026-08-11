@@ -1,0 +1,12 @@
+{
+  "name": "tachikaze-docs-lint",
+  "private": true,
+  "description": "日本語ドキュメントの textlint 用（本体は Rust。Node はドキュメント検査にのみ使う）",
+  "scripts": {
+    "docs-lint": "textlint README.md CLAUDE.md THIRD-PARTY-NOTICES.md 'docs/**/*.md'"
+  },
+  "devDependencies": {
+    "textlint": "15.8.0",
+    "textlint-rule-preset-ja-technical-writing": "12.0.2"
+  }
+}

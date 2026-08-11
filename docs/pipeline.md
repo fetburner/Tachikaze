@@ -30,7 +30,7 @@ IN.mp4
         ← 字幕タイムスタンプの張り替え（remap-subs）
 ```
 
-中央 3 つ（dtvindex / chapter_exe / join_logo_scp）は既存ツール。本ツールが実装するのは `prepare`・カット（`cut`）・字幕の張り替え（`remap-subs`）と、これらを対話なしで通す `auto`、および全体の検証。コマンドの詳細な引数・手順番号は [architecture.md](architecture.md)「コマンド構成」を参照。
+中央 3 つ（dtvindex / chapter_exe / join_logo_scp）は既存ツール。本ツールが実装するのは `prepare`・カット（`cut`）・字幕の張り替え（`remap-subs`）と、これらを対話なしで通す `auto`、および全体の検証。コマンドの詳細な引数と手順は [architecture.md](architecture.md)「コマンド構成」を参照。
 
 ## AviSynth が不要な理由
 
@@ -76,7 +76,7 @@ Amatsukaze の `LogoScan.hpp` が生成するもので、自前実装（`src/log
 
 最良位置だけでなく**可能性の範囲**を渡すのが要点。join_logo_scp 側は `rise` / `rise_l` / `rise_r` / `fall` / `fall_l` / `fall_r` として受け取る（`JlsDataset::displayLogo()` のデバッグ出力で確認できる）。
 
-`-inlogo` を省略すると join_logo_scp は**全フレームがロゴ表示中とみなす**。よって `:L` ラベルは「ロゴあり」ではなく「情報なし」を意味する。`--logo` を指定してもロゴの検出フレーム割合が閾値未満なら、自前実装は誤ったロゴ情報で判定を崩すより現状維持を優先し `-inlogo` を渡さない（`src/analyze.rs::detect_logo`/`inlogo_decision` の doc comment参照）。**検出フレーム割合が閾値以上でも、上記の出力（`build_text`）が空文字列になる場合がある**（判定の数え上げ `logo_frames` と `text` は別経路で、精緻化の結果 `s_end >= e_end` になった区間は出力されないため）。空の logoframe ファイルを渡すと join_logo_scp は警告を出して全フレームをロゴ表示中として扱ってしまうため、このケースも `-inlogo` を渡さないフォールバックとして扱う。
+`-inlogo` を省略すると join_logo_scp は**全フレームがロゴ表示中とみなす**。よって `:L` ラベルは「ロゴあり」ではなく「情報なし」を意味する。`--logo` を指定してもロゴの検出フレーム割合が閾値未満なら、自前実装は `-inlogo` を渡さない。誤ったロゴ情報で判定を崩すより現状維持を優先するためである（`src/analyze.rs::detect_logo`/`inlogo_decision` の doc comment参照）。**検出フレーム割合が閾値以上でも、上記の出力（`build_text`）が空文字列になる場合がある**（判定の数え上げ `logo_frames` と `text` は別経路で、精緻化の結果 `s_end >= e_end` になった区間は出力されないため）。空の logoframe ファイルを渡すと join_logo_scp は警告を出して全フレームをロゴ表示中として扱ってしまうため、このケースも `-inlogo` を渡さないフォールバックとして扱う。
 
 ### join_logo_scp の `-o` 出力（Trim）
 
