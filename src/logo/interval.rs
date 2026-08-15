@@ -287,14 +287,7 @@ fn fill_unknown_runs(result: &mut [Judgement]) {
 /// `hi` を返す（`std::find_if(first, last, pred)` が見つからないと `last` を
 /// 返すのに対応する、宣言的な「見つからなかった」の表現）。
 fn find_forward(lo: usize, hi: usize, mut pred: impl FnMut(usize) -> bool) -> usize {
-    let mut k = lo;
-    while k < hi {
-        if pred(k) {
-            return k;
-        }
-        k += 1;
-    }
-    hi
+    (lo..hi).find(|&k| pred(k)).unwrap_or(hi)
 }
 
 /// `[lo, hi)` を後ろから探索し、最初に `pred` を満たす添字 `p` に対して `p + 1`
@@ -305,14 +298,7 @@ fn find_forward(lo: usize, hi: usize, mut pred: impl FnMut(usize) -> bool) -> us
 /// 先」を指すため `p + 1` になる。見つからずに逆イテレータが尽きた場合は
 /// `lo` に戻る）。
 fn find_backward_base(hi: usize, lo: usize, mut pred: impl FnMut(usize) -> bool) -> usize {
-    let mut k = hi;
-    while k > lo {
-        k -= 1;
-        if pred(k) {
-            return k + 1;
-        }
-    }
-    lo
+    (lo..hi).rev().find(|&k| pred(k)).map_or(lo, |k| k + 1)
 }
 
 /// 手順6, 7: 判定列とメディアンから、ロゴ区間ごとに境界を精緻化して
