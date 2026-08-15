@@ -1,0 +1,63 @@
+name: Claude Code
+
+# @claude メンションでの試験導入（読み取り専用）。
+# パブリックリポジトリ向けの安全側設定:
+#   - allowed_non_write_users / allowed_bots は設定しない（write 権限保持者のみ起動可）
+#   - contents: read（Claude はコミットせず、調査と回答のみ）
+#   - show_full_output は既定 false のまま（ログにシークレットを出さない）
+#   - if: で author_association を確認し、ジョブ起動前に外部ユーザーを弾く（多層防御）
+# 問題がなければ contents: write に上げて修正・コミットも許可する。
+
+on:
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+  pull_request_review:
+    types: [submitted]
+
+jobs:
+  claude:
+    # Action 内部の write 権限チェックに加え、ジョブ起動前に投稿者を絞る。
+    # 外部コントリビュータは CONTRIBUTOR / NONE になり、ここで弾かれる。
+    if: |
+      (github.event_name == 'issue_comment' &&
+       contains(github.event.comment.body, '@claude') &&
+       (github.event.comment.author_association == 'OWNER' ||
+        github.event.comment.author_association == 'MEMBER' ||
+        github.event.comment.author_association == 'COLLABORATOR')) ||
+      (github.event_name == 'pull_request_review_comment' &&
+       contains(github.event.comment.body, '@claude') &&
+       (github.event.comment.author_association == 'OWNER' ||
+        github.event.comment.author_association == 'MEMBER' ||
+        github.event.comment.author_association == 'COLLABORATOR')) ||
+      (github.event_name == 'pull_request_review' &&
+       contains(github.event.review.body, '@claude') &&
+       (github.event.review.author_association == 'OWNER' ||
+        github.event.review.author_association == 'MEMBER' ||
+        github.event.review.author_association == 'COLLABORATOR'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    permissions:
+      contents: read       # 試験導入: コミットさせない。修正も任せる段階で write に上げる
+      pull-requests: write # PR への応答コメント
+      issues: write        # Issue への応答コメント
+      id-token: write      # Claude GitHub App の短命トークン取得
+      actions: read        # PR の CI 結果を参照
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - name: Run Claude Code
+        uses: anthropics/claude-code-action@v1
+        env:
+          ANTHROPIC_BASE_URL: https://api.sakana.ai
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          claude_args: |
+            --max-turns 20
+            --allowedTools "Bash(cargo test:*),Bash(cargo fmt:*),Bash(cargo clippy:*),Bash(npm ci),Bash(npm run docs-lint)"
