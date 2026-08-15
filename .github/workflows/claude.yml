@@ -3,10 +3,10 @@ name: Claude Code
 # @claude メンションでの試験導入（読み取り専用）。
 # パブリックリポジトリ向けの安全側設定:
 #   - allowed_non_write_users / allowed_bots は設定しない（write 権限保持者のみ起動可）
-#   - contents: read（Claude はコミットせず、調査と回答のみ）
+#   - ジョブスコープの GITHUB_TOKEN を使い、contents: read を強制する
+#   - ファイル変更と Bash を拒否し、調査と回答のみにする
 #   - show_full_output は既定 false のまま（ログにシークレットを出さない）
 #   - if: で author_association を確認し、ジョブ起動前に外部ユーザーを弾く（多層防御）
-# 問題がなければ contents: write に上げて修正・コミットも許可する。
 
 on:
   issue_comment:
@@ -40,10 +40,9 @@ jobs:
     timeout-minutes: 30
 
     permissions:
-      contents: read       # 試験導入: コミットさせない。修正も任せる段階で write に上げる
+      contents: read       # ジョブスコープの GITHUB_TOKEN で push を禁止
       pull-requests: write # PR への応答コメント
       issues: write        # Issue への応答コメント
-      id-token: write      # Claude GitHub App の短命トークン取得
       actions: read        # PR の CI 結果を参照
 
     steps:
@@ -51,6 +50,7 @@ jobs:
         uses: actions/checkout@v6
         with:
           fetch-depth: 1
+          persist-credentials: false
 
       - name: Run Claude Code
         uses: anthropics/claude-code-action@v1
@@ -58,6 +58,9 @@ jobs:
           ANTHROPIC_BASE_URL: https://api.sakana.ai
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          # 既定の Claude GitHub App トークンは Contents: write を持つため使わない。
+          # permissions で制限された短命のワークフロートークンを明示的に渡す。
+          github_token: ${{ secrets.GITHUB_TOKEN }}
           claude_args: |
             --max-turns 20
-            --allowedTools "Bash(cargo test:*),Bash(cargo fmt:*),Bash(cargo clippy:*),Bash(npm ci),Bash(npm run docs-lint)"
+            --disallowedTools "Bash,Edit,Write,NotebookEdit,NotebookEditCell,Replace"
