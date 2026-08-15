@@ -11,9 +11,6 @@
 //! ただし `-show_data_hash` を伴わない一般の CSV クエリ（例: `frame=pts`）まで
 //! すべてここに集約したわけではない。罠2に関わらないため、`tests/` 側の手書きの
 //! 呼び出しがそのまま残っている箇所がある。
-//!
-//! [`csv_rows`] は `-of csv=p=0` 系のクエリを、[`scalar_entry`] は
-//! `-of default=nk=1:nw=1` で単一のスカラー値を取るクエリをそれぞれ担う。
 
 use std::path::Path;
 use std::process::Command;
@@ -77,21 +74,6 @@ fn build_csv_args<'a>(stream: &'a str, entries: &'a str) -> Vec<&'a str> {
     args
 }
 
-/// `scalar_entry` が実際に `ffprobe` へ渡す引数列を組み立てる
-/// （`-of default=nk=1:nw=1` 系）。
-fn build_scalar_args<'a>(stream: &'a str, entries: &'a str) -> Vec<&'a str> {
-    vec![
-        "-v",
-        "error",
-        "-select_streams",
-        stream,
-        "-show_entries",
-        entries,
-        "-of",
-        "default=nk=1:nw=1",
-    ]
-}
-
 /// `ffprobe` を1回起動し、`target` に対して `-v error -select_streams stream
 /// -show_entries entries [-show_data_hash CRC32] -of csv=p=0` を実行して、空行を
 /// 除いた行の列を返す。
@@ -119,22 +101,6 @@ pub fn csv_rows(
         .filter(|line| !line.is_empty())
         .map(str::to_string)
         .collect())
-}
-
-/// `ffprobe` を1回起動し、`-v error -select_streams stream -show_entries entries
-/// -of default=nk=1:nw=1` の出力を単一のスカラー値（前後の空白を trim した文字列）
-/// として返す。
-///
-/// `stream=...` のような1値しか返らないエントリ(例: `stream=time_base`)向け。
-pub fn scalar_entry(
-    ffprobe: &Path,
-    target: &Path,
-    stream: &str,
-    entries: &str,
-) -> anyhow::Result<String> {
-    let args = build_scalar_args(stream, entries);
-    let text = run(ffprobe, target, &args)?;
-    Ok(text.trim().to_string())
 }
 
 /// `ffprobe` を起動して標準出力を文字列で返す。終了コードが 0 以外、または起動自体に
@@ -227,24 +193,6 @@ mod tests {
                 "CRC32",
                 "-of",
                 "csv=p=0",
-            ]
-        );
-    }
-
-    #[test]
-    fn build_scalar_args_uses_default_nk1_nw1_format() {
-        let args = build_scalar_args("v:0", "stream=time_base");
-        assert_eq!(
-            args,
-            vec![
-                "-v",
-                "error",
-                "-select_streams",
-                "v:0",
-                "-show_entries",
-                "stream=time_base",
-                "-of",
-                "default=nk=1:nw=1",
             ]
         );
     }

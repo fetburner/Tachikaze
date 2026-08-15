@@ -55,7 +55,7 @@ pub fn read_moov<P: AsRef<Path>>(path: P) -> std::result::Result<Moov, anyhow::E
 /// トラックの `stsd` に入っている先頭のサンプルエントリから `Codec` を取り出す。
 ///
 /// 対象素材の `stsd` は 1 トラックにつき 1 エントリのみを想定している。
-fn track_codec(trak: &Trak) -> Option<&Codec> {
+pub(crate) fn track_codec(trak: &Trak) -> Option<&Codec> {
     trak.mdia.minf.stbl.stsd.codecs.first()
 }
 

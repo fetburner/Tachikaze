@@ -40,7 +40,7 @@
 use mp4_atom::{Codec, Moov};
 
 use crate::dtvi::Dtvi;
-use crate::mp4io::read::is_audio_codec;
+use crate::mp4io::read::{is_audio_codec, track_codec};
 
 /// 対応していない入力構成を検出したときに返すエラー。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -93,11 +93,6 @@ pub fn check_supported(moov: &Moov, dtvi: Option<&Dtvi>) -> Result<(), Unsupport
     check_single_stsd_entry(moov)?;
     check_closed_gop(dtvi)?;
     Ok(())
-}
-
-/// トラックの `stsd` の先頭エントリから `Codec` を取り出す。
-fn track_codec(trak: &mp4_atom::Trak) -> Option<&Codec> {
-    trak.mdia.minf.stbl.stsd.codecs.first()
 }
 
 /// 映像トラックがちょうど1本、音声トラックが1本、それ以外(字幕など)のトラックが

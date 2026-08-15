@@ -106,7 +106,7 @@ use anyhow::{Context, Result};
 use mp4_atom::{Codec, Moov};
 
 use crate::errctx::PathContext;
-use crate::mp4io::read::is_audio_codec;
+use crate::mp4io::read::{is_audio_codec, track_codec};
 use crate::{external, tools, workdir};
 
 /// 字幕トラックのコーデックから判定した、抽出に使う字幕形式。
@@ -172,11 +172,6 @@ fn has_edit_list(moov: &Moov) -> bool {
     moov.trak
         .iter()
         .any(|trak| trak.edts.as_ref().is_some_and(|edts| edts.elst.is_some()))
-}
-
-/// トラックの `stsd` の先頭エントリから `Codec` を取り出す。
-fn track_codec(trak: &mp4_atom::Trak) -> Option<&Codec> {
-    trak.mdia.minf.stbl.stsd.codecs.first()
 }
 
 /// 映像でも音声でもない最初のトラックを字幕トラックとみなし、その `Codec` から

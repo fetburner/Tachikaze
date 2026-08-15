@@ -539,9 +539,32 @@ fn ffprobe_csv_column(path: &Path, stream_selector: &str, entry: &str) -> Vec<St
         .expect("ffprobe の起動に失敗した")
 }
 
+/// `ffprobe ... -of default=nk=1:nw=1` で単一のスカラー値を取る（`stream=time_base`
+/// のような1値エントリ向け）。本体では使わずこのテストだけが使うので、ここに直接持つ。
 fn ffprobe_scalar_stream_entry(path: &Path, stream_selector: &str, entry: &str) -> String {
-    tachikaze::ffprobe::scalar_entry(Path::new("ffprobe"), path, stream_selector, entry)
-        .expect("ffprobe の起動に失敗した")
+    let output = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            stream_selector,
+            "-show_entries",
+            entry,
+            "-of",
+            "default=nk=1:nw=1",
+        ])
+        .arg(path)
+        .output()
+        .expect("ffprobe の起動に失敗した");
+    assert!(
+        output.status.success(),
+        "ffprobe が失敗した: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout)
+        .expect("ffprobe の出力が utf-8 ではない")
+        .trim()
+        .to_string()
 }
 
 /// `IN.mp4` に対して ffprobe の CRC32 ラッパと集合比較ロジックが実際に動くことを、
