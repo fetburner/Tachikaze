@@ -72,9 +72,12 @@
 //! 数えるだけ（コールバックは何もしない）、2回目でその総数を使ってブロック割当て
 //! （`総標本数 × フレーム番号 / 16`）を行う。キーフレームだけを読む供給関数
 //! （`frames::stream_keyframe_luma_frames`）は ffmpeg を起動し直すだけで、
-//! キーフレーム限定デコードは軽いためこの2回呼びは許容する。
+//! キーフレーム限定デコードは軽いためこの2回呼びは許容する。**2回目が返す実際の
+//! フレーム数は1回目の総数と一致することを明示的に検査する**（一致しないと
+//! ブロック割当てが静かに歪む。CLAUDE.md 罠3の一般形と同じ「検査が無いと例外を
+//! 飛ばさずに間違った結果が出る」パターンのため、無視できないエラーにしている）。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 
 use crate::logo::frames::{LogoRect, VideoSize};
 use crate::logo::scan::round_rect_to_even;
@@ -118,9 +121,14 @@ const MAX_HEIGHT_RATIO: f64 = 0.15;
 /// `85x1` のような線状の偽成分もこの下限で落ちる。
 const MIN_SIDE: u32 = 8;
 
-/// ロゴ矩形の面積の下限（画素、手順4）。`MIN_SIDE` を両辺満たせば自動的に
-/// （8*8=64 ≧ 20 なので）満たされるが、issue の記述どおり明示しておく。
-const MIN_AREA: u32 = 20;
+/// 成分の**有意画素数**の下限（手順4）。bbox の面積（幅×高さ）に適用すると
+/// `MIN_SIDE`（8x8=64）を満たせば自動的に20以上になり恒真の判定になってしまう
+/// （実際に起きた回帰: 1080pの段48で有意画素数2〜3個の点状成分が bbox は
+/// 小さくても上位3枠を占め、段24では枠が埋まって本物のロゴが押し出される寸前
+/// だった）。bbox が広くても実際に閾値を超えた画素が少ない「点状の偽成分」を
+/// 落とすため、成分に属する画素数（[`Component::pixels`] の長さ、併合後は
+/// 併合元の合計）に適用する。
+const MIN_AREA: usize = 20;
 
 /// 閾値ラダー（階調、手順5）。実測で決めた固定値。**適応閾値（種の値 × 定数）に
 /// してはならない**（モジュール doc comment「なぜ固定閾値ラダーか」参照）。
@@ -198,10 +206,16 @@ pub fn estimate_candidates(
     }
 
     let mut acc = BlockAccumulator::new(w, h, total);
-    stream_frames(&mut |frame: &[u8]| {
+    let actual = stream_frames(&mut |frame: &[u8]| {
         acc.add_frame(frame);
         Ok(())
     })?;
+    anyhow::ensure!(
+        actual == total,
+        "フレーム供給関数が1回目({total}枚)と2回目({actual}枚)で異なる枚数を返しました。\
+         ブロック割当て（総標本数 × フレーム番号 / 16）は2回とも同じ枚数が流れることを\
+         前提にしており、食い違うと統計量が静かに歪みます。"
+    );
     acc.finish();
 
     Ok(build_candidates(w, h, video_size, &acc))
@@ -486,6 +500,7 @@ struct Component {
 }
 
 fn bbox_of(w: usize, pixels: &[usize]) -> Bbox {
+    debug_assert!(!pixels.is_empty(), "空の成分から bbox は計算できない");
     let mut x_min = u32::MAX;
     let mut y_min = u32::MAX;
     let mut x_max = 0u32;
@@ -609,9 +624,17 @@ fn label_components(w: usize, h: usize, mask: &[bool]) -> Vec<i32> {
 }
 
 /// マスクを8近傍でラベリングし、成分ごとの bbox・画素一覧を返す（手順6-2）。
+///
+/// `groups` は `BTreeMap`（ラベル番号の昇順）を使う。`HashMap` は `RandomState`
+/// でプロセスごとに種が変わり `into_values()` の列挙順が実行ごとに変わる。
+/// ラベル自体は [`label_components`] のラスタ走査（決定的）で割られるため、
+/// ラベル番号の昇順で列挙すれば結果は入力ごとに常に同じ順序になる。効果量が
+/// 同値の成分が [`TOP_K_PER_RUNG`] より多い段では、この順序が「どの候補がプールに
+/// 残るか」に直結する（「無劣化はバイト単位で再現する」という本リポジトリの流儀に
+/// 反するため、非決定的な列挙は避ける）。
 fn label_to_components(w: usize, h: usize, mask: &[bool]) -> Vec<Component> {
     let labels = label_components(w, h, mask);
-    let mut groups: HashMap<i32, Vec<usize>> = HashMap::new();
+    let mut groups: BTreeMap<i32, Vec<usize>> = BTreeMap::new();
     for (idx, &lbl) in labels.iter().enumerate() {
         if lbl >= 0 {
             groups.entry(lbl).or_default().push(idx);
@@ -632,14 +655,14 @@ fn passes_upper_bound(bbox: Bbox, video_w: u32, video_h: u32) -> bool {
     bbox.width() as f64 <= max_w && bbox.height() as f64 <= max_h
 }
 
-fn passes_lower_bound(bbox: Bbox) -> bool {
-    bbox.width() >= MIN_SIDE
-        && bbox.height() >= MIN_SIDE
-        && bbox.width().saturating_mul(bbox.height()) >= MIN_AREA
+/// `significant_pixels` は bbox 内の画素数ではなく、成分に属する**有意画素の実数**
+/// （[`MIN_AREA`] のdoc comment参照）。
+fn passes_lower_bound(bbox: Bbox, significant_pixels: usize) -> bool {
+    bbox.width() >= MIN_SIDE && bbox.height() >= MIN_SIDE && significant_pixels >= MIN_AREA
 }
 
-fn passes_size_bounds(bbox: Bbox, video_w: u32, video_h: u32) -> bool {
-    passes_upper_bound(bbox, video_w, video_h) && passes_lower_bound(bbox)
+fn passes_size_bounds(bbox: Bbox, significant_pixels: usize, video_w: u32, video_h: u32) -> bool {
+    passes_upper_bound(bbox, video_w, video_h) && passes_lower_bound(bbox, significant_pixels)
 }
 
 /// 2つの bbox の1次元方向のギャップ（重なっていれば 0）。
@@ -669,6 +692,14 @@ fn greedy_merge(mut components: Vec<Component>, video_w: u32, video_h: u32) -> V
             for j in (i + 1)..components.len() {
                 if close_enough(components[i].bbox, components[j].bbox, MERGE_GAP) {
                     let merged_bbox = components[i].bbox.union(&components[j].bbox);
+                    // 注: `DILATE_RADIUS`(8)の2倍が現在の `MERGE_GAP`(16)と一致するため、
+                    // `close_enough` が真になるペア(実画素の隙間<=16)は、手順6-1の
+                    // 膨張(半径8を両側から)で既に同じ膨張塊に入っている。その塊の bbox
+                    // (今回の `merged_bbox` と同じ範囲)が上限を超えていれば、手順6-1で
+                    // 両成分ともマスクから消えてここへ到達しない。そのため下の
+                    // `passes_upper_bound(merged_bbox, ..)` が偽になる経路は、現在の
+                    // 定数の組み合わせでは実際には発火しない防御的なコードである
+                    // （定数を変えて `MERGE_GAP > 2*DILATE_RADIUS` にした場合には発火する）。
                     if passes_upper_bound(merged_bbox, video_w, video_h) {
                         let comp_j = components.remove(j);
                         components[i].bbox = merged_bbox;
@@ -708,7 +739,10 @@ fn process_rung(
     // 計算)が上限を超えたら、その塊に属する有意画素をまとめて捨てる。
     let dilated = dilate(w, h, &mask, DILATE_RADIUS);
     let dilated_labels = label_components(w, h, &dilated);
-    let mut groups: HashMap<i32, Vec<usize>> = HashMap::new();
+    // `BTreeMap` を使う理由は `label_to_components` の doc comment参照
+    // （この groups は削除判定のみに使い、結果はどの順で処理しても変わらないが、
+    // 一貫性のため同じ流儀に揃える）。
+    let mut groups: BTreeMap<i32, Vec<usize>> = BTreeMap::new();
     for idx in 0..wh {
         if mask[idx] {
             groups.entry(dilated_labels[idx]).or_default().push(idx);
@@ -729,10 +763,11 @@ fn process_rung(
     // 6-3: 併合。
     let components = greedy_merge(components, video_size.width, video_size.height);
 
-    // 6-4: 上限・下限を満たす成分だけを残す。
+    // 6-4: 上限・下限を満たす成分だけを残す（下限の有意画素数は `c.pixels.len()`。
+    // `MIN_AREA` のdoc comment参照）。
     components
         .into_iter()
-        .filter(|c| passes_size_bounds(c.bbox, video_size.width, video_size.height))
+        .filter(|c| passes_size_bounds(c.bbox, c.pixels.len(), video_size.width, video_size.height))
         .collect()
 }
 
@@ -801,10 +836,17 @@ fn build_candidates(
                 }
             })
             .collect();
+        // 最大効果量の降順。同値のタイは bbox の座標で決定的に破る（`label_to_components`
+        // の列挙順は決定的だが、タイの並びが結果に影響しないことを明示するため
+        // 追加の全順序を敷いておく）。
         ranked.sort_by(|a, b| {
             b.max_effect
                 .partial_cmp(&a.max_effect)
                 .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.bbox.x_min.cmp(&b.bbox.x_min))
+                .then_with(|| a.bbox.y_min.cmp(&b.bbox.y_min))
+                .then_with(|| a.bbox.x_max.cmp(&b.bbox.x_max))
+                .then_with(|| a.bbox.y_max.cmp(&b.bbox.y_max))
         });
 
         for entry in ranked.into_iter().take(TOP_K_PER_RUNG) {
@@ -870,11 +912,39 @@ fn build_candidates(
         })
         .collect();
 
+    // 同値タイの決定的なタイブレークは上の `ranked.sort_by` と同じ理由。
     candidates.sort_by(|a, b| {
         b.max_effect
             .partial_cmp(&a.max_effect)
             .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.raw_bbox.x.cmp(&b.raw_bbox.x))
+            .then_with(|| a.raw_bbox.y.cmp(&b.raw_bbox.y))
+            .then_with(|| a.raw_bbox.w.cmp(&b.raw_bbox.w))
+            .then_with(|| a.raw_bbox.h.cmp(&b.raw_bbox.h))
     });
+
+    // 手順8: 最終的な候補列を stderr に出す。段ごとのログ(上)は丸め・余白前の生bbox
+    // しか分からないため、ここでは調査時にそのまま `--rect` へ渡せる形の
+    // `estimated_rect` も併せて出す。
+    for (rank, c) in candidates.iter().enumerate() {
+        eprintln!(
+            "[logo-estimate] 候補{}: estimated_rect=(x={}, y={}, w={}, h={}) \
+             raw_bbox=(x={}, y={}, w={}, h={}) 最大効果量={:.1} 有意画素数={} 段={}",
+            rank + 1,
+            c.estimated_rect.x,
+            c.estimated_rect.y,
+            c.estimated_rect.w,
+            c.estimated_rect.h,
+            c.raw_bbox.x,
+            c.raw_bbox.y,
+            c.raw_bbox.w,
+            c.raw_bbox.h,
+            c.max_effect,
+            c.significant_pixels,
+            c.rung_threshold,
+        );
+    }
+
     candidates
 }
 
@@ -1011,9 +1081,33 @@ mod tests {
     // 完了条件2: 段差を一切乗せない場合は空。
     // ---------------------------------------------------------------
 
+    /// 画面全体が動く斜め縞模様のフレームを作る。フレームごとに縞がずれるため、
+    /// 「一様な背景(隣接差分が厳密に0)」よりずっと厳しい busy な入力になる
+    /// （レビュー指摘: 一様背景だと閾値やラダー・符号一致率・大構造除去・上下限の
+    /// どれを壊しても偶然通ってしまい、「busyな背景が偽陽性を生まない」という
+    /// 見たい性質を検証できない。画素ごと独立な乱数雑音も使わない。標本数が
+    /// 少ないと中央値の頑健性が足りず、有意画素2〜6個程度の偽候補が出ることを
+    /// レビュアーが実測で確認済みのため）。
+    fn moving_stripe_frame(video_w: usize, video_h: usize, frame_index: usize) -> Vec<u8> {
+        (0..video_h)
+            .flat_map(|y| {
+                (0..video_w).map(move |x| {
+                    let phase = (x + 3 * y + 7 * frame_index) % 64;
+                    if phase < 32 {
+                        40u8
+                    } else {
+                        200u8
+                    }
+                })
+            })
+            .collect()
+    }
+
     #[test]
     fn no_step_yields_empty_candidates() {
-        let frames = make_frames(VIDEO_W, VIDEO_H, TOTAL, varying_bg, &[]);
+        let frames: Vec<Vec<u8>> = (0..TOTAL)
+            .map(|i| moving_stripe_frame(VIDEO_W, VIDEO_H, i))
+            .collect();
         let candidates =
             estimate_candidates(video_size(), frames_source(&frames)).expect("エラーにならない");
         assert!(candidates.is_empty(), "candidates={candidates:?}");
@@ -1095,9 +1189,15 @@ mod tests {
 
     #[test]
     fn far_apart_blocks_are_not_merged() {
+        // gapを40にして、2成分の隙間(>MERGE_GAP=16)だけでなく、union(併合したと
+        // 仮定した場合の bbox)自体も上限(幅0.20*300=60)を超える(実測: union幅61)
+        // ようにする。issue の完了条件「上限を超えるほど離れた」を実際に検証する
+        // ため（gapがMERGE_GAPを超えるだけでunionが上限内に収まる値だと、
+        // 「離れているから併合されない」ことしか確認できず、「上限を超えるほど」の
+        // 部分を検証できない）。
         let (x1, y1, w1, h1) = (40usize, 40usize, 10usize, 10usize);
-        // 隙間30画素(>16)。
-        let (x2, y2, w2, h2) = (x1 + w1 + 30, 40usize, 10usize, 10usize);
+        let gap = 40usize;
+        let (x2, y2, w2, h2) = (x1 + w1 + gap, 40usize, 10usize, 10usize);
         let offset = |_i: usize| 20.0;
         let frames = make_frames(
             VIDEO_W,
@@ -1107,14 +1207,23 @@ mod tests {
             &[(x1, y1, w1, h1, &offset), (x2, y2, w2, h2, &offset)],
         );
 
-        let candidates =
-            estimate_candidates(video_size(), frames_source(&frames)).expect("エラーにならない");
-
-        assert_eq!(candidates.len(), 2, "併合されず2つ残るはず: {candidates:?}");
         let expected1 =
             expected_raw_bbox_for_inside_rect(x1 as u32, y1 as u32, w1 as u32, h1 as u32);
         let expected2 =
             expected_raw_bbox_for_inside_rect(x2 as u32, y2 as u32, w2 as u32, h2 as u32);
+        let union_width = (expected2.x + expected2.w).max(expected1.x + expected1.w)
+            - expected1.x.min(expected2.x);
+        let upper_bound_width = (VIDEO_W as f64 * MAX_WIDTH_RATIO) as u32;
+        assert!(
+            union_width > upper_bound_width,
+            "この試験の前提(unionが上限超え)が崩れている: union_width={union_width}, \
+             upper_bound_width={upper_bound_width}"
+        );
+
+        let candidates =
+            estimate_candidates(video_size(), frames_source(&frames)).expect("エラーにならない");
+
+        assert_eq!(candidates.len(), 2, "併合されず2つ残るはず: {candidates:?}");
         let bboxes: Vec<LogoRect> = candidates.iter().map(|c| c.raw_bbox).collect();
         assert!(bboxes.contains(&expected1), "bboxes={bboxes:?}");
         assert!(bboxes.contains(&expected2), "bboxes={bboxes:?}");
@@ -1242,6 +1351,28 @@ mod tests {
     }
 
     #[test]
+    fn dilate_1d_with_radius_zero_is_identity() {
+        let input = vec![false, true, false, true, false];
+        let out = dilate_1d(&input, 0);
+        assert_eq!(out, input);
+    }
+
+    #[test]
+    fn dilate_1d_with_radius_covering_whole_input_is_all_true_if_any_true() {
+        let input = vec![false, false, false, true, false, false, false];
+        let out = dilate_1d(&input, input.len());
+        assert_eq!(out, vec![true; input.len()]);
+    }
+
+    #[test]
+    fn dilate_1d_all_false_stays_all_false_regardless_of_radius() {
+        let input = vec![false; 10];
+        assert_eq!(dilate_1d(&input, 0), input);
+        assert_eq!(dilate_1d(&input, 3), input);
+        assert_eq!(dilate_1d(&input, 100), input);
+    }
+
+    #[test]
     fn median_of_even_count_averages_middle_two() {
         let mut v = vec![1.0, 3.0, 2.0, 4.0];
         assert_eq!(median(&mut v), 2.5);
@@ -1251,5 +1382,85 @@ mod tests {
     fn median_of_odd_count_returns_middle() {
         let mut v = vec![5.0, 1.0, 3.0];
         assert_eq!(median(&mut v), 3.0);
+    }
+
+    // ---------------------------------------------------------------
+    // 早期return: 映像サイズ0・標本0枚・有効ブロック不足。
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn zero_width_returns_empty_without_calling_stream_frames() {
+        let mut called = false;
+        let candidates = estimate_candidates(
+            VideoSize {
+                width: 0,
+                height: 200,
+            },
+            |_on_frame| {
+                called = true;
+                Ok(0)
+            },
+        )
+        .expect("エラーにならない");
+        assert!(candidates.is_empty());
+        assert!(!called, "映像サイズが0ならフレーム供給関数を呼ばないはず");
+    }
+
+    #[test]
+    fn zero_height_returns_empty_without_calling_stream_frames() {
+        let mut called = false;
+        let candidates = estimate_candidates(
+            VideoSize {
+                width: 300,
+                height: 0,
+            },
+            |_on_frame| {
+                called = true;
+                Ok(0)
+            },
+        )
+        .expect("エラーにならない");
+        assert!(candidates.is_empty());
+        assert!(!called, "映像サイズが0ならフレーム供給関数を呼ばないはず");
+    }
+
+    #[test]
+    fn zero_total_frames_returns_empty() {
+        let frames: Vec<Vec<u8>> = Vec::new();
+        let candidates =
+            estimate_candidates(video_size(), frames_source(&frames)).expect("エラーにならない");
+        assert!(candidates.is_empty(), "candidates={candidates:?}");
+    }
+
+    #[test]
+    fn too_few_valid_blocks_returns_empty() {
+        // MIN_VALID_BLOCKS(8)未満しか標本が無い短い入力(1ブロック分の10枚だけ)。
+        let (x, y, w, h) = (40usize, 40usize, 20usize, 16usize);
+        let offset = |_i: usize| 20.0;
+        let frames = make_frames(VIDEO_W, VIDEO_H, 10, varying_bg, &[(x, y, w, h, &offset)]);
+        let candidates =
+            estimate_candidates(video_size(), frames_source(&frames)).expect("エラーにならない");
+        assert!(
+            candidates.is_empty(),
+            "有効ブロックが不足するので空のはず: {candidates:?}"
+        );
+    }
+
+    #[test]
+    fn inconsistent_frame_count_between_two_calls_is_an_error() {
+        // 1回目と2回目で異なる枚数を返す供給関数(実装ミスや実行環境の変化を想定)。
+        let mut call_count = 0;
+        let err = estimate_candidates(video_size(), |on_frame| {
+            call_count += 1;
+            let n = if call_count == 1 { 160 } else { 100 };
+            for i in 0..n {
+                on_frame(&vec![128u8; VIDEO_W * VIDEO_H])?;
+                let _ = i;
+            }
+            Ok(n as u64)
+        })
+        .expect_err("1回目と2回目の枚数が食い違うのでエラーになるはず");
+        assert!(err.to_string().contains("160"), "err={err}");
+        assert!(err.to_string().contains("100"), "err={err}");
     }
 }
