@@ -133,6 +133,14 @@ impl LogoRect {
 /// `input` の映像サイズ。呼び出し側が `.dtvi` のヘッダ等から渡す（`stream_luma_frames`
 /// はここでは probe しない）。[`LogoRect`] とまとめて1引数にすることで、
 /// `stream_luma_frames` の引数数を clippy の `too_many_arguments` の閾値内に収める。
+///
+/// **実際に ffmpeg がデコードするサイズと一致していること。** `width`/`height` は
+/// 1フレームのバイト数（`width*height`）を決めるのに使われ、その値が実際の出力と
+/// ずれていると、合計バイト数さえ `frame_bytes` で割り切れれば端数バイトの検査も
+/// （`stream_keyframe_luma_frames` の）0フレーム検査も素通りしたまま、フレームの
+/// 内容が黙って境界からずれて読み込まれる（CLAUDE.md 罠3の一般形）。`0` は
+/// 明示的に拒否される（`stream_keyframe_luma_frames` 参照。`frame_bytes==0` の
+/// まま ffmpeg を起動すると `wait()` がハングするため）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VideoSize {
     pub width: u32,
@@ -202,33 +210,7 @@ pub fn stream_luma_frames(
         expected_frame_count,
         on_frame,
     );
-
-    match read_result {
-        // `read_frames` がフレーム数不一致・端数バイトで失敗するのは、いずれも
-        // reader が EOF に達した後（ffmpeg は既に終了しているはず）。`wait()` は
-        // ブロックしないので安全に呼べる。ffmpeg 自体も異常終了していた場合は、
-        // フレーム数不一致等より根本原因に近いのでそちらを優先する（そうしないと
-        // 「壊れた入力で ffmpeg が落ちた」が常に「座標系がずれている」という
-        // 無関係な誤誘導メッセージに隠れる）。
-        Err(ReadFramesError::Protocol(protocol_err)) => match child.wait() {
-            Err(wait_err) => Err(wait_err),
-            Ok(()) => Err(protocol_err),
-        },
-        // `on_frame` コールバックがエラーを返して読み取りを中断した場合は EOF 前
-        // で、ffmpeg がまだ書き込み中の可能性がある。そのまま `wait()` すると
-        // パイプが詰まってデッドロックしうるため、先に `kill()` してから `wait()`
-        // は結果を捨てて reap だけする（`kill` によるシグナル終了エラーが
-        // `on_frame` 本来のエラーを隠してしまうため、`wait()` の結果は使わない）。
-        Err(ReadFramesError::Callback(callback_err)) => {
-            child.kill();
-            let _ = child.wait();
-            Err(callback_err)
-        }
-        Ok(frame_count) => {
-            child.wait()?;
-            Ok(frame_count)
-        }
-    }
+    finish_stream(child, read_result)
 }
 
 /// `ffmpeg` を起動し、`input` の**キーフレームだけ**をデコードして、クロップして
@@ -270,9 +252,31 @@ pub fn stream_keyframe_luma_frames(
     video_size: VideoSize,
     on_frame: impl FnMut(&[u8]) -> anyhow::Result<()>,
 ) -> anyhow::Result<u64> {
+    let frame_bytes = video_size.width as usize * video_size.height as usize;
+    if frame_bytes == 0 {
+        // `LogoRect::validate` の「ffmpeg を起動する前に自分で検査してメッセージを
+        // 明示する」流儀に合わせる（モジュール doc comment「矩形の範囲外検査」）。
+        // `stream_luma_frames` は `rect.validate` が `rect.w/h>0` を要求し、それが
+        // `video_size` にも収まることを検査するため `frame_bytes==0` になり得ない
+        // が、この関数には crop も rect も無いので自分で検査する必要がある。
+        //
+        // ここを検査せず ffmpeg を起動すると: 読み取りループが1バイトも読まずに
+        // `Ok(0)` で即 break → 0フレームでエラー（`ReadFramesError::Protocol`）
+        // → `Protocol` 分岐は「reader が EOF に達した後なので `wait()` は安全」と
+        // 判断して `kill()` せず `child.wait()` を呼ぶ → しかし ffmpeg は誰も
+        // 読まない stdout パイプが埋まって書き込みブロック中で終了しておらず、
+        // `wait()` が永久に返らない（実測: 45秒以上ハング）。
+        bail!(
+            "映像サイズが不正です: width={}, height={}。0を含む値のまま ffmpeg を\
+             起動すると1フレームのバイト数が0になり、誰も読まない標準出力パイプが\
+             埋まって `wait()` が返らずハングします。",
+            video_size.width,
+            video_size.height,
+        );
+    }
+
     let absolute_input =
         std::fs::canonicalize(input).path_ctx("入力ファイルの絶対パス解決", input)?;
-    let frame_bytes = video_size.width as usize * video_size.height as usize;
     let input_arg = absolute_input.as_os_str();
 
     let args: Vec<&std::ffi::OsStr> = vec![
@@ -298,16 +302,32 @@ pub fn stream_keyframe_luma_frames(
 
     let mut child = external::spawn_streaming(ffmpeg, &args, cwd)?;
     let read_result = read_keyframe_frames(child.stdout(), frame_bytes, on_frame);
+    finish_stream(child, read_result)
+}
 
+/// `read_frames` / `read_keyframe_frames` の結果を受けて `child` の後始末をする
+/// （[`stream_luma_frames`] と [`stream_keyframe_luma_frames`] の共通処理）。
+///
+/// - `Protocol` エラー（フレーム数不一致・端数バイト等）は、いずれも reader が
+///   EOF に達した後（ffmpeg は既に終了しているはず）に起きるため `wait()` は
+///   ブロックしないので安全に呼べる。ffmpeg 自体も異常終了していた場合は、
+///   `Protocol` エラーより根本原因に近いのでそちらを優先する（そうしないと
+///   「壊れた入力で ffmpeg が落ちた」が常に「フレーム数がずれている」という
+///   無関係な誤誘導メッセージに隠れる）。
+/// - `Callback` エラー（`on_frame` がエラーを返して読み取りを中断した場合）は
+///   EOF 前で、ffmpeg がまだ書き込み中の可能性がある。そのまま `wait()` すると
+///   パイプが詰まってデッドロックしうるため、先に `kill()` してから `wait()` は
+///   結果を捨てて reap だけする（`kill` によるシグナル終了エラーが `on_frame`
+///   本来のエラーを隠してしまうため、`wait()` の結果は使わない）。
+fn finish_stream(
+    mut child: external::StreamingChild,
+    read_result: Result<u64, ReadFramesError>,
+) -> anyhow::Result<u64> {
     match read_result {
-        // `read_frames` と同じ理由（EOF後の失敗なら `wait()` は安全、そちらの
-        // エラーを優先する）で `wait()` の呼び方を分ける。
         Err(ReadFramesError::Protocol(protocol_err)) => match child.wait() {
             Err(wait_err) => Err(wait_err),
             Ok(()) => Err(protocol_err),
         },
-        // `on_frame` が中断した場合は EOF 前の可能性があるため、先に `kill()` して
-        // から `wait()` の結果は捨てる（`stream_luma_frames` と同じ扱い）。
         Err(ReadFramesError::Callback(callback_err)) => {
             child.kill();
             let _ = child.wait();
@@ -320,8 +340,10 @@ pub fn stream_keyframe_luma_frames(
     }
 }
 
-/// [`read_frames`] の失敗要因。`stream_luma_frames` が `wait()` の呼び方を
-/// 分けるために区別する（詳細は呼び出し側の doc comment参照）。
+/// [`read_frames`] / [`read_keyframe_frames`] の失敗要因。`finish_stream`
+/// （`stream_luma_frames` と `stream_keyframe_luma_frames` の両方が使う）が
+/// `wait()` の呼び方を分けるために区別する（詳細は `finish_stream` の
+/// doc comment参照）。
 #[derive(Debug)]
 enum ReadFramesError {
     /// フレーム数不一致・端数バイト、または `fill_or_eof` 自体の I/O エラー。
@@ -344,17 +366,17 @@ impl std::fmt::Display for ReadFramesError {
 }
 
 /// `reader` から輝度フレームを `frame_bytes` バイトずつ読み、フレームごとに
-/// `on_frame` を呼ぶ。ffmpeg プロセスの起動から分離しているのは、ffmpeg を
-/// 起動せずにこの読み取りロジック単体をテストするため。
+/// `on_frame` を呼ぶ。[`read_frames`] と [`read_keyframe_frames`] の共通部分
+/// （ffmpeg プロセスの起動から分離しているのは、ffmpeg を起動せずにこの読み取り
+/// ロジック単体をテストするため）。
 ///
-/// - `frame_bytes` の倍数でない終わり方（端数バイト）はエラーにする。
-/// - 読み終えた時点で `expected_frame_count` と実際のフレーム数が一致しなければ
-///   エラーにする（モジュール doc comment「座標系がこの issue の本質」参照。
-///   一致しないまま後続に進むと CM の位置が黙ってずれる）。
-fn read_frames<R: Read>(
+/// フレーム数が確定した後の検査（`.dtvi` との一致 / 0フレーム禁止）は用途によって
+/// 異なるため、この関数には含めず呼び出し側がそれぞれ行う。
+///
+/// `frame_bytes` の倍数でない終わり方（端数バイト）は共通してエラーにする。
+fn read_luma_frames<R: Read>(
     mut reader: R,
     frame_bytes: usize,
-    expected_frame_count: u64,
     mut on_frame: impl FnMut(&[u8]) -> anyhow::Result<()>,
 ) -> Result<u64, ReadFramesError> {
     let mut buf = vec![0u8; frame_bytes];
@@ -374,6 +396,20 @@ fn read_frames<R: Read>(
         frame_count += 1;
         on_frame(&buf).map_err(ReadFramesError::Callback)?;
     }
+    Ok(frame_count)
+}
+
+/// [`read_luma_frames`] で読み、読み終えた時点で `expected_frame_count` と実際の
+/// フレーム数が一致しなければエラーにする（モジュール doc comment「座標系が
+/// この issue の本質」参照。一致しないまま後続に進むと CM の位置が黙ってずれる）。
+/// [`stream_luma_frames`] 用。
+fn read_frames<R: Read>(
+    reader: R,
+    frame_bytes: usize,
+    expected_frame_count: u64,
+    on_frame: impl FnMut(&[u8]) -> anyhow::Result<()>,
+) -> Result<u64, ReadFramesError> {
+    let frame_count = read_luma_frames(reader, frame_bytes, on_frame)?;
     if frame_count != expected_frame_count {
         return Err(ReadFramesError::Protocol(anyhow::anyhow!(
             "ffmpeg から読み取ったフレーム数({frame_count})が .dtvi の frame_count\
@@ -385,40 +421,17 @@ fn read_frames<R: Read>(
     Ok(frame_count)
 }
 
-/// `reader` から輝度フレームを `frame_bytes` バイトずつ読み、フレームごとに
-/// `on_frame` を呼ぶ（[`stream_keyframe_luma_frames`] 用）。
-///
-/// [`read_frames`] との違いは2点:
-/// - `expected_frame_count` を取らない・フレーム数の一致検査をしない
-///   （矩形推定はフレーム番号と `.dtvi` の対応を使わないため、モジュール
-///   doc comment「[`stream_keyframe_luma_frames`] を別関数にした理由」参照）
-/// - 代わりに**0フレームをエラーにする**（`-skip_frame nokey` の指定ミス等で
-///   黙って0枚になると、後続の矩形推定が「ロゴ無し」と誤判定するだけで
-///   気づけないため）
-///
-/// `frame_bytes` の倍数でない終わり方（端数バイト）をエラーにする点は
-/// `read_frames` と同じ。
+/// [`read_luma_frames`] で読み、**0フレームをエラーにする**（[`read_frames`] との
+/// 違い、モジュール doc comment「[`stream_keyframe_luma_frames`] を別関数にした
+/// 理由」参照）。`expected_frame_count` を取らない・一致検査もしない
+/// （矩形推定はフレーム番号と `.dtvi` の対応を使わないため）。
+/// [`stream_keyframe_luma_frames`] 用。
 fn read_keyframe_frames<R: Read>(
-    mut reader: R,
+    reader: R,
     frame_bytes: usize,
-    mut on_frame: impl FnMut(&[u8]) -> anyhow::Result<()>,
+    on_frame: impl FnMut(&[u8]) -> anyhow::Result<()>,
 ) -> Result<u64, ReadFramesError> {
-    let mut buf = vec![0u8; frame_bytes];
-    let mut frame_count: u64 = 0;
-    loop {
-        let n = fill_or_eof(&mut reader, &mut buf).map_err(ReadFramesError::Protocol)?;
-        if n == 0 {
-            break;
-        }
-        if n != frame_bytes {
-            return Err(ReadFramesError::Protocol(anyhow::anyhow!(
-                "ffmpeg の出力が1フレーム分のバイト数({frame_bytes}バイト)の倍数になって\
-                 いません: フレーム{frame_count}個目の途中、実際は{n}バイトで終わっています。"
-            )));
-        }
-        frame_count += 1;
-        on_frame(&buf).map_err(ReadFramesError::Callback)?;
-    }
+    let frame_count = read_luma_frames(reader, frame_bytes, on_frame)?;
     if frame_count == 0 {
         return Err(ReadFramesError::Protocol(anyhow::anyhow!(
             "ffmpeg からキーフレームを1枚も読み取れませんでした。`-skip_frame nokey` \
@@ -658,5 +671,53 @@ mod tests {
         .expect_err("on_frame のエラーが伝播するはず");
         assert_eq!(calls, 1, "1回目のフレームでエラーになったら以降は読まない");
         assert!(err.to_string().contains("callback error"));
+    }
+
+    // ---------------------------------------------------------------
+    // stream_keyframe_luma_frames: frame_bytes==0 の起動前拒否（レビューで
+    // 見つかった回帰の防止。ffmpeg を実際には起動しないため、この検査が
+    // 効いていない場合はこのテスト自体が長時間ハングして気付ける）。
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn keyframe_zero_width_is_rejected_before_spawning_ffmpeg() {
+        // width=0 のまま ffmpeg を起動すると、1フレームのバイト数が0になり、
+        // 誰も読まない標準出力パイプが埋まって `wait()` がハングする（実測で
+        // 確認済みの回帰）。存在しない ffmpeg / 入力パスを渡しても、起動前の
+        // 検査で弾かれるのでこのテストは高速に完走するはず。
+        let err = stream_keyframe_luma_frames(
+            Path::new("/nonexistent/ffmpeg-must-not-be-invoked"),
+            Path::new("/nonexistent/input-must-not-be-touched.mp4"),
+            Path::new("/tmp"),
+            VideoSize {
+                width: 0,
+                height: 360,
+            },
+            |_| Ok(()),
+        )
+        .expect_err("width=0 は ffmpeg を起動する前に弾かれるはず");
+        assert!(
+            err.to_string().contains("映像サイズが不正"),
+            "message={err}"
+        );
+    }
+
+    #[test]
+    fn keyframe_zero_height_is_rejected_before_spawning_ffmpeg() {
+        let err = stream_keyframe_luma_frames(
+            Path::new("/nonexistent/ffmpeg-must-not-be-invoked"),
+            Path::new("/nonexistent/input-must-not-be-touched.mp4"),
+            Path::new("/tmp"),
+            VideoSize {
+                width: 640,
+                height: 0,
+            },
+            |_| Ok(()),
+        )
+        .expect_err("height=0 は ffmpeg を起動する前に弾かれるはず");
+        assert!(
+            err.to_string().contains("映像サイズが不正"),
+            "message={err}"
+        );
     }
 }

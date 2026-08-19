@@ -209,7 +209,10 @@ fn count_keyframes_via_ffprobe(input: &std::path::Path) -> usize {
 #[test]
 #[ignore = "tests/fixtures/sample.mp4 と ffmpeg/ffprobe が必要。tests/fixtures/gen.sh を先に実行すること"]
 fn keyframe_only_frame_count_matches_ffprobe_keyframe_count() {
-    if common::skip_if_fixture_missing() || common::skip_if_missing("ffmpeg") {
+    // `count_keyframes_via_ffprobe` は ffprobe を `.expect(...)` で起動するため、
+    // ffmpeg はあっても ffprobe が無い環境ではスキップではなく panic になってしまう。
+    // 両方の有無を確認する `tools_available()` を使う（`tests/audio_e2e.rs` と同じ流儀）。
+    if common::skip_if_fixture_missing() || !common::tools_available() {
         return;
     }
 
