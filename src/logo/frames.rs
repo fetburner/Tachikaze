@@ -54,6 +54,25 @@
 //! デッドロックしうる（`crate::external` の `spawn_streaming` の doc comment
 //! 参照）。この対策は `spawn_streaming` 側に実装済みで、本モジュールはそれを
 //! そのまま使う。
+//!
+//! ## [`stream_keyframe_luma_frames`] を別関数にした理由（E18-1）
+//!
+//! ロゴ矩形を入力自身から推定する処理（別 issue）には、[`stream_luma_frames`] が
+//! そのままでは使えない。理由は2点:
+//!
+//! 1. **クロップしてしまう**。矩形推定はこれから矩形を決める処理なので、クロップ前の
+//!    全画面が要る
+//! 2. **フレーム数の一致検査を必ず行う**（`expected_frame_count` が省略不可）。
+//!    キーフレームだけ読むと GOP=120（CLAUDE.md「前提」）ごとにしか出ないため、
+//!    `.dtvi` の `frame_count` とは当然一致しない
+//!
+//! 1点目は crop フィルタを付けないだけで済むが、2点目は「一致検査を持たない」
+//! ことが要件そのものなので、既存関数から検査を外に出すことはできない
+//! （`stream_luma_frames` の一致検査は CLAUDE.md 罠3への防御であり、検出経路
+//! `analyze --logo` → `logo::score` が引き続き頼っている。弱めない）。そのため
+//! 新しい関数 [`stream_keyframe_luma_frames`] を追加する。この関数はフレーム番号と
+//! `.dtvi` の対応を一切使わず、統計量（矩形推定の材料）を集めるだけなので、
+//! 検査が無くても安全。**検出経路からは呼ばないこと。**
 
 use std::io::{ErrorKind, Read};
 use std::path::Path;
@@ -212,6 +231,95 @@ pub fn stream_luma_frames(
     }
 }
 
+/// `ffmpeg` を起動し、`input` の**キーフレームだけ**をデコードして、クロップして
+/// いない全画面の輝度平面を1フレームずつ `on_frame` に渡す。
+///
+/// ロゴ矩形を入力自身から推定する処理（別 issue）専用の関数。[`stream_luma_frames`]
+/// との違いと、その違いにもかかわらずフレーム数の一致検査を省いて安全な理由は
+/// モジュール doc comment「[`stream_keyframe_luma_frames`] を別関数にした理由」
+/// 参照。**この関数は `.dtvi` のフレーム番号との対応を検査しないので、
+/// `analyze --logo` の検出経路（`logo::score`）からは呼ばないこと。** 検出経路は
+/// 引き続き `stream_luma_frames` を使う。
+///
+/// GOP は 120 フレーム固定でシーンチェンジ由来の IDR がない（CLAUDE.md「前提」）ため、
+/// キーフレームは約4秒等間隔＝時間的に偏りのない標本になり、矩形推定にはこれで足りる。
+///
+/// - `video_size`: `input` の映像サイズ。1フレームのバイト数（`width*height`、
+///   `gray` は1ピクセル1バイト）を決めるために使う。
+/// - `cwd`: `ffmpeg` の作業ディレクトリ（`external::spawn_streaming` にそのまま渡す）。
+///   `input` は絶対パスに変換した上で渡すため、cwd の値自体はこの呼び出しの結果に
+///   影響しない。
+///
+/// 戻り値は実際に読めたキーフレーム数。**0枚だった場合はエラーにする**
+/// （`-skip_frame nokey` の綴りを間違える等で黙って0枚になると、後続の矩形推定が
+/// 「ロゴ無し」と誤判定するだけで気づけないため）。
+///
+/// `ffmpeg` の引数は `stream_luma_frames` と同じ流儀に、`-skip_frame nokey`（`-i`
+/// より前、デコーダ側の入力オプション。後ろに置くと出力側のオプションとして
+/// 解釈され、全フレームがデコードされてしまう）を加え、`-vf crop=...` を外した
+/// もの。
+///
+/// `ffmpeg` が見つからない・異常終了した場合や `on_frame` がエラーを返した場合の
+/// 扱いは [`stream_luma_frames`] と同じ（コマンドラインと stderr の末尾を含む
+/// エラー、`on_frame` 中断時は `kill()` してから `wait()` の結果を捨てる。
+/// モジュール doc comment「デッドロック回避」参照）。
+pub fn stream_keyframe_luma_frames(
+    ffmpeg: &Path,
+    input: &Path,
+    cwd: &Path,
+    video_size: VideoSize,
+    on_frame: impl FnMut(&[u8]) -> anyhow::Result<()>,
+) -> anyhow::Result<u64> {
+    let absolute_input =
+        std::fs::canonicalize(input).path_ctx("入力ファイルの絶対パス解決", input)?;
+    let frame_bytes = video_size.width as usize * video_size.height as usize;
+    let input_arg = absolute_input.as_os_str();
+
+    let args: Vec<&std::ffi::OsStr> = vec![
+        std::ffi::OsStr::new("-hide_banner"),
+        std::ffi::OsStr::new("-loglevel"),
+        std::ffi::OsStr::new("error"),
+        std::ffi::OsStr::new("-skip_frame"),
+        std::ffi::OsStr::new("nokey"),
+        std::ffi::OsStr::new("-i"),
+        input_arg,
+        std::ffi::OsStr::new("-map"),
+        std::ffi::OsStr::new("0:v:0"),
+        std::ffi::OsStr::new("-an"),
+        std::ffi::OsStr::new("-sn"),
+        std::ffi::OsStr::new("-pix_fmt"),
+        std::ffi::OsStr::new("gray"),
+        std::ffi::OsStr::new("-fps_mode"),
+        std::ffi::OsStr::new("passthrough"),
+        std::ffi::OsStr::new("-f"),
+        std::ffi::OsStr::new("rawvideo"),
+        std::ffi::OsStr::new("-"),
+    ];
+
+    let mut child = external::spawn_streaming(ffmpeg, &args, cwd)?;
+    let read_result = read_keyframe_frames(child.stdout(), frame_bytes, on_frame);
+
+    match read_result {
+        // `read_frames` と同じ理由（EOF後の失敗なら `wait()` は安全、そちらの
+        // エラーを優先する）で `wait()` の呼び方を分ける。
+        Err(ReadFramesError::Protocol(protocol_err)) => match child.wait() {
+            Err(wait_err) => Err(wait_err),
+            Ok(()) => Err(protocol_err),
+        },
+        // `on_frame` が中断した場合は EOF 前の可能性があるため、先に `kill()` して
+        // から `wait()` の結果は捨てる（`stream_luma_frames` と同じ扱い）。
+        Err(ReadFramesError::Callback(callback_err)) => {
+            child.kill();
+            let _ = child.wait();
+            Err(callback_err)
+        }
+        Ok(frame_count) => {
+            child.wait()?;
+            Ok(frame_count)
+        }
+    }
+}
+
 /// [`read_frames`] の失敗要因。`stream_luma_frames` が `wait()` の呼び方を
 /// 分けるために区別する（詳細は呼び出し側の doc comment参照）。
 #[derive(Debug)]
@@ -272,6 +380,50 @@ fn read_frames<R: Read>(
              ({expected_frame_count})と一致しません。この不一致を無視して後続の\
              ロゴ検出に進むと、ロゴ区間だけがフレーム数ぶんずれた Trim が出て、\
              CM の位置が黙ってずれます（join_logo_scp はこのずれをエラーにしません）。"
+        )));
+    }
+    Ok(frame_count)
+}
+
+/// `reader` から輝度フレームを `frame_bytes` バイトずつ読み、フレームごとに
+/// `on_frame` を呼ぶ（[`stream_keyframe_luma_frames`] 用）。
+///
+/// [`read_frames`] との違いは2点:
+/// - `expected_frame_count` を取らない・フレーム数の一致検査をしない
+///   （矩形推定はフレーム番号と `.dtvi` の対応を使わないため、モジュール
+///   doc comment「[`stream_keyframe_luma_frames`] を別関数にした理由」参照）
+/// - 代わりに**0フレームをエラーにする**（`-skip_frame nokey` の指定ミス等で
+///   黙って0枚になると、後続の矩形推定が「ロゴ無し」と誤判定するだけで
+///   気づけないため）
+///
+/// `frame_bytes` の倍数でない終わり方（端数バイト）をエラーにする点は
+/// `read_frames` と同じ。
+fn read_keyframe_frames<R: Read>(
+    mut reader: R,
+    frame_bytes: usize,
+    mut on_frame: impl FnMut(&[u8]) -> anyhow::Result<()>,
+) -> Result<u64, ReadFramesError> {
+    let mut buf = vec![0u8; frame_bytes];
+    let mut frame_count: u64 = 0;
+    loop {
+        let n = fill_or_eof(&mut reader, &mut buf).map_err(ReadFramesError::Protocol)?;
+        if n == 0 {
+            break;
+        }
+        if n != frame_bytes {
+            return Err(ReadFramesError::Protocol(anyhow::anyhow!(
+                "ffmpeg の出力が1フレーム分のバイト数({frame_bytes}バイト)の倍数になって\
+                 いません: フレーム{frame_count}個目の途中、実際は{n}バイトで終わっています。"
+            )));
+        }
+        frame_count += 1;
+        on_frame(&buf).map_err(ReadFramesError::Callback)?;
+    }
+    if frame_count == 0 {
+        return Err(ReadFramesError::Protocol(anyhow::anyhow!(
+            "ffmpeg からキーフレームを1枚も読み取れませんでした。`-skip_frame nokey` \
+             の指定が効いていない可能性があります。黙って0枚のまま後続のロゴ矩形推定に\
+             進むと、実際にはロゴがあっても「ロゴ無し」と誤判定されるだけで気づけません。"
         )));
     }
     Ok(frame_count)
@@ -444,6 +596,62 @@ mod tests {
         let data: Vec<u8> = (0..12).collect();
         let mut calls = 0;
         let err = read_frames(Cursor::new(data), 4, 3, |_| {
+            calls += 1;
+            bail!("callback error")
+        })
+        .expect_err("on_frame のエラーが伝播するはず");
+        assert_eq!(calls, 1, "1回目のフレームでエラーになったら以降は読まない");
+        assert!(err.to_string().contains("callback error"));
+    }
+
+    // ---------------------------------------------------------------
+    // read_keyframe_frames（stream_keyframe_luma_frames 用、ffmpeg を起動しない）
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn keyframe_reads_expected_number_of_whole_frames_without_expected_count() {
+        // frame_bytes=4, 3フレームぶん = 12バイト。expected_frame_count に相当する
+        // 引数を持たない（キーフレームだけ読むので `.dtvi` の frame_count とは
+        // 一致しなくてよい）。
+        let data: Vec<u8> = (0..12).collect();
+        let mut collected: Vec<Vec<u8>> = Vec::new();
+        let n = read_keyframe_frames(Cursor::new(data), 4, |frame| {
+            collected.push(frame.to_vec());
+            Ok(())
+        })
+        .expect("キーフレームが3枚読めるはず");
+
+        assert_eq!(n, 3);
+        assert_eq!(collected.len(), 3);
+        assert_eq!(collected[0], vec![0, 1, 2, 3]);
+        assert_eq!(collected[1], vec![4, 5, 6, 7]);
+        assert_eq!(collected[2], vec![8, 9, 10, 11]);
+    }
+
+    #[test]
+    fn keyframe_trailing_partial_bytes_is_an_error() {
+        // frame_bytes=4 の倍数でない14バイト(3フレーム+2バイトの端数)。
+        let data: Vec<u8> = (0..14).collect();
+        let err = read_keyframe_frames(Cursor::new(data), 4, |_| Ok(()))
+            .expect_err("端数バイトで終わるのでエラーになるはず");
+        assert!(err.to_string().contains("倍数"), "message={err}");
+    }
+
+    #[test]
+    fn keyframe_zero_frames_is_an_error() {
+        let err = read_keyframe_frames(Cursor::new(Vec::<u8>::new()), 4, |_| Ok(()))
+            .expect_err("0フレームはエラーになるはず（黙って『ロゴ無し』誤判定を防ぐ）");
+        assert!(
+            err.to_string().contains("1枚も読み取れません"),
+            "message={err}"
+        );
+    }
+
+    #[test]
+    fn keyframe_on_frame_error_propagates_immediately() {
+        let data: Vec<u8> = (0..12).collect();
+        let mut calls = 0;
+        let err = read_keyframe_frames(Cursor::new(data), 4, |_| {
             calls += 1;
             bail!("callback error")
         })
