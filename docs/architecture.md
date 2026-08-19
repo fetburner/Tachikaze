@@ -320,7 +320,7 @@ $ ffmpeg -i IN.mp4 -c copy -use_editlist 0 -movflags +faststart OUT.mp4
 | `segmap.rs` | `cut` が書く区間マップ（snap 後の境界と出力タイムライン上の開始時刻）の構造体、JSON への書き出しと読み込み | 上記「cut」手順8 |
 | `subtitle.rs` | `remap-subs` 本体: ASS/SRT の Start/End を区間マップの区分的な線形写像で張り替える（シフト/破棄/クリップの分類、丸め方向） | 上記「remap-subs」 |
 | `logo/lgd.rs` | Amatsukaze 形式ロゴデータ `.lgd`（AviUtl 互換のベース部 + Amatsukaze 独自の float 部）の読み込み | [cm-detection.md](cm-detection.md) |
-| `logo/frames.rs` | ffmpeg を子プロセスとして起動し、ロゴ矩形の輝度平面をフレーム順にストリームで読む。読み取ったフレーム数と `.dtvi` の `frame_count` の一致検査 | [cm-detection.md](cm-detection.md) |
+| `logo/frames.rs` | ffmpeg を子プロセスとして起動し、ロゴ矩形の輝度平面をフレーム順にストリームで読む（`stream_luma_frames`、読み取ったフレーム数と `.dtvi` の `frame_count` の一致検査あり）。ロゴ矩形推定専用に、クロップせず全画面をキーフレームだけ読む関数（`stream_keyframe_luma_frames`、フレーム数一致検査なし）も持つ | [cm-detection.md](cm-detection.md) |
 | `logo/score.rs` | ロゴマスク生成と相関スコア（`corr0`/`corr1`）。Amatsukaze `LogoScan.hpp` の相関方式を移植 | [cm-detection.md](cm-detection.md) |
 | `logo/scan.rs` | `make-logo` 本体: 外周1ピクセルが単色のフレームだけを使い、画素ごとに最小二乗で `.lgd` の係数 `a`/`b` を求める。`.lgd` の書き出し（ベース部はゼロ埋め） | 上記「make-logo」 |
 | `logo/interval.rs` | `corr0`/`corr1` の列からロゴ表示区間を判定し logoframe 形式で出力。Amatsukaze `LogoScan.hpp` の `LogoFrame::writeResult` を移植 | [cm-detection.md](cm-detection.md) |

@@ -1,4 +1,5 @@
-//! [E14-5] `logo::frames::stream_luma_frames` の E2E。
+//! [E14-5] `logo::frames::stream_luma_frames` / [E18-1]
+//! `logo::frames::stream_keyframe_luma_frames` の E2E。
 //!
 //! `tests/fixtures/sample.mp4`（640x360、599フレーム、30000/1001。
 //! `tests/fixtures/gen.sh` 参照）から実際に ffmpeg を起動し、
@@ -7,7 +8,11 @@
 
 mod common;
 
-use tachikaze::logo::frames::{stream_luma_frames, LogoRect, VideoSize};
+use std::process::Command;
+
+use tachikaze::logo::frames::{
+    stream_keyframe_luma_frames, stream_luma_frames, LogoRect, VideoSize,
+};
 use tachikaze::tools;
 
 /// フィクスチャの映像サイズ（`tests/fixtures/gen.sh` の `testsrc2=size=640x360`）。
@@ -163,5 +168,82 @@ fn callback_error_is_not_masked_by_kill() {
     assert!(
         message.contains("on_frame からの特有のエラー文言"),
         "on_frame 本来のエラーが出るはず（kill 由来のエラーに隠れていないはず）: message={message}"
+    );
+}
+
+// ---------------------------------------------------------------
+// [E18-1] stream_keyframe_luma_frames
+// ---------------------------------------------------------------
+
+/// `ffprobe -show_entries packet=flags` でフィクスチャの映像ストリームのキーフレーム
+/// 数（フラグ `K` を含むパケットの数）を数える。
+fn count_keyframes_via_ffprobe(input: &std::path::Path) -> usize {
+    let output = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "packet=flags",
+            "-of",
+            "csv=p=0",
+        ])
+        .arg(input)
+        .output()
+        .expect("ffprobe を起動できること");
+    assert!(
+        output.status.success(),
+        "ffprobe が失敗しました: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|line| line.contains('K'))
+        .count()
+}
+
+/// キーフレームだけを読む [`stream_keyframe_luma_frames`] が読めるフレーム数が、
+/// `ffprobe` で数えたキーフレーム数と一致することを確認する（完了条件）。
+/// あわせて、クロップしていない全画面（`640*360` バイト）が流れてくることも確認する。
+#[test]
+#[ignore = "tests/fixtures/sample.mp4 と ffmpeg/ffprobe が必要。tests/fixtures/gen.sh を先に実行すること"]
+fn keyframe_only_frame_count_matches_ffprobe_keyframe_count() {
+    // `count_keyframes_via_ffprobe` は ffprobe を `.expect(...)` で起動するため、
+    // ffmpeg はあっても ffprobe が無い環境ではスキップではなく panic になってしまう。
+    // 両方の有無を確認する `tools_available()` を使う（`tests/audio_e2e.rs` と同じ流儀）。
+    if common::skip_if_fixture_missing() || !common::tools_available() {
+        return;
+    }
+
+    let expected_keyframes = count_keyframes_via_ffprobe(&common::fixture_path());
+    assert!(
+        expected_keyframes > 0,
+        "フィクスチャに1枚もキーフレームが無い（テスト前提が崩れている）"
+    );
+
+    let ffmpeg = tools::resolve_tool(tools::FFMPEG).expect("ffmpeg を解決できること");
+    let cwd = common::make_tmp_dir("logo-frames-keyframe-happy");
+
+    let mut frame_lengths = Vec::new();
+    let n = stream_keyframe_luma_frames(
+        &ffmpeg,
+        &common::fixture_path(),
+        &cwd,
+        VIDEO_SIZE,
+        |frame| {
+            frame_lengths.push(frame.len());
+            Ok(())
+        },
+    )
+    .expect("キーフレームが読めるはず");
+
+    assert_eq!(n as usize, expected_keyframes);
+    assert_eq!(frame_lengths.len(), expected_keyframes);
+    assert!(
+        frame_lengths
+            .iter()
+            .all(|&len| len == (VIDEO_SIZE.width * VIDEO_SIZE.height) as usize),
+        "クロップせず全画面（w*h バイト）が流れてくるはず"
     );
 }
