@@ -692,14 +692,18 @@ fn greedy_merge(mut components: Vec<Component>, video_w: u32, video_h: u32) -> V
             for j in (i + 1)..components.len() {
                 if close_enough(components[i].bbox, components[j].bbox, MERGE_GAP) {
                     let merged_bbox = components[i].bbox.union(&components[j].bbox);
-                    // 注: `DILATE_RADIUS`(8)の2倍が現在の `MERGE_GAP`(16)と一致するため、
-                    // `close_enough` が真になるペア(実画素の隙間<=16)は、手順6-1の
-                    // 膨張(半径8を両側から)で既に同じ膨張塊に入っている。その塊の bbox
-                    // (今回の `merged_bbox` と同じ範囲)が上限を超えていれば、手順6-1で
-                    // 両成分ともマスクから消えてここへ到達しない。そのため下の
-                    // `passes_upper_bound(merged_bbox, ..)` が偽になる経路は、現在の
-                    // 定数の組み合わせでは実際には発火しない防御的なコードである
-                    // （定数を変えて `MERGE_GAP > 2*DILATE_RADIUS` にした場合には発火する）。
+                    // 注: `close_enough`（併合判定）は2成分の**bboxのギャップ**を見るが、
+                    // 手順6-1の大構造除去は**実画素のギャップ**（膨張半径8を両側から、
+                    // つまり実画素の隙間<=16で連結）で塊を決める。凸でない成分（例:
+                    // 階段状に伸びた形）ではこの2つのギャップが乖離するため、bbox同士は
+                    // `MERGE_GAP`(16)以内に近接していても、実画素は膨張しても繋がらず
+                    // 別々の膨張塊のまま両方生き残ることがある（実例: 300x200・閾値1.5で、
+                    // 階段状成分A(bbox 56x30, (40,40)-(95,69))とB(10x10, (112,40))は
+                    // 膨張塊としては別のまま残るが、bboxのxギャップは16、union幅82は
+                    // 上限60を超える）。そのような場合はここで初めて2成分のunion bboxが
+                    // 判定され、上限を超えていれば以下の `passes_upper_bound` が偽になって
+                    // 併合を止める。つまりこのガードは「bboxギャップと実画素ギャップが
+                    // 乖離する非凸な成分」で実際に発火し得る防御的なコードである。
                     if passes_upper_bound(merged_bbox, video_w, video_h) {
                         let comp_j = components.remove(j);
                         components[i].bbox = merged_bbox;
@@ -1133,6 +1137,42 @@ mod tests {
         let candidates =
             estimate_candidates(video_size(), frames_source(&frames)).expect("エラーにならない");
         assert!(candidates.is_empty(), "candidates={candidates:?}");
+    }
+
+    // ---------------------------------------------------------------
+    // MIN_AREA回帰: 下限判定は成分の有意画素数(bbox面積ではない)。
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn sparse_dotted_component_below_significant_pixel_minimum_is_rejected() {
+        // 10x10角の4隅に1画素だけの段差(「点」)を置く。各点は隣接差分の観点で
+        // 有意画素をちょうど3個生む(自分自身と、左・上の隣接画素。原理は
+        // モジュール doc comment 「原理」節と同じ隣接差分)。4点で有意画素は
+        // 合計12個だが、4点をまとめた生bboxは(39,39)-(49,49)付近のおよそ11x11
+        // (面積121、各辺11>=8)になる。
+        //
+        // これは MIN_AREA を bbox面積で判定する旧実装なら合格してしまっていた
+        // 形（各辺>=8を満たせば面積>=64>=20は自動的に満たされ恒真になっていた、
+        // レビューで指摘された回帰）。新実装(成分の有意画素数=12<20で判定)では
+        // 候補に出ないことをこのテストで固定する。
+        //
+        // (手動確認: `passes_lower_bound` を `bbox.width() as u64 *
+        // bbox.height() as u64 >= 20` へ戻すと、このテストは失敗して
+        // candidatesにこの点状成分が出るようになる。)
+        let dots: [(usize, usize); 4] = [(40, 40), (49, 40), (40, 49), (49, 49)];
+        let offset = |_i: usize| 30.0;
+        let regions: Vec<Region<'_>> = dots
+            .iter()
+            .map(|&(x, y)| (x, y, 1usize, 1usize, &offset as &dyn Fn(usize) -> f64))
+            .collect();
+        let frames = make_frames(VIDEO_W, VIDEO_H, TOTAL, varying_bg, &regions);
+
+        let candidates =
+            estimate_candidates(video_size(), frames_source(&frames)).expect("エラーにならない");
+        assert!(
+            candidates.is_empty(),
+            "有意画素数が下限未満の点状成分が候補に出ている: {candidates:?}"
+        );
     }
 
     // ---------------------------------------------------------------
