@@ -12,7 +12,7 @@ join_logo_scp -inscp scp.txt -incmd JL/JL_標準.txt -o trim.avs -oscp detail.jl
               -set param_cuttr 1
 ```
 
-`-inlogo` は既定では付けない。省略すると全フレームがロゴ表示中とみなされる。対象の mp4 には局ロゴが残っていることが多く（[measurements.md](measurements.md)「ロゴの残存」）、`analyze --logo <path.lgd>` を指定すると自前実装のロゴ検出（`src/logo/`）を通して `-inlogo` を渡せる。ただし渡すのは、検出フレーム割合が閾値以上、かつ logoframe テキストが空でないときだけ（詳細は `src/analyze.rs::detect_logo`/`inlogo_decision` の doc comment）。割合だけでは判定できない。`logo_frames` の数え上げと `text` の出力は別経路のため、割合が閾値以上でも `text` が空になるケースがあるからである。
+`-inlogo` は、ロゴ検出（自前実装、`src/logo/`）に成功したときだけ渡す。省略すると全フレームがロゴ表示中とみなされる。対象の mp4 には局ロゴが残っていることが多い（[measurements.md](measurements.md)「ロゴの残存」）。既定（`--logo`/`--no-logo` を両方省略）では、入力自身からロゴ矩形を自動推定して検出を試みる。`analyze --logo <path.lgd>` を指定すれば特定の `.lgd` を使う。`--no-logo` を指定したときだけロゴ無しで確定する（詳細は [architecture.md](architecture.md)「analyze」の「自動推定」節）。いずれの経路でも `-inlogo` を渡す条件は同じである。検出フレーム割合が閾値以上、かつ logoframe テキストが空でないときだけ渡す（詳細は `src/analyze.rs::detect_logo`/`inlogo_decision` の doc comment）。割合だけでは判定できない。`logo_frames` の数え上げと `text` の出力は別経路のため、割合が閾値以上でも `text` が空になるケースがあるからである。
 
 **`autocm_sub`/`param_cuttr` の既定値はロゴあり・なしで変えない**（実測・根拠は下記「実測の記録: ロゴあり/なしの比較」）。この節の `autocm_sub`/`param_cuttr` の実測（次の2小節）はいずれも**ロゴ無し（`-inlogo` 省略）の状態**で得たもの。
 
