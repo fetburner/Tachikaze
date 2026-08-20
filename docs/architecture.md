@@ -324,6 +324,7 @@ $ ffmpeg -i IN.mp4 -c copy -use_editlist 0 -movflags +faststart OUT.mp4
 | `logo/score.rs` | ロゴマスク生成と相関スコア（`corr0`/`corr1`）。Amatsukaze `LogoScan.hpp` の相関方式を移植 | [cm-detection.md](cm-detection.md) |
 | `logo/scan.rs` | `make-logo` 本体: 外周1ピクセルが単色のフレームだけを使い、画素ごとに最小二乗で `.lgd` の係数 `a`/`b` を求める。`.lgd` の書き出し（ベース部はゼロ埋め） | 上記「make-logo」 |
 | `logo/interval.rs` | `corr0`/`corr1` の列からロゴ表示区間を判定し logoframe 形式で出力。Amatsukaze `LogoScan.hpp` の `LogoFrame::writeResult` を移植 | [cm-detection.md](cm-detection.md) |
+| `logo/dict.rs` | 学習済み `.lgd` を辞書ディレクトリ（既定 `$XDG_DATA_HOME/tachikaze/logos`）に蓄積し、対象映像と解像度が一致する候補をスコア（Amatsukaze `LogoFrame::selectLogo` 相当）で自動選択する | [cm-detection.md](cm-detection.md) |
 
 **解析側（analyze）は mp4 の読み込みに依存しない。** `--report` が必要とするキーフレーム位置を `.dtvi` から取る設計にしてあるため。**この性質を崩さないこと**（キーフレーム位置を mp4 から取る実装に変えると解析とカットが結合する）。
 
