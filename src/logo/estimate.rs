@@ -1,8 +1,12 @@
-//! 入力自身からロゴ矩形の候補列を推定する（E18-2）。
+//! 入力自身からロゴ矩形の候補列を推定し、本編/CM の在/不在信号で採点して選ぶ
+//! （E18-2・E18-3）。
 //!
 //! `analyze --logo` は `.lgd` を必要とし、`.lgd` を作る `make-logo` はロゴ矩形を
 //! `--rect x,y,w,h` で人手指定させている。位置を人間が測らないと何も始まらない。
-//! この issue は、**候補列の生成だけ**を作る（候補から 1 つを選ぶ採点は別 issue #133）。
+//! [`estimate_candidates`] は「定常的な段差がある場所」の候補列を作り（E18-2、
+//! 手順1〜7）、続けてその候補を本編/CM ラベルとの相関（AUC）で採点して採用列を
+//! 決める（E18-3、下記「候補の採点」節）。採用列から実際に `make-logo` を試す
+//! 直列の採用ループは別 issue #135 の担当（この関数は順序つきの採用列を返すだけ）。
 //!
 //! ## 原理: 半透明合成の隣接差分
 //!
@@ -68,14 +72,91 @@
 //!
 //! ## 標本数を事前に知らなくてよい理由
 //!
-//! [`estimate_candidates`] はフレーム供給関数を**2回**呼ぶ。1回目は標本総数を
-//! 数えるだけ（コールバックは何もしない）、2回目でその総数を使ってブロック割当て
-//! （`総標本数 × フレーム番号 / 16`）を行う。キーフレームだけを読む供給関数
-//! （`frames::stream_keyframe_luma_frames`）は ffmpeg を起動し直すだけで、
-//! キーフレーム限定デコードは軽いためこの2回呼びは許容する。**2回目が返す実際の
-//! フレーム数は1回目の総数と一致することを明示的に検査する**（一致しないと
-//! ブロック割当てが静かに歪む。CLAUDE.md 罠3の一般形と同じ「検査が無いと例外を
-//! 飛ばさずに間違った結果が出る」パターンのため、無視できないエラーにしている）。
+//! 候補列の生成（[`estimate_raw`]）はフレーム供給関数を**2回**呼ぶ。1回目は
+//! 標本総数を数えるだけ（コールバックは何もしない）、2回目でその総数を使って
+//! ブロック割当て（`総標本数 × フレーム番号 / 16`）を行う。キーフレームだけを
+//! 読む供給関数（`frames::stream_keyframe_luma_frames`）は ffmpeg を起動し直す
+//! だけで、キーフレーム限定デコードは軽いためこの2回呼びは許容する。**2回目が
+//! 返す実際のフレーム数は1回目の総数と一致することを明示的に検査する**（一致
+//! しないとブロック割当てが静かに歪む。CLAUDE.md 罠3の一般形と同じ「検査が無いと
+//! 例外を飛ばさずに間違った結果が出る」パターンのため、無視できないエラーにして
+//! いる）。[`estimate_candidates`]（公開API）はこの2回に加え、AUC採点
+//! （下記「候補の採点」節）のため最大3回目の呼び出しを行う。
+//!
+//! ## 候補の採点（AUC、E18-3）
+//!
+//! 上記の手順1〜7は「定常的な段差がある場所」を強い順に並べるだけで、**定常
+//! オーバーレイは局ロゴだけではない**（実測: 時計・天気パネル・L字帯・台風テロップ
+//! が候補に混ざった。ロゴは4.5〜7.1階調と桁違いに弱いため強さでは選べない）。
+//! ロゴの定義は「本編で出ていてCMで消える」なので、候補ごとに「フレームごとの
+//! 在/不在スコア」を作り、**本編/CMラベルとの分離度（AUC、Mann–Whitney U /
+//! n_本編 n_CM）**で採点する。
+//!
+//! 以下の番号は候補列生成（手順1〜8）とは別系列の「AUC手順」であり、
+//! `classify_sample` を渡す（AUC手順1、[`estimate_candidates`] の引数）に続く。
+//!
+//! - **AUC手順2: 在/不在スコア。** 候補ごとに、`raw_bbox` + 余白 [`RECT_MARGIN`]
+//!   内の**全標本平均の d 場**（水平・垂直、[`BlockAccumulator`] が溜めたブロック
+//!   平均の重み付き平均から合成できるので追加の走査は不要）をテンプレートとし、
+//!   各標本の同領域の d 場との正規化相関（cos 類似度）をその標本のスコアとする
+//!   （[`build_template`]/[`compute_score`]）。フレームの再走査が要るのはこの
+//!   スコア計算の1パスだけで、**全候補ぶんを1パスでまとめて計算する**
+//!   （[`score_candidates`]。候補ごとに走査し直さない）。
+//! - **AUC手順3: AUC計算**（[`auc_from_scores`]）: 本編群のスコアがCM群のスコア
+//!   より大きい確率をMann–Whitney Uから求める。
+//! - **AUC手順4〜5: 採用列の決定とログ**（[`select_by_auc`]）: CM標本が
+//!   [`MIN_CM_SAMPLES_FOR_AUC`] 枚以上なら `AUC >= `[`AUC_SELECT_THRESHOLD`]`
+//!   の候補をAUC降順で返す（1つも無ければ空＝ロゴ無し）。CM標本がそれ未満なら、
+//!   AUCを使わず**候補列の先頭（最大効果量が最大の候補）1つだけ**を返す
+//!   （silence検出がCMを見つけられない入力こそロゴ検出の価値が最大なので、
+//!   ここで棄権しない）。
+//!
+//! ### 分類器（`classify_sample`）の契約
+//!
+//! [`estimate_candidates`] は「流れてきた標本の通し番号（0始まり、`stream_frames`
+//! が呼ぶ順）」から本編/CMを返すクロージャを受け取る。**この関数は標本の通し番号と
+//! `.dtvi` のフレーム番号の対応を一切持たない**（GOP=120固定という CLAUDE.md
+//! 「前提」を使って計算していない）。理由は2つ: (1) `stream_frames` に渡す供給関数
+//! （典型的には [`crate::logo::frames::stream_keyframe_luma_frames`]）は
+//! キーフレームだけを流すため、通し番号は「何番目のキーフレームか」であって
+//! フレーム番号ではない。(2) その対応づけには実際のキーフレーム位置（mp4の
+//! サンプル表の同期サンプル、または `.dtvi`）が要り、それは呼び出し側だけが持つ
+//! 情報である。**対応がずれると本編のフレームがCM群に混ざったまま採点され、
+//! 静かに間違った候補が選ばれる**（例外は飛ばない）。呼び出し側は実際の
+//! キーフレーム位置から通し番号への対応を作ってから `classify_sample` を渡すこと。
+//!
+//! ### なぜ Welch t（本編/CM 2群の差分マップ）を使わないか（罠）
+//!
+//! 初版の主基準は画素単位の Welch t マップだったが、追検証で2つの欠陥が出た。
+//! (1) **CM標本が少ないと退化する**: silence検出がCMを見つけられない入力では
+//! CM標本が1枚まで減り、t マップが偽の位置に極端な値（実測 t=411）を出した。
+//! 「CM標本0枚なら全フレーム版へフォールバック」という条件ではこの退化を防げない
+//! （1枚でも退化する）。(2) 時計のような「本編でもCMでも出ているもの」を落とす／
+//! 活かす判断は候補単位のAUCでしか行えない。画素単位の差分には「分のケタの平均差を
+//! 拾う」偽陽性も観測された（実測 `291,94,89x43` に t=51）。**この理由により
+//! Welch差分を復活させてはならない。**
+//!
+//! ### なぜAUC不採用のとき無条件採用へフォールバックしないか（罠）
+//!
+//! 「せっかく推定したから」と AUC が全滅したときに無条件採用へ落ちてはならない。
+//! これは旧版の罠「差分が『ロゴ無し』と言ったときに全フレーム版へ落ちてはいけない」
+//! と同じ思想で、AUCが候補単位で下した「本編/CMと相関しない」という判定を上書きして
+//! しまう。フォールバックしてよいのは [`MIN_CM_SAMPLES_FOR_AUC`] 節で述べる
+//! 「CM標本が少なすぎてAUC自体が作れない」場合だけである。
+//!
+//! ### なぜ CM標本20枚未満のAUCを信用しないか（[`MIN_CM_SAMPLES_FOR_AUC`] の根拠）
+//!
+//! 実測: CM標本1枚の入力では、断片（AUC 0.983）が全体のロゴ（0.946）を上回った。
+//! 負例1枚のAUCは「その1枚をたまたま外したか」の二値でしかなく統計的な意味を
+//! 持たない。20枚という下限は4局の実測から較正した値であり、これ未満では
+//! AUCによる順位づけ自体を信用せず候補列の先頭を無条件で返す。
+//!
+//! ### AUCの上位は僅差で並ぶことがある（罠ではなく既知の性質）
+//!
+//! 実測: L字放送の局ではロゴ0.990に対しL字帯・台風テロップの断片が0.947〜0.985
+//! だった（L字も本編にだけ出るので相関する）。順位の逆転はあり得るが、AUCが高い
+//! 候補は定義上本編/CMと相関しており、誤採用しても既存の検出フレーム割合の絶対
+//! 閾値と `auto` の gate が最終防御になる（時計が有用な入力での実証と同じ理屈）。
 
 use std::collections::{BTreeMap, HashSet};
 
@@ -153,14 +234,35 @@ const RECT_MARGIN: u32 = 8;
 /// 重複除去のために座標・寸法を丸める単位（画素、手順7）。
 const DEDUP_ROUND: u32 = 8;
 
+/// CM標本数がこの値以上のときだけAUCによる採点を信用する（AUC手順4、モジュール
+/// doc comment「候補の採点」の手順番号。候補列生成（手順1〜8）とは別系列の
+/// 番号なので混同しないこと）。モジュール doc comment「なぜCM標本20枚未満の
+/// AUCを信用しないか」参照（4局の実測からの較正値）。
+const MIN_CM_SAMPLES_FOR_AUC: u64 = 20;
+
+/// AUCがこの値以上の候補だけを採用列に入れる（AUC手順4）。
+const AUC_SELECT_THRESHOLD: f64 = 0.9;
+
 /// フレームごとのコールバック（輝度平面を受け取り、成否を返す）。
 /// [`estimate_candidates`] の `stream_frames` 引数が受け取る型を名付けたもの
 /// （clippy `type_complexity` 対策。裸で書くと `&mut dyn FnMut(&[u8]) ->
 /// anyhow::Result<()>` がシグネチャに毎回並び、複雑さの警告になる）。
 type FrameCallback<'a> = dyn FnMut(&[u8]) -> anyhow::Result<()> + 'a;
 
-/// ロゴ矩形の候補。降順（[`Candidate::max_effect`] の大きい順）に並んだ列として
-/// [`estimate_candidates`] が返す。
+/// 標本（[`estimate_candidates`] の `stream_frames` が流す1フレーム）の本編/CM
+/// ラベル。`classify_sample` 引数が返す型（モジュール doc comment「分類器
+/// （`classify_sample`）の契約」参照）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SampleLabel {
+    /// 本編（CM以外）の標本。
+    Program,
+    /// CMの標本。
+    Cm,
+}
+
+/// ロゴ矩形の候補。[`estimate_candidates`] が返す採用列では、AUCで採点できた場合は
+/// AUC降順、できなかった場合（CM標本が少ない）は候補列の先頭1つだけになる
+/// （モジュール doc comment「候補の採点」参照）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct Candidate {
     /// bbox の外側に余白 [`RECT_MARGIN`] 画素を足し、映像範囲でクランプしてから
@@ -176,7 +278,8 @@ pub struct Candidate {
     pub rung_threshold: f32,
 }
 
-/// 映像サイズと「キーフレームを流す供給関数」からロゴ矩形の候補列を推定する。
+/// 映像サイズと「キーフレームを流す供給関数」と「標本の本編/CM分類器」から
+/// ロゴ矩形の採用列を推定する。
 ///
 /// `stream_frames` は「フレームごとのコールバックを受け取り、実際に流した
 /// フレーム数を返す関数」を渡す。呼び出し側の典型的な使い方（実際の ffmpeg 経由）:
@@ -184,25 +287,77 @@ pub struct Candidate {
 /// ```text
 /// estimate_candidates(video_size, |on_frame| {
 ///     frames::stream_keyframe_luma_frames(&ffmpeg, &input, &cwd, video_size, on_frame)
-/// })
+/// }, classify_sample)
 /// ```
 ///
-/// この関数は `stream_frames` を2回呼ぶ（理由はモジュール doc comment
-/// 「標本数を事前に知らなくてよい理由」参照）。`video_size` の幅・高さが 0 の場合や
-/// 標本が1枚も無い場合は空の候補列を返す。
+/// `classify_sample` は「`stream_frames` が呼ぶ順に0始まりで振った標本の通し番号」
+/// を受け取り [`SampleLabel`] を返すクロージャ。**標本の通し番号から時刻や
+/// `.dtvi` のフレーム番号への対応づけは呼び出し側の責務**（この関数はその対応を
+/// 一切持たない。理由と、対応をGOP=120の仮定で計算してはならない理由はモジュール
+/// doc comment「分類器（`classify_sample`）の契約」参照）。
+///
+/// この関数は `stream_frames` を最大3回呼ぶ: 1・2回目は候補列の生成
+/// （理由はモジュール doc comment「標本数を事前に知らなくてよい理由」参照）、
+/// 3回目はAUC採点のスコア計算（CM標本が[`MIN_CM_SAMPLES_FOR_AUC`]枚以上あるときのみ、
+/// モジュール doc comment「候補の採点」参照）。`video_size` の幅・高さが 0 の場合や
+/// 標本が1枚も無い場合、候補列が生成されなかった場合は3回目を呼ばずに空の採用列を
+/// 返す。
 pub fn estimate_candidates(
     video_size: VideoSize,
     mut stream_frames: impl FnMut(&mut FrameCallback<'_>) -> anyhow::Result<u64>,
+    classify_sample: impl Fn(u64) -> SampleLabel,
 ) -> anyhow::Result<Vec<Candidate>> {
+    let Some(raw) = estimate_raw(video_size, &mut stream_frames)? else {
+        return Ok(Vec::new());
+    };
+    if raw.candidates.is_empty() {
+        return Ok(raw.candidates);
+    }
+
+    select_by_auc(
+        raw.w,
+        raw.h,
+        &raw.acc,
+        raw.candidates,
+        raw.total,
+        &mut stream_frames,
+        &classify_sample,
+    )
+}
+
+/// [`estimate_raw`] の結果（手順1〜7で作った候補列と、その元になった集計）。
+/// AUC採点（AUC手順2〜5、[`select_by_auc`]。候補列生成の手順1〜8とは別系列の
+/// 番号）に必要な `acc`/`w`/`h`/`total` を候補列と一緒に持ち越す
+/// （[`BlockAccumulator`] を2回目の `stream_frames` 呼び出しだけで作るのと同じ
+/// 理由で、AUC採点のために集計をやり直さない）。
+struct RawEstimate {
+    w: usize,
+    h: usize,
+    total: u64,
+    acc: BlockAccumulator,
+    candidates: Vec<Candidate>,
+}
+
+/// [`estimate_candidates`] の手順1〜7（候補列の生成、E18-2）。`stream_frames` を
+/// 2回呼ぶ（理由はモジュール doc comment「標本数を事前に知らなくてよい理由」参照）。
+/// `video_size` の幅・高さが0の場合や標本が1枚も無い場合は `None`。
+///
+/// AUC採点（E18-3）を経由しないこの関数の出力単体を検証するテストは
+/// `#[cfg(test)] mod tests` の `estimate_raw_candidates` から呼ぶ（構造的な候補
+/// 生成とAUC採点は独立に検証する）。
+fn estimate_raw(
+    video_size: VideoSize,
+    stream_frames: &mut impl FnMut(&mut FrameCallback<'_>) -> anyhow::Result<u64>,
+) -> anyhow::Result<Option<RawEstimate>> {
     let w = video_size.width as usize;
     let h = video_size.height as usize;
     if w == 0 || h == 0 {
-        return Ok(Vec::new());
+        return Ok(None);
     }
 
     let total = stream_frames(&mut |_frame: &[u8]| Ok(()))?;
     if total == 0 {
-        return Ok(Vec::new());
+        return Ok(None);
     }
 
     let mut acc = BlockAccumulator::new(w, h, total);
@@ -218,7 +373,376 @@ pub fn estimate_candidates(
     );
     acc.finish();
 
-    Ok(build_candidates(w, h, video_size, &acc))
+    let candidates = build_candidates(w, h, video_size, &acc);
+    Ok(Some(RawEstimate {
+        w,
+        h,
+        total,
+        acc,
+        candidates,
+    }))
+}
+
+/// [`estimate_candidates`] のAUC手順3〜5（AUC計算・採用列の決定・ログ。候補列
+/// 生成の手順1〜8とは別系列の番号、モジュール doc comment「候補の採点」参照）。
+/// 候補列が空でないことは呼び出し側が保証する。
+fn select_by_auc(
+    w: usize,
+    h: usize,
+    acc: &BlockAccumulator,
+    candidates: Vec<Candidate>,
+    total: u64,
+    stream_frames: &mut impl FnMut(&mut FrameCallback<'_>) -> anyhow::Result<u64>,
+    classify_sample: &impl Fn(u64) -> SampleLabel,
+) -> anyhow::Result<Vec<Candidate>> {
+    // CM標本数だけをまず数える(フレームの再走査なしで判定できる。AUC手順4の
+    // 分岐はこの数だけで決まるため、下限未満ならAUC採点用の3回目のストリーミングを
+    // 呼ばずに済む。「フレームの再走査が要るのはスコア計算の1パスだけ」という
+    // 性能上の前提を守るため、不要な走査は増やさない)。
+    let cm_count = (0..total)
+        .filter(|&i| classify_sample(i) == SampleLabel::Cm)
+        .count() as u64;
+    let program_count = total - cm_count;
+    eprintln!(
+        "[logo-estimate] 標本の本編/CM分類: 本編{program_count}枚 CM{cm_count}枚 \
+         (合計{total}枚)"
+    );
+
+    if cm_count < MIN_CM_SAMPLES_FOR_AUC {
+        // モジュール doc comment「なぜCM標本20枚未満のAUCを信用しないか」参照。
+        let top = candidates[0].clone();
+        eprintln!(
+            "[logo-estimate] CM標本が{cm_count}枚(下限{MIN_CM_SAMPLES_FOR_AUC}枚)未満のため、\
+             AUCを計算せず候補列の先頭(最大効果量={:.1})を採用します: \
+             raw_bbox=(x={}, y={}, w={}, h={})",
+            top.max_effect, top.raw_bbox.x, top.raw_bbox.y, top.raw_bbox.w, top.raw_bbox.h,
+        );
+        return Ok(vec![top]);
+    }
+
+    if program_count == 0 {
+        // 本編標本が1枚も無いと、どの候補も[`auc_from_scores`]がNaNを返すため
+        // 採用列は必ず空になる。3回目のフレーム走査（実測4.25秒相当）をかけても
+        // 結果が変わらないので、AUC計算そのものをせずに空を返す（安全側に落ちる
+        // だけの走査を1パス節約する）。
+        eprintln!("[logo-estimate] 本編標本が0枚のためAUCを計算できません。採用列は空です。");
+        return Ok(Vec::new());
+    }
+
+    let templates: Vec<Option<CandidateTemplate>> = candidates
+        .iter()
+        .map(|c| build_template(w, h, acc, bbox_from_rect(c.raw_bbox)))
+        .collect();
+
+    let (program_scores, cm_scores) =
+        score_candidates(w, h, &templates, stream_frames, classify_sample, total)?;
+
+    let mut scored: Vec<(Candidate, f64)> = candidates
+        .into_iter()
+        .zip(program_scores.into_iter().zip(cm_scores))
+        .map(|(candidate, (program, cm))| {
+            let auc = auc_from_scores(&program, &cm);
+            eprintln!(
+                "[logo-estimate] 候補 raw_bbox=(x={}, y={}, w={}, h={}) 最大効果量={:.1}: \
+                 AUC={auc:.3} (本編標本{}枚 CM標本{}枚)",
+                candidate.raw_bbox.x,
+                candidate.raw_bbox.y,
+                candidate.raw_bbox.w,
+                candidate.raw_bbox.h,
+                candidate.max_effect,
+                program.len(),
+                cm.len(),
+            );
+            (candidate, auc)
+        })
+        .collect();
+
+    // AUC >= 閾値の候補だけをAUC降順で残す（同値タイは最大効果量降順、さらに
+    // bbox座標で決定的に破る。`build_candidates` の並び順と同じ流儀）。
+    scored.retain(|(_, auc)| *auc >= AUC_SELECT_THRESHOLD);
+    scored.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                b.0.max_effect
+                    .partial_cmp(&a.0.max_effect)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| a.0.raw_bbox.x.cmp(&b.0.raw_bbox.x))
+            .then_with(|| a.0.raw_bbox.y.cmp(&b.0.raw_bbox.y))
+            .then_with(|| a.0.raw_bbox.w.cmp(&b.0.raw_bbox.w))
+            .then_with(|| a.0.raw_bbox.h.cmp(&b.0.raw_bbox.h))
+    });
+
+    eprintln!(
+        "[logo-estimate] 採用列(AUC>={AUC_SELECT_THRESHOLD}): {}個",
+        scored.len()
+    );
+    for (rank, (c, auc)) in scored.iter().enumerate() {
+        eprintln!(
+            "[logo-estimate] 採用{}: raw_bbox=(x={}, y={}, w={}, h={}) AUC={auc:.3}",
+            rank + 1,
+            c.raw_bbox.x,
+            c.raw_bbox.y,
+            c.raw_bbox.w,
+            c.raw_bbox.h,
+        );
+    }
+
+    Ok(scored.into_iter().map(|(c, _)| c).collect())
+}
+
+/// [`LogoRect`] を内部の [`Bbox`]（両端含む座標）へ変換する。
+fn bbox_from_rect(rect: LogoRect) -> Bbox {
+    Bbox {
+        x_min: rect.x,
+        y_min: rect.y,
+        x_max: rect.x + rect.w - 1,
+        y_max: rect.y + rect.h - 1,
+    }
+}
+
+/// 候補1つのスコアリング領域（画素座標、両端を含む）。
+#[derive(Debug, Clone, Copy)]
+struct ScoreRegion {
+    x_min: usize,
+    y_min: usize,
+    x_max: usize,
+    y_max: usize,
+}
+
+/// `bbox` + 余白 [`RECT_MARGIN`] を、[`BlockAccumulator`] がブロック平均を実際に
+/// 集計した範囲（外周 [`BORDER_MARGIN`] を除いた内側、`build_effect_maps` と同じ
+/// 範囲）にクランプする。集計範囲外は `block_mean_h`/`block_mean_v` が既定値の
+/// 0 のままで、テンプレートに含めると偽の下駄になるため範囲外に出さない。
+///
+/// 範囲が空になる（`bbox` が集計範囲の外にある等）場合は `None` を返す。
+fn candidate_score_region(bbox: Bbox, w: usize, h: usize) -> Option<ScoreRegion> {
+    let border = BORDER_MARGIN as usize;
+    if w <= 2 * border + 1 || h <= 2 * border + 1 {
+        return None;
+    }
+    let lo_x = border;
+    let hi_x = w - 1 - border;
+    let lo_y = border;
+    let hi_y = h - 1 - border;
+    let margin = RECT_MARGIN as usize;
+
+    let x_min = (bbox.x_min as usize).saturating_sub(margin).max(lo_x);
+    let y_min = (bbox.y_min as usize).saturating_sub(margin).max(lo_y);
+    let x_max = (bbox.x_max as usize + margin).min(hi_x);
+    let y_max = (bbox.y_max as usize + margin).min(hi_y);
+    if x_min > x_max || y_min > y_max {
+        return None;
+    }
+    Some(ScoreRegion {
+        x_min,
+        y_min,
+        x_max,
+        y_max,
+    })
+}
+
+/// 候補1つの在/不在スコア計算に使うテンプレート（モジュール doc comment
+/// 「候補の採点」参照）。
+struct CandidateTemplate {
+    region: ScoreRegion,
+    /// `region`内を行優先（`(y - region.y_min) * region幅 + (x - region.x_min)`）
+    /// で並べた、全標本平均の水平差分場。
+    template_h: Vec<f32>,
+    /// `template_h` と同じ並びの垂直差分場。
+    template_v: Vec<f32>,
+    /// `(template_h, template_v)` を連結したベクトルのノルム。0 ならテンプレートが
+    /// 全ゼロ（この領域に段差が無い）ことを意味し、[`compute_score`] はcos類似度を
+    /// 定義できないとみなして0を返す。
+    norm: f64,
+}
+
+/// `bbox` の [`candidate_score_region`] 内で、[`BlockAccumulator`] が溜めた
+/// ブロック平均を標本数で重み付き平均し、テンプレートを合成する
+/// （モジュール doc comment「候補の採点」の「在/不在スコア」参照。追加の
+/// フレーム走査は不要）。範囲が作れない場合は `None`。
+fn build_template(
+    w: usize,
+    h: usize,
+    acc: &BlockAccumulator,
+    bbox: Bbox,
+) -> Option<CandidateTemplate> {
+    let region = candidate_score_region(bbox, w, h)?;
+    let total_count: u64 = acc.block_sample_count.iter().sum();
+    if total_count == 0 {
+        return None;
+    }
+
+    let wh = w * h;
+    let region_w = region.x_max - region.x_min + 1;
+    let region_h = region.y_max - region.y_min + 1;
+    let mut template_h = vec![0.0f32; region_w * region_h];
+    let mut template_v = vec![0.0f32; region_w * region_h];
+
+    for ry in 0..region_h {
+        let y = region.y_min + ry;
+        for rx in 0..region_w {
+            let x = region.x_min + rx;
+            let idx = y * w + x;
+            let mut sum_h = 0.0f64;
+            let mut sum_v = 0.0f64;
+            for b in 0..NUM_BLOCKS {
+                let count = acc.block_sample_count[b];
+                if count == 0 {
+                    continue;
+                }
+                sum_h += acc.block_mean_h[b * wh + idx] as f64 * count as f64;
+                sum_v += acc.block_mean_v[b * wh + idx] as f64 * count as f64;
+            }
+            let ti = ry * region_w + rx;
+            template_h[ti] = (sum_h / total_count as f64) as f32;
+            template_v[ti] = (sum_v / total_count as f64) as f32;
+        }
+    }
+
+    let norm_sq: f64 = template_h
+        .iter()
+        .zip(template_v.iter())
+        .map(|(&th, &tv)| (th as f64).powi(2) + (tv as f64).powi(2))
+        .sum();
+
+    Some(CandidateTemplate {
+        region,
+        template_h,
+        template_v,
+        norm: norm_sq.sqrt(),
+    })
+}
+
+/// 1標本(1フレーム)の在/不在スコア。`template` の領域内で標本の d 場との
+/// cos類似度を計算する。`template.norm` が0（段差なし）か、この標本のその領域の
+/// d場がすべて0（分散なし）ならcos類似度を定義できないため0を返す
+/// （モジュール doc comment「候補の採点」参照）。
+///
+/// `h` はassert専用（`w`と合わせて `frame` が全画面1枚ぶんのバイト数を持つことを
+/// 確認するためだけに使う。`BlockAccumulator::add_frame` の同種の検査と同じ理由）。
+fn compute_score(w: usize, h: usize, template: &CandidateTemplate, frame: &[u8]) -> f32 {
+    debug_assert_eq!(frame.len(), w * h, "frame のバイト数が w*h と不一致");
+    let region = &template.region;
+    let region_w = region.x_max - region.x_min + 1;
+    let region_h = region.y_max - region.y_min + 1;
+
+    let mut dot = 0.0f64;
+    let mut sample_norm_sq = 0.0f64;
+    for ry in 0..region_h {
+        let y = region.y_min + ry;
+        let row_base = y * w;
+        for rx in 0..region_w {
+            let x = region.x_min + rx;
+            let idx = row_base + x;
+            let v = frame[idx] as f64;
+            let dh = frame[idx + 1] as f64 - v;
+            let dv = frame[idx + w] as f64 - v;
+            let ti = ry * region_w + rx;
+            dot += template.template_h[ti] as f64 * dh + template.template_v[ti] as f64 * dv;
+            sample_norm_sq += dh * dh + dv * dv;
+        }
+    }
+
+    if template.norm > 0.0 && sample_norm_sq > 0.0 {
+        (dot / (template.norm * sample_norm_sq.sqrt())) as f32
+    } else {
+        0.0
+    }
+}
+
+/// 候補ごとの標本スコア列（[`score_candidates`] の戻り値の要素。clippy
+/// `type_complexity` 対策で [`FrameCallback`] と同じ理由により名付ける）。
+type PerCandidateScores = Vec<Vec<f32>>;
+
+/// [`estimate_candidates`] のAUC採点用3回目の `stream_frames` 呼び出し。
+/// **全候補ぶんを1パスでまとめて計算する**（モジュール doc comment「候補の採点」の
+/// 「在/不在スコア」参照。候補ごとに走査し直さない）。`templates[i]` が `None` の
+/// 候補（[`candidate_score_region`] が範囲を作れなかった、実運用ではまず起きない
+/// 縁ケース）はスコアを計算せず、その候補の本編/CM双方の標本列が空のまま返る
+/// （[`auc_from_scores`] が空集合をNaNとして扱い、結果として採用列から自動的に
+/// 除外される）。
+///
+/// 戻り値は `(候補ごとの本編標本スコア列, 候補ごとのCM標本スコア列)`。
+fn score_candidates(
+    w: usize,
+    h: usize,
+    templates: &[Option<CandidateTemplate>],
+    stream_frames: &mut impl FnMut(&mut FrameCallback<'_>) -> anyhow::Result<u64>,
+    classify_sample: &impl Fn(u64) -> SampleLabel,
+    total: u64,
+) -> anyhow::Result<(PerCandidateScores, PerCandidateScores)> {
+    let mut program_scores: Vec<Vec<f32>> = vec![Vec::new(); templates.len()];
+    let mut cm_scores: Vec<Vec<f32>> = vec![Vec::new(); templates.len()];
+    let mut serial: u64 = 0;
+
+    let actual = stream_frames(&mut |frame: &[u8]| {
+        let label = classify_sample(serial);
+        for (idx, template_opt) in templates.iter().enumerate() {
+            if let Some(template) = template_opt {
+                let score = compute_score(w, h, template, frame);
+                match label {
+                    SampleLabel::Program => program_scores[idx].push(score),
+                    SampleLabel::Cm => cm_scores[idx].push(score),
+                }
+            }
+        }
+        serial += 1;
+        Ok(())
+    })?;
+    anyhow::ensure!(
+        actual == total,
+        "フレーム供給関数がAUC採点用の3回目の呼び出しで{actual}枚を返しましたが、\
+         1・2回目は{total}枚でした。ブロック割当てと同じ理由で、3回とも同じ枚数が\
+         流れることを前提にしています。"
+    );
+
+    Ok((program_scores, cm_scores))
+}
+
+/// Mann–Whitney U から AUC（本編群からランダムに選んだ標本のスコアがCM群から
+/// ランダムに選んだ標本のスコアより大きい確率、同値は0.5として数える）を計算する。
+/// 同値タイは平均順位で処理する（`program_scores`/`cm_scores`のいずれかが空の場合は
+/// 定義できないため `f64::NAN` を返す。呼び出し側は `NAN >= 閾値` が常に `false`に
+/// なることを利用して自動的に除外する）。
+fn auc_from_scores(program_scores: &[f32], cm_scores: &[f32]) -> f64 {
+    let n1 = program_scores.len();
+    let n2 = cm_scores.len();
+    if n1 == 0 || n2 == 0 {
+        return f64::NAN;
+    }
+
+    // group=0: 本編, group=1: CM。
+    let mut combined: Vec<(f32, u8)> = Vec::with_capacity(n1 + n2);
+    combined.extend(program_scores.iter().map(|&s| (s, 0u8)));
+    combined.extend(cm_scores.iter().map(|&s| (s, 1u8)));
+    combined.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    let n = combined.len();
+    let mut ranks = vec![0.0f64; n];
+    let mut i = 0;
+    while i < n {
+        let mut j = i;
+        while j + 1 < n && combined[j + 1].0 == combined[i].0 {
+            j += 1;
+        }
+        // 0始まりの範囲 i..=j に、1始まりの平均順位を割る(タイの標準的な処理)。
+        let avg_rank = ((i + 1) + (j + 1)) as f64 / 2.0;
+        for r in ranks.iter_mut().take(j + 1).skip(i) {
+            *r = avg_rank;
+        }
+        i = j + 1;
+    }
+
+    let r1: f64 = combined
+        .iter()
+        .zip(ranks.iter())
+        .filter(|((_, group), _)| *group == 0)
+        .map(|(_, &rank)| rank)
+        .sum();
+    let u1 = r1 - (n1 as f64) * ((n1 as f64) + 1.0) / 2.0;
+    u1 / (n1 as f64 * n2 as f64)
 }
 
 /// フレーム番号 `i`（0始まり、`i < total`）が属するブロック番号
@@ -956,6 +1480,50 @@ fn build_candidates(
 mod tests {
     use super::*;
 
+    /// [`estimate_raw`] の結果から候補列だけを取り出す、テスト専用の薄いラッパー。
+    /// AUC採点（E18-3、[`select_by_auc`]）を経由せず、#132 の構造的な候補生成
+    /// （手順1〜7）だけを検証するために使う（構造的な候補生成とAUC採点は独立に
+    /// テストする。モジュール doc comment「候補の採点」参照）。
+    fn estimate_raw_candidates(
+        video_size: VideoSize,
+        mut stream_frames: impl FnMut(&mut FrameCallback<'_>) -> anyhow::Result<u64>,
+    ) -> anyhow::Result<Vec<Candidate>> {
+        Ok(estimate_raw(video_size, &mut stream_frames)?
+            .map(|raw| raw.candidates)
+            .unwrap_or_default())
+    }
+
+    /// 常に [`SampleLabel::Program`] を返す分類器。CM標本0枚になるため、
+    /// [`select_by_auc`] の「CM標本が[`MIN_CM_SAMPLES_FOR_AUC`]枚未満」の分岐
+    /// （候補列の先頭のみ採用）を確認するテストで使う。
+    fn all_program(_serial: u64) -> SampleLabel {
+        SampleLabel::Program
+    }
+
+    /// 標本の通し番号が5の倍数+4（0始まりで5,10,15...番目）ならCM、それ以外は本編と
+    /// する分類器。AUCの完了条件テストで使う（`TOTAL`=160なら本編128枚・CM32枚に
+    /// 分かれ、[`MIN_CM_SAMPLES_FOR_AUC`]=20を安全に上回る）。
+    fn every_fifth_is_cm(i: u64) -> SampleLabel {
+        if i % 5 == 4 {
+            SampleLabel::Cm
+        } else {
+            SampleLabel::Program
+        }
+    }
+
+    /// `x`・`y`・フレーム番号 `i` から決定的な擬似乱数を作る（-20.0〜20.0）。
+    /// テレビ朝日の時計のような「常時表示だがCM側で検出が乱れる」を模すのに使う
+    /// （テストのみ。乱数生成crateへの依存を避けるためビット混合で実装する）。
+    fn pixel_noise(x: usize, y: usize, i: usize) -> f64 {
+        let mut h = (x as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        h ^= (y as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        h ^= (i as u64).wrapping_mul(0x94D0_49BB_1331_11EB);
+        h ^= h >> 33;
+        h = h.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
+        h ^= h >> 33;
+        ((h % 41) as i64 - 20) as f64
+    }
+
     /// 8bit にクランプして丸める。
     fn clamp_u8(v: f64) -> u8 {
         v.round().clamp(0.0, 255.0) as u8
@@ -1062,7 +1630,7 @@ mod tests {
             &[(x, y, w, h, &offset)],
         );
 
-        let candidates = estimate_candidates(video_size(), frames_source(&frames))
+        let candidates = estimate_raw_candidates(video_size(), frames_source(&frames))
             .expect("supply関数はエラーを返さない");
 
         assert!(!candidates.is_empty(), "矩形が復元されるはず");
@@ -1112,8 +1680,8 @@ mod tests {
         let frames: Vec<Vec<u8>> = (0..TOTAL)
             .map(|i| moving_stripe_frame(VIDEO_W, VIDEO_H, i))
             .collect();
-        let candidates =
-            estimate_candidates(video_size(), frames_source(&frames)).expect("エラーにならない");
+        let candidates = estimate_raw_candidates(video_size(), frames_source(&frames))
+            .expect("エラーにならない");
         assert!(candidates.is_empty(), "candidates={candidates:?}");
     }
 
@@ -1134,8 +1702,8 @@ mod tests {
             &[(x, y, w, h, &offset)],
         );
 
-        let candidates =
-            estimate_candidates(video_size(), frames_source(&frames)).expect("エラーにならない");
+        let candidates = estimate_raw_candidates(video_size(), frames_source(&frames))
+            .expect("エラーにならない");
         assert!(candidates.is_empty(), "candidates={candidates:?}");
     }
 
@@ -1167,8 +1735,8 @@ mod tests {
             .collect();
         let frames = make_frames(VIDEO_W, VIDEO_H, TOTAL, varying_bg, &regions);
 
-        let candidates =
-            estimate_candidates(video_size(), frames_source(&frames)).expect("エラーにならない");
+        let candidates = estimate_raw_candidates(video_size(), frames_source(&frames))
+            .expect("エラーにならない");
         assert!(
             candidates.is_empty(),
             "有意画素数が下限未満の点状成分が候補に出ている: {candidates:?}"
@@ -1193,8 +1761,8 @@ mod tests {
             &[(x1, y1, w1, h1, &offset), (x2, y2, w2, h2, &offset)],
         );
 
-        let candidates =
-            estimate_candidates(video_size(), frames_source(&frames)).expect("エラーにならない");
+        let candidates = estimate_raw_candidates(video_size(), frames_source(&frames))
+            .expect("エラーにならない");
 
         assert_eq!(
             candidates.len(),
@@ -1260,8 +1828,8 @@ mod tests {
              upper_bound_width={upper_bound_width}"
         );
 
-        let candidates =
-            estimate_candidates(video_size(), frames_source(&frames)).expect("エラーにならない");
+        let candidates = estimate_raw_candidates(video_size(), frames_source(&frames))
+            .expect("エラーにならない");
 
         assert_eq!(candidates.len(), 2, "併合されず2つ残るはず: {candidates:?}");
         let bboxes: Vec<LogoRect> = candidates.iter().map(|c| c.raw_bbox).collect();
@@ -1294,8 +1862,8 @@ mod tests {
             ],
         );
 
-        let candidates =
-            estimate_candidates(video_size(), frames_source(&frames)).expect("エラーにならない");
+        let candidates = estimate_raw_candidates(video_size(), frames_source(&frames))
+            .expect("エラーにならない");
 
         // 強い小矩形だけが候補として残るはず(弱い大帯は単独でもどの段でも
         // 上限超え、かつ低い段では強い矩形と繋がって一緒に落ちる)。
@@ -1344,8 +1912,8 @@ mod tests {
             &[(x, y, w, h, &offset)],
         );
 
-        let candidates =
-            estimate_candidates(video_size(), frames_source(&frames)).expect("エラーにならない");
+        let candidates = estimate_raw_candidates(video_size(), frames_source(&frames))
+            .expect("エラーにならない");
         assert!(
             candidates.is_empty(),
             "符号一致率不足で落ちるはず: {candidates:?}"
@@ -1364,9 +1932,9 @@ mod tests {
         let frames_200 = make_frames(VIDEO_W, VIDEO_H, 200, varying_bg, &[(x, y, w, h, &offset)]);
         let frames_2000 = make_frames(VIDEO_W, VIDEO_H, 2000, varying_bg, &[(x, y, w, h, &offset)]);
 
-        let candidates_200 = estimate_candidates(video_size(), frames_source(&frames_200))
+        let candidates_200 = estimate_raw_candidates(video_size(), frames_source(&frames_200))
             .expect("エラーにならない");
-        let candidates_2000 = estimate_candidates(video_size(), frames_source(&frames_2000))
+        let candidates_2000 = estimate_raw_candidates(video_size(), frames_source(&frames_2000))
             .expect("エラーにならない");
 
         assert!(!candidates_200.is_empty());
@@ -1431,7 +1999,7 @@ mod tests {
     #[test]
     fn zero_width_returns_empty_without_calling_stream_frames() {
         let mut called = false;
-        let candidates = estimate_candidates(
+        let candidates = estimate_raw_candidates(
             VideoSize {
                 width: 0,
                 height: 200,
@@ -1449,7 +2017,7 @@ mod tests {
     #[test]
     fn zero_height_returns_empty_without_calling_stream_frames() {
         let mut called = false;
-        let candidates = estimate_candidates(
+        let candidates = estimate_raw_candidates(
             VideoSize {
                 width: 300,
                 height: 0,
@@ -1467,8 +2035,8 @@ mod tests {
     #[test]
     fn zero_total_frames_returns_empty() {
         let frames: Vec<Vec<u8>> = Vec::new();
-        let candidates =
-            estimate_candidates(video_size(), frames_source(&frames)).expect("エラーにならない");
+        let candidates = estimate_raw_candidates(video_size(), frames_source(&frames))
+            .expect("エラーにならない");
         assert!(candidates.is_empty(), "candidates={candidates:?}");
     }
 
@@ -1478,8 +2046,8 @@ mod tests {
         let (x, y, w, h) = (40usize, 40usize, 20usize, 16usize);
         let offset = |_i: usize| 20.0;
         let frames = make_frames(VIDEO_W, VIDEO_H, 10, varying_bg, &[(x, y, w, h, &offset)]);
-        let candidates =
-            estimate_candidates(video_size(), frames_source(&frames)).expect("エラーにならない");
+        let candidates = estimate_raw_candidates(video_size(), frames_source(&frames))
+            .expect("エラーにならない");
         assert!(
             candidates.is_empty(),
             "有効ブロックが不足するので空のはず: {candidates:?}"
@@ -1490,7 +2058,7 @@ mod tests {
     fn inconsistent_frame_count_between_two_calls_is_an_error() {
         // 1回目と2回目で異なる枚数を返す供給関数(実装ミスや実行環境の変化を想定)。
         let mut call_count = 0;
-        let err = estimate_candidates(video_size(), |on_frame| {
+        let err = estimate_raw_candidates(video_size(), |on_frame| {
             call_count += 1;
             let n = if call_count == 1 { 160 } else { 100 };
             for i in 0..n {
@@ -1502,5 +2070,310 @@ mod tests {
         .expect_err("1回目と2回目の枚数が食い違うのでエラーになるはず");
         assert!(err.to_string().contains("160"), "err={err}");
         assert!(err.to_string().contains("100"), "err={err}");
+    }
+
+    #[test]
+    fn inconsistent_frame_count_on_third_auc_scoring_pass_is_an_error() {
+        // 1・2回目は`frames.len()`枚を正しく返すが、AUC採点用の3回目だけ1枚少なく
+        // 返す供給関数。候補が非空かつCM標本20枚以上・本編標本0枚超になるよう、
+        // 「本編/CMどちらでも同じ強さで出る」オーバーレイ(AUC完了条件2と同じ配置)
+        // を使う(3回目に到達することが目的で、AUCの値自体は問わない)。
+        let (x, y, w, h) = (40usize, 40usize, 20usize, 16usize);
+        let offset = |_i: usize| 20.0;
+        let frames = make_frames(
+            VIDEO_W,
+            VIDEO_H,
+            TOTAL,
+            varying_bg,
+            &[(x, y, w, h, &offset)],
+        );
+
+        let mut call_count = 0;
+        let err = estimate_candidates(
+            video_size(),
+            |on_frame| {
+                call_count += 1;
+                let n = if call_count == 3 {
+                    frames.len() - 1
+                } else {
+                    frames.len()
+                };
+                for f in frames.iter().take(n) {
+                    on_frame(f)?;
+                }
+                Ok(n as u64)
+            },
+            every_fifth_is_cm,
+        )
+        .expect_err("3回目の枚数が1・2回目と食い違うのでエラーになるはず");
+
+        assert!(err.to_string().contains("AUC採点用の3回目"), "err={err}");
+        assert!(
+            err.to_string().contains(&(frames.len() - 1).to_string()),
+            "err={err}"
+        );
+        assert!(
+            err.to_string().contains(&frames.len().to_string()),
+            "err={err}"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // AUC完了条件4の性能契約: CM標本が下限未満のときはAUC採点用の3回目の
+    // ストリーミングを呼ばない。
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn few_cm_samples_does_not_trigger_third_streaming_pass() {
+        let (x, y, w, h) = (40usize, 40usize, 20usize, 16usize);
+        let offset = |_i: usize| 20.0;
+        let frames = make_frames(
+            VIDEO_W,
+            VIDEO_H,
+            TOTAL,
+            varying_bg,
+            &[(x, y, w, h, &offset)],
+        );
+
+        let mut calls = 0;
+        let candidates = estimate_candidates(
+            video_size(),
+            |on_frame| {
+                calls += 1;
+                for f in &frames {
+                    on_frame(f)?;
+                }
+                Ok(frames.len() as u64)
+            },
+            all_program,
+        )
+        .expect("エラーにならない");
+
+        assert_eq!(candidates.len(), 1, "candidates={candidates:?}");
+        assert_eq!(
+            calls, 2,
+            "CM標本が下限未満のときはAUC採点用の3回目のストリーミングを呼ばないはず\
+             (性能上の前提。モジュール doc comment「候補の採点」参照)"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // AUC完了条件1: 本編群にだけ段差がある候補は、AUCが高く採用列に入る。
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn step_present_only_in_program_group_has_high_auc_and_is_adopted() {
+        let (x, y, w, h) = (40usize, 40usize, 20usize, 16usize);
+        let frames: Vec<Vec<u8>> = (0..TOTAL)
+            .map(|i| {
+                let bg = varying_bg(i);
+                let mut frame = vec![clamp_u8(bg); VIDEO_W * VIDEO_H];
+                if every_fifth_is_cm(i as u64) != SampleLabel::Cm {
+                    for yy in y..y + h {
+                        for xx in x..x + w {
+                            frame[yy * VIDEO_W + xx] = clamp_u8(bg + 20.0);
+                        }
+                    }
+                }
+                frame
+            })
+            .collect();
+
+        let candidates =
+            estimate_candidates(video_size(), frames_source(&frames), every_fifth_is_cm)
+                .expect("エラーにならない");
+
+        let expected = expected_raw_bbox_for_inside_rect(x as u32, y as u32, w as u32, h as u32);
+        assert_eq!(candidates.len(), 1, "candidates={candidates:?}");
+        assert_eq!(candidates[0].raw_bbox, expected);
+    }
+
+    // ---------------------------------------------------------------
+    // AUC完了条件2: 本編/CMと無相関な常時オーバーレイは、AUCが0.5付近になり
+    // 採用列に入らない。
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn step_present_in_both_groups_has_auc_near_half_and_is_not_adopted() {
+        let (x, y, w, h) = (40usize, 40usize, 20usize, 16usize);
+        let offset = |_i: usize| 20.0;
+        let frames = make_frames(
+            VIDEO_W,
+            VIDEO_H,
+            TOTAL,
+            varying_bg,
+            &[(x, y, w, h, &offset)],
+        );
+
+        let candidates =
+            estimate_candidates(video_size(), frames_source(&frames), every_fifth_is_cm)
+                .expect("エラーにならない");
+
+        assert!(
+            candidates.is_empty(),
+            "本編/CMのどちらでも同じ強さで出るオーバーレイはAUC~0.5になり\
+             採用されないはず: {candidates:?}"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // AUC完了条件3: 常時表示だがCM側でだけスコアが下がる候補
+    // （テレビ朝日の時計を模したもの）は採用列に入る。
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn always_present_overlay_weaker_in_cm_is_adopted() {
+        let (x, y, w, h) = (40usize, 40usize, 20usize, 16usize);
+        let frames: Vec<Vec<u8>> = (0..TOTAL)
+            .map(|i| {
+                let bg = varying_bg(i);
+                let mut frame = vec![clamp_u8(bg); VIDEO_W * VIDEO_H];
+                let is_cm = every_fifth_is_cm(i as u64) == SampleLabel::Cm;
+                for yy in y..y + h {
+                    for xx in x..x + w {
+                        let off = if is_cm { pixel_noise(xx, yy, i) } else { 20.0 };
+                        frame[yy * VIDEO_W + xx] = clamp_u8(bg + off);
+                    }
+                }
+                frame
+            })
+            .collect();
+
+        let candidates =
+            estimate_candidates(video_size(), frames_source(&frames), every_fifth_is_cm)
+                .expect("エラーにならない");
+
+        let expected = expected_raw_bbox_for_inside_rect(x as u32, y as u32, w as u32, h as u32);
+        assert!(
+            candidates.iter().any(|c| c.raw_bbox == expected),
+            "candidates={candidates:?}"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // AUC完了条件4: CM標本が0枚・下限未満のときはAUCを計算せず、
+    // 候補列の先頭1つだけを返す。
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn zero_cm_samples_skips_auc_and_returns_top_candidate() {
+        let (x, y, w, h) = (40usize, 40usize, 20usize, 16usize);
+        let offset = |_i: usize| 20.0;
+        let frames = make_frames(
+            VIDEO_W,
+            VIDEO_H,
+            TOTAL,
+            varying_bg,
+            &[(x, y, w, h, &offset)],
+        );
+
+        let candidates = estimate_candidates(video_size(), frames_source(&frames), all_program)
+            .expect("エラーにならない");
+
+        let expected = expected_raw_bbox_for_inside_rect(x as u32, y as u32, w as u32, h as u32);
+        assert_eq!(candidates.len(), 1, "candidates={candidates:?}");
+        assert_eq!(candidates[0].raw_bbox, expected);
+    }
+
+    #[test]
+    fn few_cm_samples_below_minimum_skips_auc_and_returns_top_candidate() {
+        let (x, y, w, h) = (40usize, 40usize, 20usize, 16usize);
+        let offset = |_i: usize| 20.0;
+        let frames = make_frames(
+            VIDEO_W,
+            VIDEO_H,
+            TOTAL,
+            varying_bg,
+            &[(x, y, w, h, &offset)],
+        );
+
+        // CM標本を10枚(下限20枚未満)だけ混ぜる。AUCは計算されず先頭候補が返るはず。
+        let classify = |i: u64| {
+            if i < 10 {
+                SampleLabel::Cm
+            } else {
+                SampleLabel::Program
+            }
+        };
+        let candidates = estimate_candidates(video_size(), frames_source(&frames), classify)
+            .expect("エラーにならない");
+
+        let expected = expected_raw_bbox_for_inside_rect(x as u32, y as u32, w as u32, h as u32);
+        assert_eq!(candidates.len(), 1, "candidates={candidates:?}");
+        assert_eq!(candidates[0].raw_bbox, expected);
+    }
+
+    // ---------------------------------------------------------------
+    // AUC完了条件5: CM標本20枚以上で全候補のAUCが閾値未満のとき、空の採用列が
+    // 返る（「せっかく推定したから」と無条件採用へフォールバックしない）。
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn no_candidate_clears_auc_threshold_yields_empty_not_unconditional_adoption() {
+        // `far_apart_blocks_are_not_merged`(#132)と同じ配置で、併合されない
+        // 2つの候補を作る。両方とも本編/CMどちらでも同じ強さで出る(AUC~0.5)ため、
+        // 「全候補」が閾値未満になる状況を作れる。
+        let (x1, y1, w1, h1) = (40usize, 40usize, 10usize, 10usize);
+        let gap = 40usize;
+        let (x2, y2, w2, h2) = (x1 + w1 + gap, 40usize, 10usize, 10usize);
+        let offset = |_i: usize| 20.0;
+        let frames = make_frames(
+            VIDEO_W,
+            VIDEO_H,
+            TOTAL,
+            varying_bg,
+            &[(x1, y1, w1, h1, &offset), (x2, y2, w2, h2, &offset)],
+        );
+
+        let candidates =
+            estimate_candidates(video_size(), frames_source(&frames), every_fifth_is_cm)
+                .expect("エラーにならない");
+
+        assert!(
+            candidates.is_empty(),
+            "AUCで全滅した場合は無条件採用へ落ちず空になるはず: {candidates:?}"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // auc_from_scores の単体テスト（cos類似度の合成を経由しない、Mann-Whitney U
+    // の計算そのものの検証）。
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn auc_from_scores_is_one_for_perfect_separation() {
+        let program = vec![1.0, 0.9, 0.8];
+        let cm = vec![0.1, 0.2, 0.3];
+        assert_eq!(auc_from_scores(&program, &cm), 1.0);
+    }
+
+    #[test]
+    fn auc_from_scores_is_zero_for_perfect_reversal() {
+        let program = vec![0.1, 0.2, 0.3];
+        let cm = vec![1.0, 0.9, 0.8];
+        assert_eq!(auc_from_scores(&program, &cm), 0.0);
+    }
+
+    #[test]
+    fn auc_from_scores_is_half_for_identical_tied_scores() {
+        let program = vec![0.5; 4];
+        let cm = vec![0.5; 6];
+        assert_eq!(auc_from_scores(&program, &cm), 0.5);
+    }
+
+    #[test]
+    fn auc_from_scores_handles_partial_tie_at_rank_boundary() {
+        // combined昇順: 1.0(P), 2.0(P)=2.0(C)(タイ), 3.0(C)。
+        // タイ2件の平均順位=(2+3)/2=2.5。R1=1(1.0のP順位)+2.5=3.5。
+        // U1=3.5-2*3/2=0.5。AUC=0.5/(2*2)=0.125。
+        let program = vec![1.0, 2.0];
+        let cm = vec![2.0, 3.0];
+        assert_eq!(auc_from_scores(&program, &cm), 0.125);
+    }
+
+    #[test]
+    fn auc_from_scores_is_nan_when_a_group_is_empty() {
+        assert!(auc_from_scores(&[], &[1.0]).is_nan());
+        assert!(auc_from_scores(&[1.0], &[]).is_nan());
     }
 }
