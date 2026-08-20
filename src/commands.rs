@@ -402,6 +402,10 @@ fn run_analyze(cache_dir: Option<PathBuf>, args: AnalyzeArgs) -> anyhow::Result<
         logo,
         no_logo,
         logo_dir,
+        // `analyze` を直接叩く経路では `input` が既にユーザー入力そのものなので
+        // 上書きは不要（`AnalyzeConfig::source_name_hint` の doc comment参照。
+        // `auto` 経由のときだけ `auto::build_analyze_config` が設定する）。
+        source_name_hint: None,
     };
 
     let result = analyze::run(&config)?;

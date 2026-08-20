@@ -63,12 +63,13 @@ const LOGO_DETECTION_THRESHOLD_SHORT: f64 = 0.03;
 const LOGO_DETECTION_SHORT_VIDEO_SECONDS: f64 = 7.0 * 60.0;
 
 /// 自動推定（`--logo`/`--no-logo` 省略時）で、採用列（AUC 順、
-/// `estimate::estimate_candidates` の戻り値）の先頭から実際に学習を試す候補数の
-/// 上限（issue #135「やること 2-6」）。学習（[`scan::run`]）は実測30分1080pで
-/// 21.5秒かかるフルデコードのため、候補を無制限に試すと入力1本の処理時間が
-/// 大きく伸びる。4局の実測では2番目までの候補で成功しているため、余裕を見て
-/// 5件に切る（1件目で失敗する入力（テレビ朝日の4:3再放送、issue #135「罠」）が
-/// あるため1件では足りない）。
+/// `estimate::estimate_candidates` の戻り値）の先頭から実際に学習・検出を試す
+/// 候補数の上限（issue #135「やること 2-6」）。候補1件あたり [`scan::run`]
+/// （実測30分1080pで21.5秒かかるフルデコード）と [`detect_logo`] の2パスが
+/// かかるため、候補を無制限に試すと入力1本の処理時間が大きく伸びる。4局の
+/// 実測では2番目までの候補で成功しているため、余裕を見て5件に切る（1件目で
+/// 失敗する入力（テレビ朝日の4:3再放送、issue #135「罠」）があるため1件では
+/// 足りない）。
 const MAX_AUTO_TRAINING_CANDIDATES: usize = 5;
 
 /// analyze コマンドの実行に必要な設定。
@@ -102,6 +103,28 @@ pub struct AnalyzeConfig {
     /// `dict::resolve_dict_dir` の既定に従う。`logo`/`no_logo` 経路では
     /// 使わない（自動推定のときだけ参照する）。
     pub logo_dir: Option<PathBuf>,
+    /// 自動推定で学習した `.lgd` の辞書ファイル名・`LogoData.name` を作るときに
+    /// `input` の代わりに使う元入力の表示名（レビュー指摘、issue #135）。
+    ///
+    /// `auto` は `prepare` 後のパス（`<cache>/<hash>-<stem>/input_prepared.mp4`）
+    /// を `input` としてここへ渡すため、`input` の stem は常に
+    /// `"input_prepared"` になる。`dict::save`/`auto_logo_name` がそのまま
+    /// `input` を使うと、辞書のファイル名・`LogoData.name` が局に関わらず
+    /// 常に `input_prepared`（`-2`、`-3` ...）になり、辞書を見てもどの局の
+    /// ロゴか分からず調査ができなくなる（親issue #130「局ごとのロゴ辞書」の
+    /// ゴールに反する）。`auto` はユーザーが実際に指定した元の入力パスを
+    /// 知っている（`auto::process_one` の引数）ため、それをここに渡す。
+    /// `analyze` を直接叩いた場合は `input` が既にユーザー入力そのものなので
+    /// `None` のままでよい（[`dict_naming_source`] が `input` にフォールバック
+    /// する）。
+    pub source_name_hint: Option<PathBuf>,
+}
+
+/// ロゴ辞書のファイル名・`LogoData.name` を作るときに使う「元入力」のパスを
+/// 返す（[`AnalyzeConfig::source_name_hint`] の doc comment参照）。
+/// `source_name_hint` があればそれを、無ければ `input` をそのまま使う。
+fn dict_naming_source(config: &AnalyzeConfig) -> &Path {
+    config.source_name_hint.as_deref().unwrap_or(&config.input)
 }
 
 /// [`AnalyzeConfig::logo`] と [`AnalyzeConfig::no_logo`] が両立しないことを
@@ -325,7 +348,7 @@ fn run_pipeline(
             &work.logoframe_path(),
             dict_dir,
             &no_logo_trim,
-            &config.input,
+            dict_naming_source(config),
         )?
     } else {
         // `--logo` があるときだけ動く経路（E14-8、issue #97）。フレーム数の不一致
@@ -483,6 +506,12 @@ fn run_join_logo_scp(
 /// 成功した候補の `.lgd` だけを [`dict::save`] で辞書へ保存する。全候補が
 /// 尽きた場合は `Ok(None)`（ロゴ無し。呼び出し側は1回目の結果をそのまま使い、
 /// 2回目の join_logo_scp を実行しない）。
+///
+/// `naming_source` は保存する `.lgd` のファイル名・`LogoData.name` の元にする
+/// パス（[`dict_naming_source`] の戻り値）。`work_mp4`（実処理に使う入力、
+/// `auto` 経由では `prepare` 後の一時パス）とは別に受け取る理由はレビュー
+/// 指摘（issue #135）参照: `work_mp4` をそのまま使うと、`auto` 経由では
+/// stem が常に `input_prepared` になり、辞書を見ても局が分からなくなる。
 #[allow(clippy::too_many_arguments)]
 fn run_auto_logo_detection(
     ffmpeg_path: &Path,
@@ -492,10 +521,18 @@ fn run_auto_logo_detection(
     logoframe_path: &Path,
     dict_dir: &Path,
     no_logo_trim: &TrimList,
-    original_input: &Path,
+    naming_source: &Path,
 ) -> Result<Option<PathBuf>> {
     let video_size = dtvi_video_size(dtvi)?;
-    let total_frames = dtvi.frames.len() as u32;
+    // `.dtvi` ヘッダの `frame_count` を使う（`dtvi.frames.len()` ではない）。
+    // `detect_logo`（`frames::stream_luma_frames` 経由）と `scan::run`
+    // （`MakeLogoConfig::frame_count`）はどちらもこのヘッダ値を
+    // `expected_frame_count` として使うため、規則を揃える（レビュー指摘）。
+    // `dtvi.frames` はテスト用に意図的に切り詰められることがあり
+    // （`tests/data/sample.dtvi` 等）、`dtvi.frames.len()` を使うとその場合
+    // だけ値が食い違う。
+    let total_frames = u32::try_from(dtvi_frame_count(dtvi)?)
+        .map_err(|_| anyhow!(".dtvi の frame_count が u32 の範囲を超えています"))?;
     let duration_seconds = total_duration_seconds(dtvi);
 
     // 1. ロゴ辞書に解像度一致の候補があるか。
@@ -546,19 +583,31 @@ fn run_auto_logo_detection(
     );
 
     // `estimate_candidates` に渡す `classify_sample` は「ffmpeg がキーフレームを
-    // 流す順の通し番号」しか受け取らない。`.dtvi` 由来の `keyframe_frame_numbers`
-    // と対応がずれると、静かに間違った候補が選ばれる（例外は飛ばない、issue
-    // #135「罠」）。範囲外アクセスがあれば `mismatch` を立て、
-    // `estimate_candidates` から戻った直後にハードエラーにする（`Fn` の中で
-    // 決着をつけず、呼び出し後に確実に検出する）。
-    let mismatch = std::cell::Cell::new(false);
+    // 流す順の通し番号」しか受け取らない。`.dtvi` のキーパケット（mp4 の同期
+    // サンプル由来）と ffmpeg の `-skip_frame nokey`（デコーダの IDR 判定由来）は
+    // 別経路のため、**枚数が一致する保証は無い**（レビュー指摘: フィクスチャや
+    // 手元の実測クリップで偶然一致していただけ）。対応がずれると静かに間違った
+    // 候補が選ばれる（例外は飛ばない、issue #135「罠」・CLAUDE.md 罠3）ため、
+    // 「ffmpeg が実際に流したキーフレーム数」と「.dtvi のキーフレーム数」の
+    // **両方向**の食い違いを検査する必要がある。
+    //
+    // `classify_sample` が呼ばれるたびに観測した `serial` の最大値を記録し
+    // （`estimate_candidates` は本編/CM の標本数を数える1回目の走査でも
+    // `classify_sample` を呼ぶため、そのタイミングで拾える）、呼び出し後に
+    // 「観測した最大 serial + 1」を ffmpeg が実際に流したキーフレーム数として
+    // `keyframe_frame_numbers.len()` と突き合わせる。範囲外アクセス（ffmpeg 側が
+    // 多い場合）は `keyframe_frame_numbers.get` が `None` を返す（ダミー値を返して
+    // 続行するが、最大 serial は正しく記録されるため下記の一致検査で必ず捕まる）。
+    // ffmpeg 側が少ない場合は `serial` が常に範囲内に収まるため、
+    // `estimate_raw` の1回目/2回目の一致検査（`actual == total` の `ensure!`）と
+    // 同じ水準の検査がここでも要る。
+    let max_serial_seen: std::cell::Cell<Option<u64>> = std::cell::Cell::new(None);
     let classify_sample = |serial: u64| -> SampleLabel {
+        let updated = max_serial_seen.get().map_or(serial, |m| m.max(serial));
+        max_serial_seen.set(Some(updated));
         match keyframe_frame_numbers.get(serial as usize) {
             Some(&frame_number) => classify_frame_number(frame_number, &cm_ranges),
-            None => {
-                mismatch.set(true);
-                SampleLabel::Program
-            }
+            None => SampleLabel::Program,
         }
     };
 
@@ -569,13 +618,7 @@ fn run_auto_logo_detection(
         },
         classify_sample,
     )?;
-    anyhow::ensure!(
-        !mismatch.get(),
-        "標本の通し番号(ffmpeg がキーフレームを流す順)が .dtvi 由来のキーフレーム\
-         フレーム番号一覧({}枚)の範囲を超えました。標本数の対応がずれているため\
-         中断します（issue #135「罠」、CLAUDE.md 罠3の一般形）。",
-        keyframe_frame_numbers.len()
-    );
+    verify_keyframe_count_matches_dtvi(max_serial_seen.get(), keyframe_frame_numbers.len())?;
 
     if candidates.is_empty() {
         eprintln!("[analyze] 推定候補がありませんでした。ロゴ無しとして扱います。");
@@ -586,7 +629,8 @@ fn run_auto_logo_detection(
     let tried = total_candidates.min(MAX_AUTO_TRAINING_CANDIDATES);
     eprintln!(
         "[analyze] 推定候補{total_candidates}件のうち先頭{tried}件を順に学習します\
-         （上限 {MAX_AUTO_TRAINING_CANDIDATES} 件、学習1回21.5秒相当のため）。"
+         （上限 {MAX_AUTO_TRAINING_CANDIDATES} 件、候補1件あたり学習+検出で\
+         実測30分1080p相当21.5秒超かかるため）。"
     );
 
     for (index, candidate) in candidates
@@ -613,7 +657,7 @@ fn run_auto_logo_detection(
             video_size,
             frame_count: u64::from(total_frames),
             threshold: scan::DEFAULT_THRESHOLD,
-            name: auto_logo_name(original_input),
+            name: auto_logo_name(naming_source),
             service_id: scan::UNSPECIFIED_SERVICE_ID,
         };
 
@@ -632,17 +676,23 @@ fn run_auto_logo_detection(
         let candidate_lgd_path = cwd.join(format!("logo-candidate-{attempt}.lgd"));
         scan::write_lgd(&scan_output.logo, &candidate_lgd_path)?;
 
-        match detect_logo(
+        let detect_result = detect_logo(
             ffmpeg_path,
             &candidate_lgd_path,
             work_mp4,
             cwd,
             dtvi,
             logoframe_path,
-        )? {
+        )?;
+        // 作業ディレクトリに書いた候補の `.lgd` は使い終わったら消す
+        // （レビュー指摘: 失敗した候補ぶんが残ると紛らわしい。成功した場合も
+        // `dict::save` が辞書側に別途保存するため、この一時ファイルは不要）。
+        remove_scratch_candidate_lgd(&candidate_lgd_path);
+
+        match detect_result {
             Some(inlogo) => {
                 eprintln!("[analyze] 候補{attempt}: 検出に成功しました。ロゴ辞書へ保存します。");
-                match dict::save(dict_dir, &scan_output.logo, original_input) {
+                match dict::save(dict_dir, &scan_output.logo, naming_source) {
                     Ok(saved_path) => {
                         eprintln!("[analyze] ロゴ辞書へ保存しました: {}", saved_path.display());
                     }
@@ -665,6 +715,78 @@ fn run_auto_logo_detection(
          （1回目の join_logo_scp の結果をそのまま使います）。"
     );
     Ok(None)
+}
+
+/// ffmpeg が実際に流したキーフレーム数と `.dtvi` 由来のキーフレーム数が一致する
+/// ことを検査する（レビュー指摘、issue #135「罠」・CLAUDE.md 罠3の一般形）。
+///
+/// `.dtvi` のキーパケット（mp4 の同期サンプル由来）と ffmpeg の
+/// `-skip_frame nokey`（デコーダの IDR 判定由来）は別経路のため、**枚数が
+/// 一致する保証は無い**（手元のフィクスチャや実測クリップで偶然一致していた
+/// だけ）。対応がずれると `classify_sample`（標本の通し番号→フレーム番号→
+/// 本編/CM）が静かに間違ったラベルを返し、静かに間違った候補が選ばれる
+/// （例外は飛ばない）。
+///
+/// - `max_serial_seen`: `classify_sample` が観測した `serial`（0始まり、
+///   `estimate_candidates` が渡す通し番号）の最大値。一度も呼ばれなかった
+///   場合（候補が最初から無い等）は `None` で、その場合は検査のしようが
+///   無いためスキップする。
+/// - `dtvi_keyframe_count`: `.dtvi` 由来のキーフレーム数
+///   （[`dtvi_keyframe_frame_numbers`] の要素数）。
+///
+/// `ffmpeg が流した実際のキーフレーム数 = max_serial_seen + 1`
+/// （`classify_sample` は `0..実際の枚数` の範囲で呼ばれるため）と
+/// `dtvi_keyframe_count` を比較する。
+///
+/// - **ffmpeg 側が多い場合**: `classify_sample` の中で
+///   `keyframe_frame_numbers.get(serial)` が範囲外になり `None` を返すが、
+///   `max_serial_seen` 自体はその大きい値を正しく記録するため、この関数で
+///   不一致として検出できる
+/// - **ffmpeg 側が少ない場合**: `serial` は常に `.dtvi` 側の範囲内に収まる
+///   ため、範囲外アクセスによる検出はできない。`estimate_raw` の1回目/2回目の
+///   フレーム数一致検査（`actual == total` の `ensure!`）と同じ水準の検査が
+///   必要で、この関数はその役目を兼ねる
+///
+/// プロセスを起動せずに検証できるよう、`run_auto_logo_detection` から分離した
+/// 純粋関数にしている。
+fn verify_keyframe_count_matches_dtvi(
+    max_serial_seen: Option<u64>,
+    dtvi_keyframe_count: usize,
+) -> Result<()> {
+    let Some(max_serial) = max_serial_seen else {
+        return Ok(());
+    };
+    let ffmpeg_keyframe_count = max_serial + 1;
+    anyhow::ensure!(
+        ffmpeg_keyframe_count == dtvi_keyframe_count as u64,
+        "ffmpeg が実際に流したキーフレーム数({ffmpeg_keyframe_count}枚、観測した標本の\
+         通し番号の最大値+1から算出)が、.dtvi のキーフレーム数\
+         ({dtvi_keyframe_count}枚、キーパケットの frame_number の個数)と一致しません。\
+         両者は別経路（mp4 の同期サンプル vs ffmpeg の -skip_frame nokey）のため、枚数の\
+         一致は保証されていません。対応がずれると本編のフレームが CM 群に混ざったまま\
+         採点され、静かに間違った候補が選ばれるため中断します\
+         （issue #135「罠」、CLAUDE.md 罠3の一般形）。"
+    );
+    Ok(())
+}
+
+/// 候補の学習結果を一時的に書いた `.lgd`（`logo-candidate-{n}.lgd`）を削除する
+/// （レビュー指摘: 成功・失敗どちらでも作業ディレクトリに残ると紛らわしい。
+/// 成功した候補は `dict::save` が辞書側に別途保存するため、この一時ファイルは
+/// もう要らない）。`clear_stale_logoframe` と同じ扱いで、削除に失敗しても
+/// 警告に留め `run_auto_logo_detection` 自体は失敗させない。
+fn remove_scratch_candidate_lgd(path: &Path) {
+    match fs::remove_file(path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            eprintln!(
+                "[analyze] 警告: 候補の一時 .lgd の削除に失敗しました（処理は続行します）: \
+                 {} ({err})",
+                path.display()
+            );
+        }
+    }
 }
 
 /// `.dtvi` のキーパケット（同期サンプル相当）の `frame_number`（表示順）一覧を
@@ -1505,6 +1627,63 @@ mod tests {
         assert_eq!(classify_frame_number(0, &[]), SampleLabel::Program);
     }
 
+    // --- verify_keyframe_count_matches_dtvi: レビュー指摘（最重要）。
+    // ffmpeg が実際に流したキーフレーム数と .dtvi のキーフレーム数の食い違いを
+    // 両方向とも検出できることを、プロセスを起動せずに固定する。---
+
+    #[test]
+    fn verify_keyframe_count_matches_dtvi_accepts_matching_counts() {
+        // classify_sample が 通し番号 0..=4（5枚）まで観測し、.dtvi 側も5枚。
+        verify_keyframe_count_matches_dtvi(Some(4), 5).expect("枚数が一致するので成功するはず");
+    }
+
+    #[test]
+    fn verify_keyframe_count_matches_dtvi_skips_when_never_observed() {
+        // classify_sample が一度も呼ばれなかった場合（候補が最初から無い等）は
+        // 検査のしようが無いのでスキップする。
+        verify_keyframe_count_matches_dtvi(None, 5)
+            .expect("観測が無い場合は検査をスキップして成功するはず");
+    }
+
+    #[test]
+    fn verify_keyframe_count_matches_dtvi_rejects_when_ffmpeg_reports_more_keyframes() {
+        // ffmpeg が .dtvi より多くのキーフレームを流した場合（レビュー指摘が
+        // 修正前から検出できていた方向）。観測した最大 serial=6 → ffmpeg 側7枚、
+        // .dtvi 側は5枚しか無い。
+        let err = verify_keyframe_count_matches_dtvi(Some(6), 5)
+            .expect_err("ffmpeg 側が多い食い違いはエラーになるはず");
+        let message = err.to_string();
+        assert!(
+            message.contains('7'),
+            "ffmpeg 側の枚数(7)が含まれるはず: {message}"
+        );
+        assert!(
+            message.contains('5'),
+            ".dtvi 側の枚数(5)が含まれるはず: {message}"
+        );
+    }
+
+    #[test]
+    fn verify_keyframe_count_matches_dtvi_rejects_when_ffmpeg_reports_fewer_keyframes() {
+        // 【最重要・レビュー指摘】ffmpeg が .dtvi より少ないキーフレームしか
+        // 流さなかった場合。この方向は修正前の実装では `serial` が常に
+        // `.dtvi` 側の範囲内に収まるため検出できず、素通りしていた
+        // （CLAUDE.md 罠3: 「本編のフレームを CM 群に混ぜたまま採点され、
+        // 静かに間違った候補が選ばれる」その現象そのもの）。観測した最大
+        // serial=2 → ffmpeg 側3枚しか無いのに、.dtvi 側は5枚ある。
+        let err = verify_keyframe_count_matches_dtvi(Some(2), 5)
+            .expect_err("ffmpeg 側が少ない食い違いもエラーになるはず");
+        let message = err.to_string();
+        assert!(
+            message.contains('3'),
+            "ffmpeg 側の枚数(3)が含まれるはず: {message}"
+        );
+        assert!(
+            message.contains('5'),
+            ".dtvi 側の枚数(5)が含まれるはず: {message}"
+        );
+    }
+
     #[test]
     fn total_duration_seconds_uses_frame_count_and_fps() {
         let dtvi = dtvi_with_header(&[("frame_rate_num", "30000"), ("frame_rate_den", "1001")]);
@@ -1616,6 +1795,7 @@ mod tests {
             logo: None,
             no_logo: true,
             logo_dir: None,
+            source_name_hint: None,
         };
 
         let err = run(&config).expect_err("空振りする PATH では解決に失敗するはず");
@@ -1685,6 +1865,7 @@ mod tests {
             logo: None,
             no_logo: true,
             logo_dir: None,
+            source_name_hint: None,
         };
 
         let err = run(&config).expect_err("chapter_exe の失敗で run 全体が失敗するはず");
@@ -1767,6 +1948,7 @@ mod tests {
             logo: None,
             no_logo: true,
             logo_dir: None,
+            source_name_hint: None,
         };
         let out_none = run(&config_none).expect("output なしでも成功するはず");
         assert_eq!(out_none.raw_trim, TRIM_CONTENT);
@@ -1791,6 +1973,7 @@ mod tests {
             logo: None,
             no_logo: true,
             logo_dir: None,
+            source_name_hint: None,
         };
         let out_some = run(&config_some).expect("明示パスでも成功するはず");
         assert_eq!(out_some.raw_trim, TRIM_CONTENT);
@@ -1837,6 +2020,7 @@ mod tests {
             logo: None,
             no_logo: true,
             logo_dir: None,
+            source_name_hint: None,
         };
 
         let output = run(&config).expect("analyze パイプラインが成功するはず");

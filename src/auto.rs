@@ -246,7 +246,7 @@ fn process_one(
     // `work_probe.trim_path()` を先読みするのではなく、`analyze::run` が返す
     // `AnalyzeOutput::cache_trim_path` を使う（実際に書いた場所を返り値から
     // 直接受け取ることで、パス導出が食い違う可能性を構造的に排除する）。
-    let analyze_config = build_analyze_config(config, jls_set, media_path.clone());
+    let analyze_config = build_analyze_config(config, jls_set, media_path.clone(), input);
     eprintln!("[auto] analyze: {}", media_path.display());
     let analyze_output = analyze::run(&analyze_config)
         .with_context(|| format!("analyze に失敗しました: {}", media_path.display()))?;
@@ -394,17 +394,28 @@ fn process_one(
 }
 
 /// `AutoConfig` と、その実行で使う `jls_set`（パース済み）・`media_path`
-/// （`prepare` 後の入力）から `analyze::AnalyzeConfig` を組み立てる。
+/// （`prepare` 後の入力）・`original_input`（ユーザーが実際に指定した元の
+/// 入力、`process_one` の引数）から `analyze::AnalyzeConfig` を組み立てる。
 ///
-/// `logo`/`no_logo`/`logo_dir` はそのまま転記するだけ（`analyze` へのロゴ関連
-/// 設定の結線は #135 の担当）。純粋な struct 変換だけの小さい関数に分離した
+/// `logo`/`no_logo`/`logo_dir` はそのまま転記するだけ（#135）。`analyze` 側の
+/// 解釈（`--logo` 明示・`--no-logo`・自動推定のどれになるか）は
+/// `analyze::run_auto_logo_detection`/`analyze::validate_logo_flags` が持ち、
+/// `auto` はその判断を複製しない。純粋な struct 変換だけの小さい関数に分離した
 /// のは、`process_one`（`prepare`/`analyze` を実際に起動する重い処理）を経由
 /// せずに「`AutoConfig` の値が `AnalyzeConfig` へ正しく渡るか」だけを単体テスト
 /// できるようにするため。
+///
+/// `original_input` は `AnalyzeConfig::source_name_hint` に渡す（レビュー
+/// 指摘、issue #135）。`media_path`（`input`）は `prepare` 後の一時パス
+/// （`<cache>/<hash>-<stem>/input_prepared.mp4`）で、これをそのまま自動推定の
+/// ロゴ辞書のファイル名・`LogoData.name` に使うと局に関わらず常に
+/// `input_prepared` になってしまう。ユーザーが実際に指定した元の入力を
+/// 別に渡すことで、辞書のファイル名から局・番組が分かるようにする。
 fn build_analyze_config(
     config: &AutoConfig,
     jls_set: &[(String, String)],
     media_path: PathBuf,
+    original_input: &Path,
 ) -> analyze::AnalyzeConfig {
     analyze::AnalyzeConfig {
         input: media_path,
@@ -415,6 +426,7 @@ fn build_analyze_config(
         logo: config.logo.clone(),
         no_logo: config.no_logo,
         logo_dir: config.logo_dir.clone(),
+        source_name_hint: Some(original_input.to_path_buf()),
     }
 }
 
@@ -737,13 +749,21 @@ mod tests {
             logo_dir: Some(PathBuf::from("/tmp/dict")),
         };
         let media_path = PathBuf::from("/tmp/work/input_prepared.mp4");
-        let analyze_config = build_analyze_config(&config, &[], media_path.clone());
+        let original_input = Path::new("/rec/BS日テレ.mp4");
+        let analyze_config = build_analyze_config(&config, &[], media_path.clone(), original_input);
 
         assert_eq!(analyze_config.input, media_path);
         assert_eq!(analyze_config.cache_dir, Some(PathBuf::from("/tmp/cache")));
         assert!(analyze_config.no_logo);
         assert_eq!(analyze_config.logo_dir, Some(PathBuf::from("/tmp/dict")));
         assert_eq!(analyze_config.logo, None);
+        // レビュー指摘（issue #135）: `input`（prepare 後の一時パス）ではなく、
+        // ユーザーが実際に指定した元の入力がロゴ辞書の命名用に渡ること。
+        assert_eq!(
+            analyze_config.source_name_hint,
+            Some(original_input.to_path_buf()),
+            "prepare 後のパスではなく元の入力がロゴ辞書の命名用に渡るはず"
+        );
     }
 
     #[test]
@@ -764,8 +784,12 @@ mod tests {
             no_logo: false,
             logo_dir: None,
         };
-        let analyze_config =
-            build_analyze_config(&config, &[], PathBuf::from("/tmp/work/input.mp4"));
+        let analyze_config = build_analyze_config(
+            &config,
+            &[],
+            PathBuf::from("/tmp/work/input.mp4"),
+            Path::new("/rec/IN.mp4"),
+        );
 
         assert_eq!(analyze_config.logo, Some(PathBuf::from("/tmp/logo.lgd")));
         assert!(!analyze_config.no_logo);
