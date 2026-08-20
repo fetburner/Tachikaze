@@ -160,13 +160,14 @@ tachikaze make-logo IN.mp4 --rect x,y,w,h -o OUT.lgd [--threshold N]
 
 ## パス解決
 
-インストールして（`/usr/local/bin` などに置いて）使う場合を含め、パスの決め方は**実行ファイル / 読み取り専用データ / キャッシュ / 出力**の4分類ごとに変える。配置手順は [toolchain-macos.md](toolchain-macos.md)「ビルド後の配置とインストール」。
+インストールして（`/usr/local/bin` などに置いて）使う場合を含め、パスの決め方は**実行ファイル / 読み取り専用データ / キャッシュ / 蓄積データ / 出力**の5分類ごとに変える。配置手順は [toolchain-macos.md](toolchain-macos.md)「ビルド後の配置とインストール」。
 
 | 種類 | 探索順・既定 |
 |---|---|
 | 実行ファイル（`tachikaze` / 外部3ツール / `ffmpeg` / `ffprobe`） | `PATH` のみ（`src/tools.rs::resolve_tool`） |
 | 読み取り専用データ（JL コマンドファイル、既定 `JL_標準.txt`） | `--jl-file` → `<join_logo_scp の実体パス>/../../share/join_logo_scp/JL/` |
 | キャッシュ（再生成可能な中間物） | `--cache-dir` → 既定 `<ホームディレクトリ>/.cache/tachikaze/` |
+| 蓄積データ（ロゴ辞書、`.lgd`） | 呼び出し側の上書き引数（CLI への結線は #135）→ 既定 `$XDG_DATA_HOME/tachikaze/logos`。`XDG_DATA_HOME` が未設定または空なら `<ホームディレクトリ>/.local/share/tachikaze/logos` |
 | 出力 | 明示指定のみ（`cut`/`auto` の `-o` は必須） |
 
 `--jl-file` / `--cache-dir` / `--dtvi` を明示指定した場合は、いずれも上記の探索より最優先でそのまま使う。分類ごとの詳細:
@@ -183,12 +184,15 @@ tachikaze make-logo IN.mp4 --rect x,y,w,h -o OUT.lgd [--threshold N]
 - `input_prepared.mp4` — `prepare` が elst 除去・字幕除去後に書く前処理済み入力（`src/prepare.rs`、`workdir::prepared_input_path`）
 - `subs.ass` / `subs.srt` — `prepare` が mp4 内蔵字幕トラックから抽出した字幕サイドカー。`remap-subs` の入力（`workdir::subs_path`）
 
+**蓄積データ**（`src/logo/dict.rs`）。学習済み `.lgd` を貯める辞書ディレクトリ。既定は `$XDG_DATA_HOME/tachikaze/logos`。`XDG_DATA_HOME` が未設定または空文字列なら `<ホームディレクトリ>/.local/share/tachikaze/logos` になる（`dict::resolve_dict_dir`）。キャッシュとは別分類にした理由、環境変数を読む理由は下記「なぜこの形にしたか」参照。
+
 **出力**。`cut -o` / `auto -o`（本編、必須）と `--cm-output`（CM側、`auto` は指定時のみ）はすべて明示指定させる。例外は2つ。`remap-subs` を単体で使うときだけ、入力の隣に `*_CMcut.ass` / `*_CMcut.srt` を既定で置く（`src/commands.rs::default_remap_subs_output_path`）。`auto` の字幕サイドカーは `-o` と同じ stem・別拡張子で書く（`src/auto.rs::subs_sidecar_path`。本編出力と揃えることでプレイヤーが自動で字幕を読み込める）。
 
 なぜこの形にしたか:
 
 - **中間物をキャッシュに置いた理由**: `.dtvi` / `trim.avs` / `detail.jls` はいずれも `analyze` を再実行すれば作り直せる。外部3ツールはいずれも既存の出力先を実害なく上書きすることを実バイナリで確認済みなので、消えても復旧できるデータとしてキャッシュ扱いにした。既定で残すことで、`analyze` → `cut` を `--cache-dir` / `--dtvi` の手打ちなしで繋げられる。ディレクトリ名（`~/.cache/tachikaze`）自体は XDG Base Directory 仕様の既定と同じものを借りている
-- **XDG 由来の環境変数を読まないと決めた理由**: 置き場所を決める口を `--cache-dir`（キャッシュ）・`--jl-file`（JL）のように引数に一本化し、環境変数の値によって挙動が変わらないようにした。ディレクトリ名だけ XDG の既定（`~/.cache`）を借りているが、環境変数側は一切読まない（`src/workdir.rs::default_cache_root` の doc comment）
+- **ロゴ辞書をキャッシュと別分類にした理由**: `.lgd` は元の録画を消すと作り直せない。`--cache-dir`（再生成できる中間物の置き場所という規約）にはそぐわないため、蓄積データという別分類を立てた（`src/logo/dict.rs` モジュール doc comment）
+- **XDG 由来の環境変数を読まないと決めた理由（ロゴ辞書は例外）**: 置き場所を決める口を `--cache-dir`（キャッシュ）・`--jl-file`（JL）のように引数に一本化し、環境変数の値によって挙動が変わらないようにした。ディレクトリ名だけ XDG の既定（`~/.cache`）を借りているが、環境変数側は一切読まない（`src/workdir.rs::default_cache_root` の doc comment）。**唯一の例外がロゴ辞書**（`src/logo/dict.rs::resolve_dict_dir`）で、`$XDG_DATA_HOME` を実際に読む。理由は2つある。(1) 蓄積データという性質上、XDG のデータディレクトリ規約にそのまま従う方が利用者にとって自然である。`--cache-dir` が借りているのはディレクトリ名だけだが、辞書は規約そのものに従う。(2) 呼び出し側の明示的な上書き引数が環境変数より常に優先する。そのため `--cache-dir` 側の懸念（複数の口が同時に設定されたときどちらが効くか読まないと分からない）は生じない（詳細は `src/logo/dict.rs` モジュール doc comment）
 - **ホームディレクトリを `std::env::home_dir()` で取る理由**: `$HOME` 環境変数の読み取りではなく OS への問い合わせなので、`$HOME` が unset な環境でも既定値を作れる場合がある。実測（`src/workdir.rs::default_cache_root` の doc comment）: rustc 1.97.1 時点で非推奨警告は出ない。Unix では `$HOME` が unset でも `getpwuid` 経由でホームディレクトリを引ける。実際にホームが取れない（＝エラーになる）のは「呼び出しユーザーの passwd エントリすら無い」環境（コンテナで存在しない UID として動かす等）に限られる
 - **ホームディレクトリが特定できないときにエラーで止める理由**: 黙って一時ディレクトリ等へフォールバックすると、キャッシュが知らない場所に増える。さらに悪いことに、別プロセスが別の一時領域を引くと同じ入力に対して別のキャッシュディレクトリを掴み、`analyze` → `cut`（`--dtvi` 省略）の受け渡しが**エラーを出さずに**外れる。`--cache-dir` を促すエラーで明示的に止める方が安全と判断した
 - **外部ツール専用の配置ディレクトリを指定するオプションと「自分の実行ファイルの隣」を削った理由**: `PATH=/opt/jls/bin:$PATH tachikaze ...` のように `PATH` を前置すれば同じことができる。インストールしたくない場合は Docker イメージ（[docker.md](docker.md)）がある。口を1つに絞ることで、複数の口が同時に設定されたときどちらが効くか読まないと分からない状態を無くした
@@ -324,7 +328,7 @@ $ ffmpeg -i IN.mp4 -c copy -use_editlist 0 -movflags +faststart OUT.mp4
 | `logo/score.rs` | ロゴマスク生成と相関スコア（`corr0`/`corr1`）。Amatsukaze `LogoScan.hpp` の相関方式を移植 | [cm-detection.md](cm-detection.md) |
 | `logo/scan.rs` | `make-logo` 本体: 外周1ピクセルが単色のフレームだけを使い、画素ごとに最小二乗で `.lgd` の係数 `a`/`b` を求める。`.lgd` の書き出し（ベース部はゼロ埋め） | 上記「make-logo」 |
 | `logo/interval.rs` | `corr0`/`corr1` の列からロゴ表示区間を判定し logoframe 形式で出力。Amatsukaze `LogoScan.hpp` の `LogoFrame::writeResult` を移植 | [cm-detection.md](cm-detection.md) |
-| `logo/dict.rs` | 学習済み `.lgd` を辞書ディレクトリ（既定 `$XDG_DATA_HOME/tachikaze/logos`）に蓄積し、対象映像と解像度が一致する候補をスコア（Amatsukaze `LogoFrame::selectLogo` 相当）で自動選択する | [cm-detection.md](cm-detection.md) |
+| `logo/dict.rs` | 学習済み `.lgd` を辞書ディレクトリ（既定 `$XDG_DATA_HOME/tachikaze/logos`、未設定時 `~/.local/share/tachikaze/logos`）に蓄積し、対象映像と解像度が一致する候補をスコア（Amatsukaze `LogoFrame::selectLogo` 相当）で自動選択する | [cm-detection.md](cm-detection.md)、上記「パス解決」 |
 
 **解析側（analyze）は mp4 の読み込みに依存しない。** `--report` が必要とするキーフレーム位置を `.dtvi` から取る設計にしてあるため。**この性質を崩さないこと**（キーフレーム位置を mp4 から取る実装に変えると解析とカットが結合する）。
 

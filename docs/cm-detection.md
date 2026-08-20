@@ -60,7 +60,7 @@ CM 判定は 3 種類の「証拠」を集めて外部ツールが統合判定�
 
 ### ロゴ辞書（`.lgd` の再利用、`src/logo/dict.rs`）
 
-同じ局のロゴは番組が変わっても同一である。そのため学習済み `.lgd` を辞書ディレクトリ（既定 `$XDG_DATA_HOME/tachikaze/logos`）に蓄積し、次回以降は毎回学習し直さずに使い回す。
+同じ局のロゴは番組が変わっても同一である。そのため学習済み `.lgd` を辞書ディレクトリに蓄積し、次回以降は毎回学習し直さずに使い回す。既定は `$XDG_DATA_HOME/tachikaze/logos`。`XDG_DATA_HOME` が未設定または空文字列なら `~/.local/share/tachikaze/logos` になる（macOS では未設定が通常）。
 
 Amatsukaze もサービスIDごとにロゴ候補を貯め（`LogoSetting`）、`LogoFrame::selectLogo` がスコアで1つ選ぶ。同じ構造だが、本ツールは mp4 に PMT が無くサービスIDが取れない。そこで**「解像度が一致するものを全部候補にしてスコアで選ぶ」**に置き換えている。
 
