@@ -89,8 +89,10 @@ fn skip_if_prerequisites_missing() -> bool {
 ///   を渡す）。
 /// - `chapter_exe`: `-o` の次の引数へダミーの `scp.txt` を書く（偽の
 ///   `join_logo_scp` しか読まないので内容は問わない）。
-/// - `join_logo_scp`: 起動時の全引数を1行1引数で `captured_args_path` に記録し、
-///   `-o`/`-oscp` の次の引数へ固定内容を書く。
+/// - `join_logo_scp`: 起動時の全引数を1行1引数で `captured_args_path` に記録し
+///   （毎回上書き、最後に起動されたときの引数だけが残る）、`-o`/`-oscp` の次の
+///   引数へ固定内容を書く。加えて、[`invocation_count_path`] が指す方には
+///   毎回1行**追記**する（自動推定で複数回起動されうる、issue #135）。
 ///
 /// 戻り値は `PATH` に前置するビンディレクトリ。
 fn setup_fake_tools(tmp_dir: &Path, dtvi_source: &Path, captured_args_path: &Path) -> PathBuf {
@@ -113,14 +115,35 @@ fn setup_fake_tools(tmp_dir: &Path, dtvi_source: &Path, captured_args_path: &Pat
     common::write_executable_script(
         &bin_dir.join("join_logo_scp"),
         &format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{captured}'\nprev=\"\"\nfor a in \"$@\"; do\n  case \"$prev\" in\n    -o) printf '{trim}' > \"$a\" ;;\n    -oscp) printf '{jls}' > \"$a\" ;;\n  esac\n  prev=\"$a\"\ndone\nexit 0\n",
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{captured}'\nprintf '1\\n' >> '{invocations}'\nprev=\"\"\nfor a in \"$@\"; do\n  case \"$prev\" in\n    -o) printf '{trim}' > \"$a\" ;;\n    -oscp) printf '{jls}' > \"$a\" ;;\n  esac\n  prev=\"$a\"\ndone\nexit 0\n",
             captured = captured_args_path.display(),
+            invocations = invocation_count_path(captured_args_path).display(),
             trim = FAKE_TRIM_CONTENT,
             jls = FAKE_DETAIL_JLS_CONTENT,
         ),
     );
 
     bin_dir
+}
+
+/// [`setup_fake_tools`] の偽 `join_logo_scp` が起動されるたびに1行追記する
+/// ファイルのパス（`captured_args_path` から導出、`captured_args_path` 自体は
+/// 毎回上書きされ最後の呼び出しの引数しか残らないため、起動回数を別ファイルで
+/// 数える）。
+fn invocation_count_path(captured_args_path: &Path) -> PathBuf {
+    let mut os = captured_args_path.as_os_str().to_os_string();
+    os.push(".invocations");
+    PathBuf::from(os)
+}
+
+/// [`invocation_count_path`] の行数（＝偽 `join_logo_scp` が起動された回数）を返す。
+/// ファイルが無ければ0回。
+fn join_logo_scp_invocation_count(captured_args_path: &Path) -> usize {
+    let path = invocation_count_path(captured_args_path);
+    match fs::read_to_string(&path) {
+        Ok(content) => content.lines().count(),
+        Err(_) => 0,
+    }
 }
 
 /// `captured_args_path`（偽 `join_logo_scp` が書いた、1行1引数のファイル）を
@@ -163,6 +186,10 @@ fn run_make_logo(input: &Path, rect: &str, output: &Path) {
 }
 
 /// `tachikaze analyze` を実行する。`logo` が `Some` なら `--logo` を付ける。
+/// `no_logo` が `true` なら `--no-logo` を付ける（E18-5 以降、`--logo`/
+/// `--no-logo` をどちらも省略すると自動推定が既定で走るため、このテスト
+/// ファイルの「ロゴ検出そのものを対象にしない」比較には `--no-logo` で
+/// 明示的に無効化する必要がある）。
 fn run_analyze(
     bin_dir: &Path,
     cache_dir: &Path,
@@ -170,6 +197,7 @@ fn run_analyze(
     output: &Path,
     jl_file: &Path,
     logo: Option<&Path>,
+    no_logo: bool,
 ) -> std::process::Output {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_tachikaze"));
     cmd.env("PATH", common::prepend_path(bin_dir))
@@ -183,6 +211,9 @@ fn run_analyze(
         .arg(jl_file);
     if let Some(logo) = logo {
         cmd.arg("--logo").arg(logo);
+    }
+    if no_logo {
+        cmd.arg("--no-logo");
     }
     cmd.output().expect("tachikaze analyze を起動できるはず")
 }
@@ -220,6 +251,7 @@ fn analyze_logo_completes_and_writes_logoframe_when_detection_succeeds() {
         &output,
         &jl_file,
         Some(&lgd_path),
+        false,
     );
     assert!(
         result.status.success(),
@@ -266,16 +298,19 @@ fn analyze_logo_completes_and_writes_logoframe_when_detection_succeeds() {
     );
 }
 
-/// 完了条件: `--logo` を省略した `analyze` は、`join_logo_scp` に渡す引数の形が
-/// この issue の変更前と同じになる（`-inlogo` を含まない）。
+/// 完了条件: `--no-logo` を付けた `analyze` は、`join_logo_scp` に渡す引数の形が
+/// この issue（#135）の変更前（＝ `--logo` を省略したときの旧来の唯一の挙動）と
+/// 同じになる（`-inlogo` を含まない、join_logo_scp は1回だけ起動される）。
+/// E18-5 以降、`--logo`/`--no-logo` を両方省略すると自動推定が既定で走るため、
+/// 「変更前と同じ挙動」を再現するには `--no-logo` を明示する必要がある。
 #[test]
 #[ignore = "tests/fixtures/sample_logo.mp4 と ffmpeg が必要。tests/fixtures/gen.sh を先に実行すること"]
-fn analyze_without_logo_flag_passes_unchanged_arguments_to_join_logo_scp() {
+fn analyze_no_logo_passes_unchanged_arguments_to_join_logo_scp() {
     if skip_if_prerequisites_missing() {
         return;
     }
 
-    let tmp_dir = make_tmp_dir("omitted");
+    let tmp_dir = make_tmp_dir("no-logo");
     let captured_args_path = tmp_dir.join("join_logo_scp_args.txt");
     let bin_dir = setup_fake_tools(&tmp_dir, &common::logo_dtvi_path(), &captured_args_path);
     let jl_file = write_placeholder_jl_file(&tmp_dir);
@@ -284,7 +319,7 @@ fn analyze_without_logo_flag_passes_unchanged_arguments_to_join_logo_scp() {
     let input = common::logo_fixture_path();
     let output = tmp_dir.join("trim.avs");
 
-    let result = run_analyze(&bin_dir, &cache_dir, &input, &output, &jl_file, None);
+    let result = run_analyze(&bin_dir, &cache_dir, &input, &output, &jl_file, None, true);
     assert!(
         result.status.success(),
         "analyze が失敗しました: stderr={}",
@@ -298,7 +333,7 @@ fn analyze_without_logo_flag_passes_unchanged_arguments_to_join_logo_scp() {
     let args = read_captured_args(&captured_args_path);
     assert!(
         !args.contains(&"-inlogo".to_string()),
-        "--logo 省略時は -inlogo を渡さないはず: args={args:?}"
+        "--no-logo のときは -inlogo を渡さないはず: args={args:?}"
     );
     // 引数の形そのもの（`-inscp`/`-incmd`/`-o`/`-oscp`/`-set` の並び）が
     // この issue の変更前と一致することを確認する。`-o`/`-oscp` は
@@ -328,7 +363,7 @@ fn analyze_without_logo_flag_passes_unchanged_arguments_to_join_logo_scp() {
 }
 
 /// 完了条件: 検出フレーム割合が閾値未満のとき `-inlogo` を渡さず、Trim が
-/// `--logo` 省略時と一致する。`sample_logo_train.mp4` で学習した `.lgd`
+/// `--no-logo` と一致する。`sample_logo_train.mp4` で学習した `.lgd`
 /// （ロゴの位置 616,4,16,16 前提）を、そのロゴが一切合成されていない
 /// `sample.mp4`（既存フィクスチャ、`tests/fixtures/gen.sh`）に適用し、
 /// 検出割合を確実に閾値未満にする。
@@ -347,7 +382,7 @@ fn analyze_logo_below_threshold_falls_back_to_no_inlogo_and_matches_omitted_logo
     // `sample.mp4` には `.dtvi` の実測値がある（`tests/data/sample.dtvi`）ため、
     // 偽 dtvindex にはそちらをコピーさせる（sample_logo.dtvi ではフレーム数
     // 不一致になり、意図と異なるエラーで落ちてしまう）。
-    // フォールバック実行と `--logo` 省略実行の両方に**同じキャッシュディレクトリ・
+    // フォールバック実行と `--no-logo` 実行の両方に**同じキャッシュディレクトリ・
     // 同じ入力**を使う（`workdir` はキャッシュを実害なく上書きする設計、
     // `src/workdir.rs` の doc comment参照）。こうすることで join_logo_scp に
     // 渡る引数の絶対パスまで含めて一致比較できる（別ディレクトリだと絶対パス
@@ -367,6 +402,7 @@ fn analyze_logo_below_threshold_falls_back_to_no_inlogo_and_matches_omitted_logo
         &output_fallback,
         &jl_file,
         Some(&lgd_path),
+        false,
     );
     assert!(
         result.status.success(),
@@ -391,7 +427,7 @@ fn analyze_logo_below_threshold_falls_back_to_no_inlogo_and_matches_omitted_logo
         "閾値未満のときは -inlogo を渡さないはず: args={args_fallback:?}"
     );
 
-    // --logo 省略時と比較する（同じキャッシュディレクトリを再利用する）。
+    // --no-logo と比較する（同じキャッシュディレクトリを再利用する）。
     let captured_args_omitted = tmp_dir.join("join_logo_scp_args_omitted.txt");
     let bin_dir_omitted = setup_fake_tools(&tmp_dir, &common::dtvi_path(), &captured_args_omitted);
     let output_omitted = tmp_dir.join("trim-omitted.avs");
@@ -402,18 +438,19 @@ fn analyze_logo_below_threshold_falls_back_to_no_inlogo_and_matches_omitted_logo
         &output_omitted,
         &jl_file,
         None,
+        true,
     );
     assert!(result_omitted.status.success());
 
     assert_eq!(
         fs::read_to_string(&output_fallback).unwrap(),
         fs::read_to_string(&output_omitted).unwrap(),
-        "閾値未満のフォールバック時の Trim は --logo 省略時と一致するはず"
+        "閾値未満のフォールバック時の Trim は --no-logo と一致するはず"
     );
     assert_eq!(
         read_captured_args(&captured_args_omitted),
         args_fallback,
-        "閾値未満のフォールバック時の join_logo_scp 引数は --logo 省略時と一致するはず"
+        "閾値未満のフォールバック時の join_logo_scp 引数は --no-logo と一致するはず"
     );
 }
 
@@ -458,6 +495,7 @@ fn analyze_logo_aborts_before_join_logo_scp_on_frame_count_mismatch() {
         &output,
         &jl_file,
         Some(&lgd_path),
+        false,
     );
     assert!(
         !result.status.success(),
@@ -478,4 +516,97 @@ fn analyze_logo_aborts_before_join_logo_scp_on_frame_count_mismatch() {
         "join_logo_scp はフレーム数不一致の後に起動されてはいけない"
     );
     assert!(!output.exists(), "失敗時に trim.avs を書き出してはいけない");
+}
+
+/// 完了条件（issue #135）: 自動推定（`--logo`/`--no-logo` を両方省略、既定）が
+/// 「ロゴ無し」と判定する入力で、`trim.avs` が `--no-logo` の場合とバイト単位で
+/// 一致する。join_logo_scp が1回しか起動されていないことも確認する（issue
+/// #135「罠」: 2回目を走らせると「ロゴ無しの現状」と一致しなくなる恐れがある）。
+///
+/// `sample.mp4`（既存フィクスチャ、599フレーム・キーフレーム約5枚）は
+/// `logo::estimate` の候補列生成に必要な有効ブロック数（下限8個、`estimate.rs`
+/// の `MIN_VALID_BLOCKS`）に届かないほど短いため、確実に「候補なし→ロゴ無し」
+/// に倒れる。ロゴ辞書は空の一時ディレクトリ（`--logo-dir`）を使い、開発者の
+/// 実際の辞書（既定 `~/.local/share/tachikaze/logos`）を一切読み書きしない。
+#[test]
+#[ignore = "tests/fixtures/sample.mp4 と ffmpeg が必要。tests/fixtures/gen.sh を先に実行すること"]
+fn analyze_auto_detect_falls_back_to_no_logo_and_matches_no_logo_flag() {
+    if common::skip_if_missing("ffmpeg") || common::skip_if_fixture_missing() {
+        return;
+    }
+
+    let tmp_dir = make_tmp_dir("auto-detect-fallback");
+    let jl_file = write_placeholder_jl_file(&tmp_dir);
+    let input = common::fixture_path();
+
+    // 自動推定（--logo/--no-logo 両方省略）。
+    let captured_args_auto = tmp_dir.join("join_logo_scp_args_auto.txt");
+    let bin_dir_auto = setup_fake_tools(&tmp_dir, &common::dtvi_path(), &captured_args_auto);
+    let logo_dir_auto = tmp_dir.join("logo-dict-auto");
+    let cache_dir_auto = tmp_dir.join("cache-auto");
+    let output_auto = tmp_dir.join("trim-auto.avs");
+    let result_auto = Command::new(env!("CARGO_BIN_EXE_tachikaze"))
+        .env("PATH", common::prepend_path(&bin_dir_auto))
+        .arg("--cache-dir")
+        .arg(&cache_dir_auto)
+        .arg("analyze")
+        .arg(&input)
+        .arg("-o")
+        .arg(&output_auto)
+        .arg("--jl-file")
+        .arg(&jl_file)
+        .arg("--logo-dir")
+        .arg(&logo_dir_auto)
+        .output()
+        .expect("tachikaze analyze を起動できるはず");
+    assert!(
+        result_auto.status.success(),
+        "自動推定の analyze が失敗しました: stderr={}",
+        String::from_utf8_lossy(&result_auto.stderr)
+    );
+
+    assert_eq!(
+        join_logo_scp_invocation_count(&captured_args_auto),
+        1,
+        "ロゴが見つからない入力では join_logo_scp は1回しか起動されないはず"
+    );
+    let args_auto = read_captured_args(&captured_args_auto);
+    assert!(
+        !args_auto.contains(&"-inlogo".to_string()),
+        "ロゴが見つからなければ -inlogo を渡さないはず: args={args_auto:?}"
+    );
+
+    // --no-logo と比較する（trim.avs の内容自体はキャッシュディレクトリの
+    // パスに依存しないため、絶対パスを含む引数の完全一致までは求めない）。
+    let captured_args_no_logo = tmp_dir.join("join_logo_scp_args_no_logo.txt");
+    let bin_dir_no_logo = setup_fake_tools(&tmp_dir, &common::dtvi_path(), &captured_args_no_logo);
+    let cache_dir_no_logo = tmp_dir.join("cache-no-logo");
+    let output_no_logo = tmp_dir.join("trim-no-logo.avs");
+    let result_no_logo = run_analyze(
+        &bin_dir_no_logo,
+        &cache_dir_no_logo,
+        &input,
+        &output_no_logo,
+        &jl_file,
+        None,
+        true,
+    );
+    assert!(
+        result_no_logo.status.success(),
+        "--no-logo の analyze が失敗しました: stderr={}",
+        String::from_utf8_lossy(&result_no_logo.stderr)
+    );
+    assert_eq!(
+        join_logo_scp_invocation_count(&captured_args_no_logo),
+        1,
+        "--no-logo でも join_logo_scp は1回しか起動されないはず"
+    );
+
+    assert_eq!(
+        fs::read_to_string(&output_auto).unwrap(),
+        fs::read_to_string(&output_no_logo).unwrap(),
+        "自動推定でロゴ無しと判定された結果は --no-logo と一致するはず"
+    );
+
+    let _ = fs::remove_dir_all(&tmp_dir);
 }

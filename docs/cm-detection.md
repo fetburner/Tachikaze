@@ -15,7 +15,12 @@ CM 判定は 3 種類の「証拠」を集めて外部ツールが統合判定�
                   ＋ PMT 変更点   … Amatsukaze 本体 (applyPmtCut)       Trim(a,b)++…
 ```
 
-**本プロジェクトは PMT を使わない**（mp4 に PMT が無いため）。**ロゴ検出は自前実装している**（`analyze --logo <path.lgd>` を指定したときだけ使う。省略時はロゴ無しの経路になる）。対象の mp4 には局ロゴが残っていることが多い（[measurements.md](measurements.md)「ロゴの残存」）。
+**本プロジェクトは PMT を使わない**（mp4 に PMT が無いため）。**ロゴ検出は自前実装している**。
+`analyze --logo <path.lgd>` を指定すると特定の `.lgd` を使う。`--logo`/`--no-logo` を
+両方省略した既定では、入力自身からロゴ矩形を自動推定して同じ検出を試みる。
+`--no-logo` を指定したときだけロゴ無しの経路になる（詳細は
+[architecture.md](architecture.md)「analyze」の「自動推定」節）。対象の mp4 には
+局ロゴが残っていることが多い（[measurements.md](measurements.md)「ロゴの残存」）。
 
 ## ロゴ検出（自前実装、任意）
 

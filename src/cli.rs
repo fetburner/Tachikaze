@@ -90,13 +90,28 @@ pub struct AnalyzeArgs {
     pub jl_file: Option<PathBuf>,
 
     /// ロゴ検出に使う `.lgd`（Amatsukaze 形式ロゴデータ、`make-logo` で作る）。
-    /// 指定時のみロゴ検出を行い、検出フレーム割合が閾値以上かつ logoframe の
-    /// 出力が空でなければキャッシュへ書いて join_logo_scp に `-inlogo` を渡す。
-    /// それ以外はフォールバックして渡さない（`src/analyze.rs` の doc comment
-    /// `inlogo_decision`参照）。省略時は従来どおり
-    /// ロゴ無しの経路のまま（1バイトも変わらない、#97）。
+    /// 指定時のみこの `.lgd` でロゴ検出を行い、検出フレーム割合が閾値以上かつ
+    /// logoframe の出力が空でなければキャッシュへ書いて join_logo_scp に
+    /// `-inlogo` を渡す。それ以外はフォールバックして渡さない（`src/analyze.rs`
+    /// の doc comment `inlogo_decision`参照）。**指定したときの挙動は
+    /// 1バイトも変わらない（#97/#135）。** `--no-logo` と同時には指定できない。
     #[arg(long)]
     pub logo: Option<PathBuf>,
+
+    /// 自動推定によるロゴ検出を行わない。`--logo` を省略したときの既定は
+    /// E18-5 以降「入力自身からロゴ矩形を自動推定して検出を試みる」ため、
+    /// 従来どおり常にロゴ無し（`-inlogo` を渡さない）で処理したい場合に使う。
+    /// `--logo` と同時には指定できない（`--logo` があれば明示の `.lgd` を
+    /// 使うため、`--no-logo` を付ける意味が無い）。
+    #[arg(long = "no-logo", conflicts_with = "logo")]
+    pub no_logo: bool,
+
+    /// ロゴ辞書（学習済み `.lgd` を蓄積するディレクトリ）の場所を上書きする。
+    /// 省略時は既定の場所（`$XDG_DATA_HOME/tachikaze/logos`、未設定なら
+    /// `~/.local/share/tachikaze/logos`、`src/logo/dict.rs::resolve_dict_dir`
+    /// 参照）を使う。`--logo`/`--no-logo` 指定時は辞書を読み書きしないため無視する。
+    #[arg(long = "logo-dir")]
+    pub logo_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -235,9 +250,18 @@ pub struct AutoArgs {
     #[arg(long = "jls-set")]
     pub jls_set: Vec<String>,
 
-    /// ロゴ検出に使う `.lgd`（`analyze --logo` と同じ）。
+    /// ロゴ検出に使う `.lgd`（`analyze --logo` と同じ）。指定したときの挙動は
+    /// 1バイトも変わらない。`--no-logo` と同時には指定できない。
     #[arg(long)]
     pub logo: Option<PathBuf>,
+
+    /// 自動推定によるロゴ検出を行わない（`analyze --no-logo` と同じ）。
+    #[arg(long = "no-logo", conflicts_with = "logo")]
+    pub no_logo: bool,
+
+    /// ロゴ辞書の場所を上書きする（`analyze --logo-dir` と同じ）。
+    #[arg(long = "logo-dir")]
+    pub logo_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -355,6 +379,36 @@ mod tests {
         ])
         .expect_err("3値しかないので失敗するはず");
         assert!(err.to_string().contains("--rect"));
+    }
+
+    #[test]
+    fn analyze_rejects_logo_and_no_logo_together() {
+        let err = Cli::try_parse_from([
+            "tachikaze",
+            "analyze",
+            "in.mp4",
+            "--logo",
+            "logo.lgd",
+            "--no-logo",
+        ])
+        .expect_err("--logo と --no-logo の併用は拒否するはず");
+        assert!(err.to_string().contains("no-logo") || err.to_string().contains("logo"));
+    }
+
+    #[test]
+    fn auto_rejects_logo_and_no_logo_together() {
+        let err = Cli::try_parse_from([
+            "tachikaze",
+            "auto",
+            "in.mp4",
+            "-o",
+            "out.mp4",
+            "--logo",
+            "logo.lgd",
+            "--no-logo",
+        ])
+        .expect_err("--logo と --no-logo の併用は拒否するはず");
+        assert!(err.to_string().contains("no-logo") || err.to_string().contains("logo"));
     }
 
     #[test]

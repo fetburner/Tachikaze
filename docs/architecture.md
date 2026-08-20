@@ -37,7 +37,8 @@ elst(edit list) 除去・字幕トラック除去・字幕抽出を1回の ffmpe
 
 ```
 tachikaze analyze IN.mp4 [-o trim.avs|-] [--report] [--cache-dir DIR]
-                         [--jls-set KEY=VALUE]... [--jl-file FILE] [--logo FILE.lgd]
+                         [--jls-set KEY=VALUE]... [--jl-file FILE]
+                         [--logo FILE.lgd | --no-logo] [--logo-dir DIR]
 ```
 
 1. `dtvindex build`（外部プロセス）
@@ -58,6 +59,16 @@ tachikaze analyze IN.mp4 [-o trim.avs|-] [--report] [--cache-dir DIR]
 - 割合が閾値以上でも、精緻化で text が空になった場合は同様に渡さない。`logo_frames`（判定の数え上げ）と `text`（`build_text` の出力）は別経路のため、割合だけでは text が空のケースを見落とす（`src/analyze.rs::inlogo_decision`）
 - `-inlogo` を渡さないときは、キャッシュに残る古い logoframe.txt を削除する
 - `.dtvi` の `frame_count` と読み取ったフレーム数が食い違う場合は手順3を実行せず中断する（CLAUDE.md 罠3。この検査は省略不可）
+
+**`--logo`/`--no-logo` を両方省略したときの自動推定（既定、E18-5・#135）。** `--logo` を明示したとき・`--no-logo` を指定したときは上記のとおり（`join_logo_scp` は1回だけ）。それ以外（既定）は次の直列ループで決める（`src/analyze.rs::run_auto_logo_detection`）:
+
+1. まず `join_logo_scp` を `-inlogo` 無しで1回走らせ、「ロゴ無しの結果」として保持する
+2. その保持区間の補集合（CM区間、表示順フレーム番号）を求める。それと `.dtvi` のキーパケットの `frame_number` から、標本（キーフレーム）ごとの本編/CM分類器を作る（GOP=120固定の等間隔仮定は使わない、CLAUDE.md 罠3）
+3. ロゴ辞書（既定 `$XDG_DATA_HOME/tachikaze/logos`、`--logo-dir` で上書き）を見る。対象解像度と一致する候補があれば、学習をスキップしてそのまま検出を試す（`src/logo/dict.rs::select_candidate`）
+4. 辞書で決まらなければ、入力自身からロゴ矩形の候補列を推定する（`src/logo/estimate.rs::estimate_candidates`、AUC順の採用列）。先頭から最大5件を順に学習し（`src/logo/scan.rs::make-logo` と同じアルゴリズム）、検出まで試す。学習失敗（回帰係数 NaN 等）や検出失敗は次候補へ進み、成功した時点で打ち切る
+5. 成功した候補の `.lgd` だけをロゴ辞書へ保存する。全候補が尽きればロゴ無しとして扱う（1回目の結果をそのまま使い、`join_logo_scp` の2回目は走らせない）。見つかった場合だけ `join_logo_scp` を `-inlogo` 付きでもう1回走らせる。その結果を最終の `trim.avs` とする
+
+各段階の結果（辞書ヒット・候補列とAUC・何番目の候補で成功したか・学習の有効フレーム数・検出フレーム割合・`-inlogo` を渡したか）は stderr に出る。
 
 （必要なら trim.avs を人手で編集してから `cut` へ渡す）
 
@@ -98,7 +109,8 @@ tachikaze remap-subs IN.mp4 [--segment-map PATH] [--subs PATH] [-o OUT.ass|OUT.s
 ```
 tachikaze auto IN.mp4 -o OUT.mp4 [--cm-output CM.mp4] [--ignore-gate] [-f|--force]
                      [--analyze-only] [--no-subtitles] [--snap] [--verify]
-                     [--jl-file] [--jls-set] [--cache-dir] [--logo FILE.lgd]
+                     [--jl-file] [--jls-set] [--cache-dir]
+                     [--logo FILE.lgd | --no-logo] [--logo-dir DIR]
 ```
 
 `prepare` → `analyze` → gate 判定 → `cut` → `remap-subs` を対話なしで合成する（`src/auto.rs`）。アルゴリズムは持たず、各ステップは上記の関数・処理をそのまま呼ぶ（`commands::execute_cut` を `cut` サブコマンドと共有。詳細は `src/commands.rs` / `src/auto.rs` の doc comment）。
@@ -107,6 +119,7 @@ tachikaze auto IN.mp4 -o OUT.mp4 [--cm-output CM.mp4] [--ignore-gate] [-f|--forc
 - `--ignore-gate` で無視できるのは gate の判定だけで、自己検証や `.dtvi` 必須は変わらない
 - `--analyze-only` は `--ignore-gate` の有無に関わらず cut へ進まない。gate が疑わしいと判定していれば exit code は 3 のまま（無視の対象は「cut へ進むかどうか」で、停止コードそのものではない）
 - 1プロセスにつき入力は1本。複数ファイルはシェルのループに任せる。1入力1プロセスにすることで、exit code の意味が「その1本に対する答え」に一意になる（下記「exit code」）
+- `--logo`/`--no-logo`/`--logo-dir` は値をそのまま `analyze` へ渡すだけ（`auto` 独自のロジックは持たない）。挙動は上記「analyze」の「自動推定」節と同じ
 
     ```
     for f in *.mp4; do case "$f" in *_CMcut.mp4) continue;; esac; tachikaze auto "$f" -o "${f%.mp4}_CMcut.mp4"; done
@@ -167,7 +180,7 @@ tachikaze make-logo IN.mp4 --rect x,y,w,h -o OUT.lgd [--threshold N]
 | 実行ファイル（`tachikaze` / 外部3ツール / `ffmpeg` / `ffprobe`） | `PATH` のみ（`src/tools.rs::resolve_tool`） |
 | 読み取り専用データ（JL コマンドファイル、既定 `JL_標準.txt`） | `--jl-file` → `<join_logo_scp の実体パス>/../../share/join_logo_scp/JL/` |
 | キャッシュ（再生成可能な中間物） | `--cache-dir` → 既定 `<ホームディレクトリ>/.cache/tachikaze/` |
-| 蓄積データ（ロゴ辞書、`.lgd`） | 呼び出し側の上書き引数（CLI への結線は #135）→ 既定 `$XDG_DATA_HOME/tachikaze/logos`。`XDG_DATA_HOME` が未設定または空なら `<ホームディレクトリ>/.local/share/tachikaze/logos` |
+| 蓄積データ（ロゴ辞書、`.lgd`） | `--logo-dir`（`analyze`/`auto`）→ 既定 `$XDG_DATA_HOME/tachikaze/logos`。`XDG_DATA_HOME` が未設定または空なら `<ホームディレクトリ>/.local/share/tachikaze/logos` |
 | 出力 | 明示指定のみ（`cut`/`auto` の `-o` は必須） |
 
 `--jl-file` / `--cache-dir` / `--dtvi` を明示指定した場合は、いずれも上記の探索より最優先でそのまま使う。分類ごとの詳細:

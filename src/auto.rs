@@ -98,6 +98,10 @@ pub struct AutoConfig {
     pub jls_set: Vec<String>,
     /// `--logo`（`analyze --logo` と同じ、ロゴ検出に使う `.lgd`）。
     pub logo: Option<PathBuf>,
+    /// `--no-logo`（自動推定によるロゴ検出を行わない。`analyze --no-logo` と同じ）。
+    pub no_logo: bool,
+    /// `--logo-dir`（ロゴ辞書の場所の上書き。`analyze --logo-dir` と同じ）。
+    pub logo_dir: Option<PathBuf>,
 }
 
 /// 入力1本の処理結果（失敗は `anyhow::Result::Err` で表す。`commands::run_auto`
@@ -123,6 +127,12 @@ pub fn run(config: &AutoConfig, input: &Path) -> anyhow::Result<InputStatus> {
     if let Some(path) = &config.cm_output {
         commands::reject_dash_output(path, "--cm-output")?;
     }
+    // `--logo` と `--no-logo` の併用は静的な設定の誤り（`clap` の
+    // `conflicts_with` でも弾かれるが、`AutoConfig` を直接組み立てて
+    // `auto::run` を呼ぶ経路（このモジュールの単体テスト等）も同じ規則で
+    // 弾くため、`analyze::validate_logo_flags` をここでも呼ぶ。実処理
+    // （`prepare`/`analyze`）より前に検出する）。
+    analyze::validate_logo_flags(config.logo.as_deref(), config.no_logo)?;
 
     // `--cm-output` を指定したときのみ CM 側出力を作る（既定では作らない）。
     // `--snap inward` は保持区間を退化させうるため `--cm-output` と併用できない
@@ -236,14 +246,7 @@ fn process_one(
     // `work_probe.trim_path()` を先読みするのではなく、`analyze::run` が返す
     // `AnalyzeOutput::cache_trim_path` を使う（実際に書いた場所を返り値から
     // 直接受け取ることで、パス導出が食い違う可能性を構造的に排除する）。
-    let analyze_config = analyze::AnalyzeConfig {
-        input: media_path.clone(),
-        output: None,
-        cache_dir: config.cache_dir.clone(),
-        jls_set: jls_set.to_vec(),
-        jl_file: config.jl_file.clone(),
-        logo: config.logo.clone(),
-    };
+    let analyze_config = build_analyze_config(config, jls_set, media_path.clone());
     eprintln!("[auto] analyze: {}", media_path.display());
     let analyze_output = analyze::run(&analyze_config)
         .with_context(|| format!("analyze に失敗しました: {}", media_path.display()))?;
@@ -388,6 +391,31 @@ fn process_one(
     );
 
     Ok(InputStatus::Completed)
+}
+
+/// `AutoConfig` と、その実行で使う `jls_set`（パース済み）・`media_path`
+/// （`prepare` 後の入力）から `analyze::AnalyzeConfig` を組み立てる。
+///
+/// `logo`/`no_logo`/`logo_dir` はそのまま転記するだけ（`analyze` へのロゴ関連
+/// 設定の結線は #135 の担当）。純粋な struct 変換だけの小さい関数に分離した
+/// のは、`process_one`（`prepare`/`analyze` を実際に起動する重い処理）を経由
+/// せずに「`AutoConfig` の値が `AnalyzeConfig` へ正しく渡るか」だけを単体テスト
+/// できるようにするため。
+fn build_analyze_config(
+    config: &AutoConfig,
+    jls_set: &[(String, String)],
+    media_path: PathBuf,
+) -> analyze::AnalyzeConfig {
+    analyze::AnalyzeConfig {
+        input: media_path,
+        output: None,
+        cache_dir: config.cache_dir.clone(),
+        jls_set: jls_set.to_vec(),
+        jl_file: config.jl_file.clone(),
+        logo: config.logo.clone(),
+        no_logo: config.no_logo,
+        logo_dir: config.logo_dir.clone(),
+    }
 }
 
 /// cut が書いた区間マップ（`workdir::cached_segment_map_path`）を読み、
@@ -554,6 +582,8 @@ mod tests {
             jls_set: vec![],
             cache_dir: None,
             logo: None,
+            no_logo: false,
+            logo_dir: None,
         };
         let err = run(&config, Path::new("/a.mp4"))
             .expect_err("--cm-output 指定時の --snap inward は拒否するはず");
@@ -579,6 +609,8 @@ mod tests {
             jls_set: vec![],
             cache_dir: None,
             logo: None,
+            no_logo: false,
+            logo_dir: None,
         };
         let err = run(&config, Path::new("/nonexistent-for-auto-test.mp4"))
             .expect_err("入力が無いのでエラーになるはず");
@@ -603,6 +635,8 @@ mod tests {
             jls_set: vec![],
             cache_dir: None,
             logo: None,
+            no_logo: false,
+            logo_dir: None,
         };
         let err = run(&config, Path::new("/a.mp4")).expect_err("-o - は拒否するはず");
         assert!(err.to_string().contains("-o/--output"));
@@ -623,6 +657,8 @@ mod tests {
             jls_set: vec![],
             cache_dir: None,
             logo: None,
+            no_logo: false,
+            logo_dir: None,
         };
         let err = run(&config, Path::new("/a.mp4")).expect_err("--cm-output - は拒否するはず");
         assert!(err.to_string().contains("--cm-output"));
@@ -643,9 +679,95 @@ mod tests {
             jls_set: vec!["not-key-value".to_string()],
             cache_dir: None,
             logo: None,
+            no_logo: false,
+            logo_dir: None,
         };
         let err = run(&config, Path::new("/nonexistent-for-auto-test.mp4"))
             .expect_err("--jls-set の形式不正は事前に拒否するはず");
         assert!(err.to_string().contains("KEY=VALUE"));
+    }
+
+    #[test]
+    fn run_rejects_logo_and_no_logo_together_before_processing_input() {
+        // 完了条件: `--logo` と `--no-logo` の併用がエラーになる（`auto` 経由）。
+        // `analyze::validate_logo_flags` を実処理より前に呼んでいることも、
+        // 実在しない入力でエラーになる（＝「入力がありません」ではなく
+        // このバリデーションで先に失敗する）ことで確認する。
+        let config = AutoConfig {
+            output: PathBuf::from("/tmp/out.mp4"),
+            cm_output: None,
+            ignore_gate: false,
+            force: false,
+            analyze_only: false,
+            no_subtitles: false,
+            snap: cli::Snap::Outward,
+            verify: false,
+            jl_file: None,
+            jls_set: vec![],
+            cache_dir: None,
+            logo: Some(PathBuf::from("/tmp/logo.lgd")),
+            no_logo: true,
+            logo_dir: None,
+        };
+        let err = run(&config, Path::new("/nonexistent-for-auto-test.mp4"))
+            .expect_err("--logo と --no-logo の併用は拒否するはず");
+        assert!(err.to_string().contains("--logo"));
+        assert!(err.to_string().contains("--no-logo"));
+    }
+
+    /// 完了条件: `auto` の `--logo-dir` / `--no-logo` が `AnalyzeConfig` へ
+    /// そのまま渡る。`build_analyze_config` は I/O を一切行わない純粋関数なので、
+    /// `prepare`/`analyze` を実際に起動せずに配線だけを検証できる。
+    #[test]
+    fn build_analyze_config_forwards_no_logo_and_logo_dir() {
+        let config = AutoConfig {
+            output: PathBuf::from("/tmp/out.mp4"),
+            cm_output: None,
+            ignore_gate: false,
+            force: false,
+            analyze_only: false,
+            no_subtitles: false,
+            snap: cli::Snap::Outward,
+            verify: false,
+            jl_file: None,
+            jls_set: vec![],
+            cache_dir: Some(PathBuf::from("/tmp/cache")),
+            logo: None,
+            no_logo: true,
+            logo_dir: Some(PathBuf::from("/tmp/dict")),
+        };
+        let media_path = PathBuf::from("/tmp/work/input_prepared.mp4");
+        let analyze_config = build_analyze_config(&config, &[], media_path.clone());
+
+        assert_eq!(analyze_config.input, media_path);
+        assert_eq!(analyze_config.cache_dir, Some(PathBuf::from("/tmp/cache")));
+        assert!(analyze_config.no_logo);
+        assert_eq!(analyze_config.logo_dir, Some(PathBuf::from("/tmp/dict")));
+        assert_eq!(analyze_config.logo, None);
+    }
+
+    #[test]
+    fn build_analyze_config_forwards_explicit_logo() {
+        let config = AutoConfig {
+            output: PathBuf::from("/tmp/out.mp4"),
+            cm_output: None,
+            ignore_gate: false,
+            force: false,
+            analyze_only: false,
+            no_subtitles: false,
+            snap: cli::Snap::Outward,
+            verify: false,
+            jl_file: None,
+            jls_set: vec![],
+            cache_dir: None,
+            logo: Some(PathBuf::from("/tmp/logo.lgd")),
+            no_logo: false,
+            logo_dir: None,
+        };
+        let analyze_config =
+            build_analyze_config(&config, &[], PathBuf::from("/tmp/work/input.mp4"));
+
+        assert_eq!(analyze_config.logo, Some(PathBuf::from("/tmp/logo.lgd")));
+        assert!(!analyze_config.no_logo);
     }
 }

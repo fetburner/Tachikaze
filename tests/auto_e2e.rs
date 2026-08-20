@@ -211,6 +211,11 @@ fn auto_completes_full_pipeline_with_fake_tools() {
         .arg(&out_path)
         .arg("--cm-output")
         .arg(&cm_path)
+        // このテストはロゴ検出を確認するものではない。`--logo`/`--no-logo` 省略時は
+        // E18-5 以降ロゴの自動推定（ffmpeg 起動・ロゴ辞書の読み書き）が既定で
+        // 走るため、無関係な依存を増やさないよう明示的に無効化する
+        // （ロゴ関連の挙動は tests/analyze_logo_e2e.rs が個別に確認する）。
+        .arg("--no-logo")
         .env("PATH", common::prepend_path(&bin_dir))
         .output()
         .expect("tachikaze auto の起動に失敗した");
@@ -316,6 +321,8 @@ fn auto_ignore_gate_overrides_gate_stop_but_gate_alone_stops_without_it() {
             .arg(&input)
             .arg("-o")
             .arg(&out_path)
+            // ロゴ検出は本テストの対象外（上記 `--no-logo` のコメントと同じ理由）。
+            .arg("--no-logo")
             .env("PATH", common::prepend_path(&bin_dir));
         if ignore_gate {
             cmd.arg("--ignore-gate");
@@ -393,6 +400,8 @@ fn analyze_and_cut_support_dash_for_stdout_and_stdin() {
         .arg(&input)
         .arg("-o")
         .arg("-")
+        // ロゴ検出は本テストの対象外（`--no-logo` の理由は上記コメント参照）。
+        .arg("--no-logo")
         .env("PATH", common::prepend_path(&bin_dir))
         .output()
         .expect("tachikaze analyze -o - の起動に失敗した");
@@ -418,6 +427,7 @@ fn analyze_and_cut_support_dash_for_stdout_and_stdin() {
         .arg(&input)
         .arg("-o")
         .arg(&explicit_path)
+        .arg("--no-logo")
         .env("PATH", common::prepend_path(&bin_dir))
         .output()
         .expect("tachikaze analyze -o PATH の起動に失敗した");
