@@ -437,6 +437,48 @@ pub fn run(config: &MakeLogoConfig) -> anyhow::Result<MakeLogoOutput> {
         |frame| learner.add_frame(frame),
     )?;
 
+    finish_learner(
+        &learner,
+        config.rect,
+        config.video_size,
+        config.name.clone(),
+        config.service_id,
+    )
+}
+
+/// [`FrameLearner`] を確定させ、学習結果から [`LogoData`] を組み立てる
+/// （[`run`] の後半部分を分離したもの、issue #153「やること 1」）。
+///
+/// フレーム供給を `run` のように `stream_luma_frames`（ffmpeg 起動）に限らず、
+/// 既に集め終えたフレームから作った `FrameLearner` を渡すだけで同じ結果を
+/// 組み立てられるようにするために分離した。`src/analyze.rs` の
+/// `run_auto_logo_detection` は、候補ごとの学習用デコードと検出用デコードを
+/// 1回に共有する経路でこの関数を呼ぶ（学習は `stream_luma_frames` の
+/// コールバック内で `FrameLearner::add_frame` を呼びながら進め、デコードが
+/// 終わった時点でこの関数で確定させる）。`run` と全く同じフィールド組み立てを
+/// 行うため、[`round_rect_to_even`] 適用済みの矩形を渡すこと（`w`/`h` が2の倍数
+/// であることをここでも検査する）。
+///
+/// `learner` の `w`/`h`（内部に保持済み、非公開）が `rect.w`/`rect.h` と食い違う
+/// 呼び方をすると `finish()` の返す係数列の長さが `rect` から計算した `uv_count`
+/// と食い違ったまま `.lgd` に書き出されてしまう。呼び出し側の責務とし、ここでは
+/// 検査しない（`FrameLearner::new` と `rect` を同じ値から作ることを呼び出し側が
+/// 保証する。`run` はその条件を満たしている）。
+pub fn finish_learner(
+    learner: &FrameLearner,
+    rect: LogoRect,
+    video_size: VideoSize,
+    name: String,
+    service_id: i32,
+) -> anyhow::Result<MakeLogoOutput> {
+    anyhow::ensure!(
+        rect.w.is_multiple_of(2) && rect.h.is_multiple_of(2),
+        "ロゴ矩形の w/h は2の倍数である必要があります（クロマの間引きに合わせるため、\
+         round_rect_to_even で丸めてから渡すこと）: w={}, h={}",
+        rect.w,
+        rect.h
+    );
+
     eprintln!(
         "[make-logo] 有効フレーム: {}/{}",
         learner.used_frames(),
@@ -448,8 +490,8 @@ pub fn run(config: &MakeLogoConfig) -> anyhow::Result<MakeLogoOutput> {
         .map_err(|err| anyhow::anyhow!("{err}"))
         .context("ロゴの学習に失敗しました")?;
 
-    let wuv = (config.rect.w >> LOG_UV) as usize;
-    let huv = (config.rect.h >> LOG_UV) as usize;
+    let wuv = (rect.w >> LOG_UV) as usize;
+    let huv = (rect.h >> LOG_UV) as usize;
     let uv_count = wuv * huv;
 
     // クロマ平面は学習しない（モジュール doc comment「クロマ平面は学習しない」節）。
@@ -461,16 +503,16 @@ pub fn run(config: &MakeLogoConfig) -> anyhow::Result<MakeLogoOutput> {
     let b_v = vec![0.0f32; uv_count];
 
     let logo = LogoData {
-        w: config.rect.w as i32,
-        h: config.rect.h as i32,
+        w: rect.w as i32,
+        h: rect.h as i32,
         log_uv_x: LOG_UV,
         log_uv_y: LOG_UV,
-        imgw: config.video_size.width as i32,
-        imgh: config.video_size.height as i32,
-        imgx: config.rect.x as i32,
-        imgy: config.rect.y as i32,
-        name: config.name.clone(),
-        service_id: config.service_id,
+        imgw: video_size.width as i32,
+        imgh: video_size.height as i32,
+        imgx: rect.x as i32,
+        imgy: rect.y as i32,
+        name,
+        service_id,
         a_y,
         b_y,
         a_u,
