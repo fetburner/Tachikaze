@@ -48,12 +48,46 @@ pub fn logo_train_fixture_path() -> PathBuf {
 }
 
 /// `tests/data/sample_logo.dtvi`（`sample_logo.mp4` に対する実 `dtvindex build`
-/// 出力の抜粋。ヘッダ全体 + 先頭40フレーム、`tests/data/sample.dtvi` と同じ
-/// truncation 規則）の絶対パスを返す。`analyze --logo` の E2E が使う偽
-/// `dtvindex` の出力元として使う。
+/// 出力そのもの、ヘッダ + 全599フレーム）の絶対パスを返す。`analyze --logo`
+/// の E2E が使う偽 `dtvindex` の出力元として使う。
+///
+/// **レビュー指摘で判明: 以前は先頭40フレームの抜粋（キーフレーム1枚のみ）
+/// だった**。`tests/data/sample.dtvi`（パーサのフォーマット理解を検証するだけ
+/// の用途で抜粋で足りる）とは異なり、このファイルはロゴ検出（`detect_logo`）
+/// のE2Eが実際にフレーム数・キーフレーム数の一致検査を通す必要があるため、
+/// 抜粋では階層化方式（issue #154）のGOP構造やフレーム数検査を意味のある形で
+/// 検証できなかった（キーフレーム1枚しか無いと精緻化GOPの選定が自明になり、
+/// 検査対象のロジックを素通りしてしまう）。`bash tests/fixtures/gen.sh` で
+/// `sample_logo.mp4` を作った上で `dtvindex build` を実行すれば同じ内容を
+/// 再生成できる。
 #[allow(dead_code)]
 pub fn logo_dtvi_path() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/sample_logo.dtvi")
+}
+
+/// `tests/data/sample_no_logo.dtvi`（`sample.mp4` に対する実 `dtvindex build`
+/// 出力そのもの、ヘッダ + 全599フレーム）の絶対パスを返す。
+///
+/// **レビュー指摘で追加**: `analyze --logo` の E2E がロゴを含まない
+/// `sample.mp4` に対して検出のフォールバック（閾値未満）を確認するテスト
+/// （`tests/analyze_logo_e2e.rs`）専用。当初は `sample.mp4` に対しても
+/// `tests/data/sample.dtvi`（40フレームの抜粋、他の多くのテストが共有する
+/// ため変更しない）や `sample_logo.dtvi`（別ファイル）の使い回しを試したが、
+/// いずれも階層化方式（issue #154）のフレーム数検査で失敗した。`sample.dtvi`
+/// はフレーム表が抜粋のため（`.dtvi` ヘッダの `frame_count` と食い違う）、
+/// `sample_logo.dtvi` は `sample.mp4` とは別ファイルのため（**実測で判明**:
+/// `width`/`height`/`frame_rate`/総フレーム数/キーフレームの表示順
+/// frame_number は完全に一致するにもかかわらず、ffmpeg の `-ss` シークが
+/// ファイルごとに微妙に異なる着地をすることがあり、末尾GOPの部分デコードで
+/// 実際に読めた枚数が2フレームずれた。着地オラクル（`corr` の比較）はこの
+/// 矩形の画素が全編にわたって不変だったため検出できず、blocker3で追加した
+/// 「メディア側の真値」検査（読めた枚数の期待値との一致）でのみ検出できた）。
+/// そのため `sample.mp4` 専用の完全な `.dtvi` をこのファイルとして別に持つ。
+/// `bash tests/fixtures/gen.sh` で `sample.mp4` を作った上で `dtvindex build`
+/// を実行すれば同じ内容を再生成できる。
+#[allow(dead_code)]
+pub fn no_logo_dtvi_path() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/sample_no_logo.dtvi")
 }
 
 /// 指定したフィクスチャが存在しない場合に true を返す。

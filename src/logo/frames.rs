@@ -123,16 +123,31 @@
 //! 捨てられ、**次のフレームから出力が始まる**。実測でフレーム360/4200/54000の
 //! いずれでも「`+0.5`フレーム版の出力」と「対象フレームの1つ後（`+1`）」が
 //! ビット単位で完全一致した（つまりズレは1フレーム分の系統的なオフセットで、
-//! ランダムな丸め誤差ではない）。詳細と修正は
-//! [`crate::logo::hier::seek_seconds_for_frame`] の doc comment参照
-//! （対象キーフレームの pts の**手前**を指定するよう修正した）。
+//! ランダムな丸め誤差ではない）。
+//!
+//! ### 実録画で見つかった罠3: pts は0始まりとは限らない
+//!
+//! 罠2の修正直後は `seek_seconds` を「対象フレーム番号 / fps」の式で近似して
+//! いた（対象キーフレームの pts の**手前**を指定する設計自体は正しい）。
+//! 実録画（`start_time` ヘッダが0の素材）ではこの近似で問題無かったが、
+//! レビューで追加した E2E フィクスチャ（`tests/fixtures/sample.mp4`、
+//! `start_time` ヘッダが2002）で破綻した: 実際の pts は
+//! `frame_number * 1001 + 2002` で、式による近似はこのオフセットを無視して
+//! 2フレーム早い時刻を指定してしまい、末尾GOPの部分デコードで実際に読めた
+//! 枚数が期待値と2フレームずれた（issue #154 レビュー指摘）。
+//!
+//! 修正と詳細は [`crate::logo::hier::seek_seconds_for_pts`] の doc comment
+//! 参照（式による近似ではなく `.dtvi` のフレーム表に記録された実測 pts を
+//! そのまま使うよう修正した）。
 //!
 //! 修正後は着地オラクル（`src/analyze.rs::verify_landing_oracle`）が
-//! **完全一致（`==`）**で検査でき、実際に完全一致することを確認済み（罠1の
-//! ような crop 経路依存の丸めは、両段とも `-vf crop` を経由させている限り
-//! ここでは発生しない）。この罠も合成フィクスチャでは再現しない（GOP が短い
-//! 合成フィクスチャでは1フレームのオフセットが表面化しにくく、実録画で初めて
-//! 発覚した）。
+//! **完全一致（`==`）**で検査でき、実録画3本＋`sample.mp4`/`sample_logo.mp4`
+//! いずれでも実際に完全一致することを確認済み（罠1のような crop 経路依存の
+//! 丸めは、両段とも `-vf crop` を経由させている限りここでは発生しない）。
+//! 罠2・罠3はいずれも合成フィクスチャでは当初再現しなかった（罠2はGOPが短い
+//! 合成フィクスチャでは1フレームのオフセットが表面化しにくく実録画で初めて
+//! 発覚、罠3は`start_time`ヘッダが0の実録画では近似がたまたま正しい値になり、
+//! `start_time`が非0のE2Eフィクスチャで初めて発覚した）。
 
 use std::io::{ErrorKind, Read};
 use std::path::Path;
@@ -380,10 +395,12 @@ pub fn stream_keyframe_luma_frames(
 /// - `-skip_frame nokey`: [`stream_keyframe_luma_frames`] と同じ、`-i` より前
 ///   （デコーダ側の入力オプション）。
 ///
-/// 戻り値は実際に読めたキーフレーム数。呼び出し側が `.dtvi` のキーフレーム数
-/// との一致を検査する（[`stream_keyframe_luma_frames`] と違い、この関数自身は
-/// 0枚チェックも一致検査も行わない。検出経路の呼び出し側 `detect_logo_scores_hier`
-/// が一致検査を必ず行うため、ここで重複させない）。
+/// 戻り値は実際に読めたキーフレーム数。内部で使う [`read_keyframe_frames`]
+/// が0枚を検出したらエラーにするが、`.dtvi` のキーフレーム数との**一致**検査は
+/// この関数自身は行わない（レビュー指摘: 以前のdoc commentは「0枚チェックも
+/// 一致検査も行わない」と書いていたが誤り。0枚チェックは `read_keyframe_frames`
+/// が行っている）。検出経路の呼び出し側 `detect_logo_scores_hier` が一致検査を
+/// 必ず行うため、ここで重複させない。
 pub fn stream_keyframe_cropped_luma_frames(
     ffmpeg: &Path,
     input: &Path,
@@ -433,12 +450,13 @@ pub fn stream_keyframe_cropped_luma_frames(
 ///
 /// - `rect`/`video_size`: [`stream_luma_frames`] と同じ（クロップ座標・矩形の
 ///   範囲外検査）。
-/// - `seek_seconds`: 呼び出し側が
-///   `(対象キーフレームの表示順フレーム番号 + 0.5) / fps` で計算した値を渡す
-///   （mp4 の入力シークは指定時刻**以下**の直近同期サンプルに着地するため、
-///   フレーム境界そのものだと浮動小数点誤差で1フレーム前に着地しうる。
-///   `+0.5` フレーム分ずらすことで境界の内側に確実に入れる。
-///   `src/logo/hier.rs::seek_seconds_for_frame` が計算する）。
+/// - `seek_seconds`: 呼び出し側が対象キーフレームの**実測 pts**（`.dtvi` の
+///   フレーム表の値、`frame_number / fps` のような式による近似ではない）から
+///   `hier::seek_seconds_for_pts` で計算した値を渡す。mp4 の入力シークは
+///   指定時刻**以下**の直近同期サンプルに着地するのではなく、ffmpeg の既定の
+///   フレーム精度シークにより「pts < 指定時刻」のフレームが捨てられる
+///   （モジュール doc comment「実録画で見つかった罠2」参照）ため、対象
+///   キーフレームの pts の**わずかに手前**を指定する必要がある。
 /// - `frame_count`: `.dtvi` のキーフレーム番号の差分（次の境界までの距離）から
 ///   呼び出し側が算出する。読めたフレーム数がこれと一致しなければエラーにする
 ///   （[`stream_luma_frames`] と同じ流儀、`-frames:v` で出力側にも制限を掛けるが
@@ -449,7 +467,7 @@ pub fn stream_keyframe_cropped_luma_frames(
 /// （`detect_logo_scores_hier`）が、返った先頭フレームの corr と第1段
 /// （キーフレーム走査）で得た同じキーフレームの corr が完全一致することを
 /// 確認する（CLAUDE.md 罠3の一般形、着地オラクル）。`seek_seconds` の計算を
-/// 誤ると（モジュール doc comment「実録画で見つかった罠2」参照）着地が1フレーム
+/// 誤ると（モジュール doc comment「実録画で見つかった罠2」「罠3」参照）着地が
 /// ずれ、この検査で必ず捕まる。
 #[allow(clippy::too_many_arguments)]
 pub fn decode_frame_range_luma_frames(
@@ -500,6 +518,66 @@ pub fn decode_frame_range_luma_frames(
 
     let mut child = external::spawn_streaming(ffmpeg, &args, cwd)?;
     let read_result = read_frames(child.stdout(), rect.frame_bytes(), frame_count, on_frame);
+    finish_stream(child, read_result)
+}
+
+/// 末尾GOPの部分デコード専用（issue #154 レビュー指摘）。`-frames:v` を付けず
+/// EOFまで読み、実際に読めたフレーム数を返す。
+///
+/// [`decode_frame_range_luma_frames`] は呼び出し側が渡す `frame_count` との
+/// 一致を検査するが、末尾GOPの `frame_count` は `.dtvi` ヘッダの `frame_count`
+/// （信用してよいとは限らない値。issue #154「罠」・CLAUDE.md 罠3の一般形）から
+/// 算出するため、そのヘッダが実際のメディアより小さい値を主張していても
+/// 「指定した枚数だけ読めれば成功」という判定を素通りしてしまう。この関数は
+/// 枚数を指定せず実際にメディアの終端まで読むため、戻り値を呼び出し側が
+/// `.dtvi` から算出した期待値と比較すれば、**メディア側の実際の値**との
+/// 食い違いを検出できる（`detect_logo_scores_hier` 参照）。
+///
+/// 内部の読み取りは [`read_keyframe_frames`] を再利用する（名前は
+/// キーフレーム走査用だが、実装は「EOFまで読み、1バイトも読めなければ
+/// エラーにする」だけで枚数の期待値を取らない。この関数の用途にも合致する）。
+pub fn decode_from_seek_until_eof_luma_frames(
+    ffmpeg: &Path,
+    input: &Path,
+    cwd: &Path,
+    rect: LogoRect,
+    video_size: VideoSize,
+    seek_seconds: f64,
+    on_frame: impl FnMut(&[u8]) -> anyhow::Result<()>,
+) -> anyhow::Result<u64> {
+    rect.validate(video_size.width, video_size.height)?;
+
+    let absolute_input =
+        std::fs::canonicalize(input).path_ctx("入力ファイルの絶対パス解決", input)?;
+    let filter = format!("crop={}:{}:{}:{}", rect.w, rect.h, rect.x, rect.y);
+    let input_arg = absolute_input.as_os_str();
+    let seek_arg = format!("{seek_seconds}");
+
+    let args: Vec<&std::ffi::OsStr> = vec![
+        std::ffi::OsStr::new("-hide_banner"),
+        std::ffi::OsStr::new("-loglevel"),
+        std::ffi::OsStr::new("error"),
+        std::ffi::OsStr::new("-ss"),
+        std::ffi::OsStr::new(&seek_arg),
+        std::ffi::OsStr::new("-i"),
+        input_arg,
+        std::ffi::OsStr::new("-map"),
+        std::ffi::OsStr::new("0:v:0"),
+        std::ffi::OsStr::new("-an"),
+        std::ffi::OsStr::new("-sn"),
+        std::ffi::OsStr::new("-vf"),
+        std::ffi::OsStr::new(&filter),
+        std::ffi::OsStr::new("-pix_fmt"),
+        std::ffi::OsStr::new("gray"),
+        std::ffi::OsStr::new("-fps_mode"),
+        std::ffi::OsStr::new("passthrough"),
+        std::ffi::OsStr::new("-f"),
+        std::ffi::OsStr::new("rawvideo"),
+        std::ffi::OsStr::new("-"),
+    ];
+
+    let mut child = external::spawn_streaming(ffmpeg, &args, cwd)?;
+    let read_result = read_keyframe_frames(child.stdout(), rect.frame_bytes(), on_frame);
     finish_stream(child, read_result)
 }
 
