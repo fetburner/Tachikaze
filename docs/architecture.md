@@ -60,7 +60,7 @@ tachikaze analyze IN.mp4 [-o trim.avs|-] [--report] [--cache-dir DIR]
 - `-inlogo` を渡さないときは、キャッシュに残る古い logoframe.txt を削除する
 - `.dtvi` の `frame_count` と読み取ったフレーム数が食い違う場合は手順3を実行せず中断する（CLAUDE.md 罠3。この検査は省略不可）
 
-**`--logo`/`--no-logo` を両方省略したときの自動推定（既定、E18-5・#135）。** `--logo` を明示したとき・`--no-logo` を指定したときは上記のとおり（`join_logo_scp` は1回だけ）。それ以外（既定）は次の直列ループで決める（`src/analyze.rs::run_auto_logo_detection`）:
+**`--logo`/`--no-logo` を両方省略したときの自動推定（既定）。** `--logo` を明示したとき・`--no-logo` を指定したときは上記のとおり（`join_logo_scp` は1回だけ）。それ以外（既定）は次の直列ループで決める（`src/analyze.rs::run_auto_logo_detection`）:
 
 1. まず `join_logo_scp` を `-inlogo` 無しで1回走らせ、「ロゴ無しの結果」として保持する
 2. ロゴ辞書（既定 `$XDG_DATA_HOME/tachikaze/logos`、`--logo-dir` で上書き）を見る。対象解像度と一致する候補があれば、学習をスキップしてそのまま検出を試す（`src/logo/dict.rs::select_candidate`）。検出に成功すればここで確定し、下記3・4は実行しない
@@ -287,7 +287,7 @@ $ ffmpeg -i IN.mp4 -c copy -use_editlist 0 -movflags +faststart OUT.mp4
 
 ### ロゴ矩形推定・AUC 採用のパラメータは4局からの較正
 
-既知の限界として残す（このエピック E18 では直さない）。閾値ラダー・サイズ上限・AUC 採用閾値 0.9・CM 標本ガード 20 枚は、実ファイル5本＋追検証4本のいずれも同じ4局（BS日テレ / TOKYO MX / フジテレビ / テレビ朝日）から決めた値である（[measurements.md](measurements.md)「ロゴ矩形の自動推定」）。局が増えれば見直しが必要になる可能性がある。
+既知の限界として残す。閾値ラダー・サイズ上限・AUC 採用閾値 0.9・CM 標本ガード 20 枚は、実ファイル5本＋追検証4本のいずれも同じ4局（BS日テレ / TOKYO MX / フジテレビ / テレビ朝日）から決めた値である（[measurements.md](measurements.md)「ロゴ矩形の自動推定」）。局が増えれば見直しが必要になる可能性がある。
 
 ### 相関方式の検出限界と、AUC 採用が誤ったロゴでも trim を改善しうること
 
