@@ -299,6 +299,18 @@ TOKYO MX の ED 区間（90秒）は、ロゴ自体は出ているのに段差�
 
 `src/report/missed.rs` は `.jls` のラベルを見ず、ギャップ長の一致だけで判定するため、ロゴの有無でロジックは変わらない。実測2本（BS11・TOKYO MX2、[jls-settings.md](jls-settings.md)「ロゴありでの見逃し警告」）ではロゴあり/なしで見逃し候補の件数に変化が無かった（どちらも0件）。ただし検出済み CM ブロック長が揃わない番組でロゴありを試した実測が無いため、一般に誤警告が増えないとは言えない。加えて MX2 は元々このヒューリスティックが発火しない構成だった。`find_missed_candidates` は保持区間内部の `.jls` エントリと長さを突き合わせる実装のため、見逃しブロックが単一の長い `:L` エントリの内側にあると検出対象にならない。「両方0件」という結果は、ロゴの有無というより検出条件自体が MX2 では成立していなかった可能性がある。
 
+### ロゴ検出の階層化方式の収束判定・性能足切りは経験的な閾値である
+
+`detect_logo_scores_hier`（issue #154）の不動点化の収束判定
+（`REQUIRED_STABLE_ROUNDS`）は、実測に基づく経験的な閾値である。性能足切り
+（`HIER_FALLBACK_GOP_FRACTION_THRESHOLD`）も同様に経験的な閾値である。
+数学的な収束証明は無い。前者は実測で観測した「偽の安定」（2ラウンド）に
+安全側の余裕を持たせた値である。後者は乙女ゲー・ぼっちの実測から選んだ値
+である。将来別の入力でこれらの前提が崩れる例が見つかった場合は、値の見直し
+か、より保守的な方式（例: 常に全編フルデコード）への切り替えを検討する。
+詳細は `src/analyze.rs` の `REQUIRED_STABLE_ROUNDS`/
+`HIER_FALLBACK_GOP_FRACTION_THRESHOLD` の doc comment、自己検証12参照。
+
 ## 方針として作らないもの
 
 | 項目 | 理由 |
@@ -386,8 +398,8 @@ struct DecodeIdx(u32);    // デコード順（mp4 のサンプル番号 / .dtvi
 6. 音声の丸め誤差の最大値をログ出力（`AudioDiffInfo` 相当）
 7. `--verify` 指定時は ffprobe のパケット単位 CRC32 で元ファイルとの一致を確認（[lossless-cut.md](lossless-cut.md)）
 8. `--cm-output` 指定時は保持側と CM 側でフレーム数の合計 == 総フレーム数、`DecodeIdx` の集合が互いに素
-9. `analyze --logo` 指定時: ffmpeg から読み取ったロゴ矩形のフレーム数が `.dtvi` の `frame_count` と一致するか（不一致なら明示エラーで停止）。検査の実体は `src/logo/frames.rs::stream_luma_frames`。ロゴ検出は `cut` とは別の ffmpeg 供給経路を使うため、上記 4 とは別に必要な検査
-10. **自動推定（`--logo`/`--no-logo` 両方省略）でも罠3の防御は緩んでいない**。候補の推定（`logo/estimate.rs::estimate_candidates`）は `stream_keyframe_luma_frames` を使う。ロゴ辞書候補の採点（`logo/dict.rs::select_candidate`）も同じ関数を使う。この関数は意図的にフレーム数一致検査を持たない（キーフレームだけを読むため `.dtvi` の `frame_count` とは一致しない）。候補の推定は `classify_sample` が「標本の通し番号」で `.dtvi` 由来の配列を引くため、フレーム数がずれると静かに誤ったラベルを返しうる。そのため代わりに `verify_keyframe_count_matches_dtvi`（`src/analyze.rs`）で、ffmpeg が実際に流したキーフレーム数と `.dtvi` のキーフレーム数を突き合わせる。**辞書候補の採点（`dict::select_candidate`）にはこの突き合わせが無い。** `corr0`/`corr1` の平均を取るだけで通し番号を配列の添字に使わないため、フレーム数のずれが起きても「候補を1つ見送る」以上の実害が無い。**候補が決まった後の学習（`scan::run`）と検出（`detect_logo`）は、明示 `--logo` 指定時と同じ `stream_luma_frames` を通る**ため、上記9の検査を必ず経由する。推定用の供給関数が検出経路から直接呼ばれることはない。
+9. `analyze --logo` 指定時: ffmpeg から読み取ったロゴ矩形のフレーム数が `.dtvi` の `frame_count` と一致するかを検査する（不一致なら明示エラーで停止）。既定の検出経路（`detect_logo_scores_hier`、下記12）はこの検査を `stream_luma_frames` 単体ではなく12(a)〜(f)の複数検査で行う。`stream_luma_frames` を直接経由するのは、12(f)の性能フォールバックが発動して全編フルデコードへ切り替わった場合に限る。ロゴ検出は `cut` とは別の ffmpeg 供給経路を使うため、上記4とは別に必要な検査である
+10. **自動推定（`--logo`/`--no-logo` 両方省略）でも罠3の防御は緩んでいない**。候補の推定（`logo/estimate.rs::estimate_candidates`）は `stream_keyframe_luma_frames` を使う。ロゴ辞書候補の採点（`logo/dict.rs::select_candidate`）も同じ関数を使う。この関数は意図的にフレーム数一致検査を持たない（キーフレームだけを読むため `.dtvi` の `frame_count` とは一致しない）。候補の推定は `classify_sample` が「標本の通し番号」で `.dtvi` 由来の配列を引くため、フレーム数がずれると静かに誤ったラベルを返しうる。そのため代わりに `verify_keyframe_count_matches_dtvi`（`src/analyze.rs`）で、ffmpeg が実際に流したキーフレーム数と `.dtvi` のキーフレーム数を突き合わせる。**辞書候補の採点（`dict::select_candidate`）にはこの突き合わせが無い。** `corr0`/`corr1` の平均を取るだけで通し番号を配列の添字に使わないため、フレーム数のずれが起きても「候補を1つ見送る」以上の実害が無い。候補が決まった後の学習（`scan::run`、`train_and_detect_candidate` 経由）は、明示 `--logo` 指定時と同じ `stream_luma_frames` を通るため、上記9の検査を必ず経由する。検出（`detect_logo`）は既定では上記9の注記どおり `detect_logo_scores_hier`（下記12）を通り、`stream_luma_frames` を直接経由するのは12(f)のフォールバック時だけである。推定用の供給関数が検出経路から直接呼ばれることはない。
 11. **`detect_logo` の corr スコア列キャッシュもフレーム数一致検査を持つ**。`read_score_cache`（`src/analyze.rs`）は要素数不一致（`.dtvi` の `frame_count` = `expected_frame_count` と食い違う）やファイルサイズの破損を検知したら `None` を返す。呼び出し側はその場合、検査済みの `stream_luma_frames` によるフルデコードへ落ちる。
 
     キーは `.lgd` のバイト列 + `expected_frame_count` + `.dtvi` ヘッダの `source_size`/`source_mtime_ns`/`source_fingerprint`（入力ファイルの実体を識別する値）から作る。ロゴが変わる（再学習・別ロゴ）だけでなく、**同じパスに別内容の録画ファイルが上書きされた場合**もキャッシュは自動的に当たらなくなる。レビュー指摘・実測: 当初は `.lgd` + フレーム数だけだったため、上書き後も古いロゴ区間の logoframe を誤って書く実害があった。
