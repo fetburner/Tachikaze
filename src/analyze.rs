@@ -692,6 +692,7 @@ fn run_auto_logo_detection(
 }
 
 /// [`train_and_detect_candidate`] の結果。
+#[derive(Debug)]
 enum CandidateOutcome {
     /// 学習（[`scan::FrameLearner::finish`]）が失敗した。理由の文言を保持し、
     /// 呼び出し側で従来経路と同じ形式のメッセージを出す。
@@ -756,6 +757,21 @@ fn train_and_detect_candidate(
     rect: LogoRect,
     attempt: usize,
 ) -> Result<CandidateOutcome> {
+    // レビュー指摘（nit）: `scan::run`/`scan::finish_learner` と同じ検査を
+    // デコード前に行う。この検査を省くと、奇数矩形を渡した場合に全編フル
+    // デコード（実測30分1080pで約19秒）を終えてから `finish_learner` 内の
+    // `ensure!` で初めて失敗する（無駄なデコードコストを払ってから落ちる）。
+    // `estimate_candidates` は常に `round_rect_to_even` で丸めた矩形しか
+    // 返さないため通常は発生しないが、他の呼び出し元が丸め忘れた場合の
+    // 安全策として、デコードを始める前に検査する。
+    anyhow::ensure!(
+        rect.w.is_multiple_of(2) && rect.h.is_multiple_of(2),
+        "ロゴ矩形の w/h は2の倍数である必要があります（クロマの間引きに合わせるため、\
+         round_rect_to_even で丸めてから渡すこと）: w={}, h={}",
+        rect.w,
+        rect.h
+    );
+
     let frame_bytes = u64::from(rect.w) * u64::from(rect.h);
     let estimated_bytes = frame_bytes.saturating_mul(u64::from(total_frames));
 
@@ -788,7 +804,17 @@ fn train_and_detect_candidate(
     // ここで呼ぶ `stream_luma_frames` の引数（`rect`/`video_size`/フレーム数）は
     // `scan::run` が組み立てる `MakeLogoConfig` と完全に同一。同じ ffmpeg
     // コマンドラインを1回だけ実行し、その出力を学習と検出の両方に使う。
-    frames::stream_luma_frames(
+    //
+    // レビュー指摘（nit）: このデコードのエラー（フレーム数不一致・ffmpeg起動
+    // 失敗等）は [`train_and_detect_candidate_two_pass`] が `scan::run` の
+    // 失敗を扱う流儀と揃え、`TrainingFailed` として次候補へ進む（ハード
+    // アボートしない）。両経路とも `scan::run`/`stream_luma_frames` という
+    // 同じ関数を呼ぶため、失敗の扱いだけ経路によって変えると「候補の学習に
+    // 失敗したら次候補へ進む」という直列ループの前提（issue #135「罠」）が
+    // 経路依存になってしまう。全候補が同じ入力を同じ方法でデコードするため、
+    // 実際に頻発するフレーム数不一致（環境要因）が起きれば以降の候補も同様に
+    // 失敗し、`run_auto_logo_detection` は結局「ロゴ無し」へ収束する。
+    if let Err(err) = frames::stream_luma_frames(
         ffmpeg_path,
         work_mp4,
         cwd,
@@ -800,7 +826,9 @@ fn train_and_detect_candidate(
             playback.extend_from_slice(frame);
             Ok(())
         },
-    )?;
+    ) {
+        return Ok(CandidateOutcome::TrainingFailed(format!("{err}")));
+    }
 
     let scan_output = match scan::finish_learner(
         &learner,
@@ -2422,6 +2450,81 @@ mod tests {
                 "フレーム{i}: 再生バッファから読み戻した内容が元のフレームと食い違っている"
             );
         }
+    }
+
+    #[test]
+    fn train_and_detect_candidate_rejects_odd_rect_before_decoding() {
+        // レビュー指摘（nit）: 奇数矩形は全編デコードを始める前に拒否する。
+        // ffmpeg を実際に起動しないことを、存在しないパスを渡しても
+        // すぐにエラーになる（ハングもタイムアウトもしない）ことで確認する。
+        let dtvi = dtvi_with_header(&[]);
+        let odd_rect = LogoRect {
+            x: 0,
+            y: 0,
+            w: 3,
+            h: 4,
+        };
+        let dir = unique_scratch_dir("train-detect-odd-rect");
+        let result = train_and_detect_candidate(
+            Path::new("/nonexistent/ffmpeg"),
+            Path::new("/nonexistent/input.mp4"),
+            &dir,
+            &dtvi,
+            VideoSize {
+                width: 100,
+                height: 100,
+            },
+            10,
+            &dir.join("logoframe.txt"),
+            Path::new("input"),
+            odd_rect,
+            1,
+        );
+        let err = result.expect_err("奇数矩形はエラーになるはず");
+        assert!(
+            format!("{err}").contains("2の倍数"),
+            "奇数矩形のエラーメッセージが期待と違う: {err}"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn train_and_detect_candidate_converts_decode_failure_to_training_failed() {
+        // レビュー指摘（nit）: 共有デコード経路のデコード失敗（ここでは存在
+        // しない入力による canonicalize 失敗で再現）は、two_pass 経路の
+        // `scan::run` 失敗時と同じく `Ok(CandidateOutcome::TrainingFailed)`
+        // に変換され、`Err`（直列ループのハードアボート）にはならない。
+        let dtvi = dtvi_with_header(&[]);
+        let even_rect = LogoRect {
+            x: 0,
+            y: 0,
+            w: 4,
+            h: 4,
+        };
+        let dir = unique_scratch_dir("train-detect-decode-failure");
+        let result = train_and_detect_candidate(
+            Path::new("/nonexistent/ffmpeg"),
+            Path::new("/nonexistent/input.mp4"),
+            &dir,
+            &dtvi,
+            VideoSize {
+                width: 100,
+                height: 100,
+            },
+            10,
+            &dir.join("logoframe.txt"),
+            Path::new("input"),
+            even_rect,
+            1,
+        );
+        match result {
+            Ok(CandidateOutcome::TrainingFailed(_)) => {}
+            other => panic!(
+                "デコード失敗は Ok(TrainingFailed) になるはず（two_pass 経路と\
+                 同じ扱い）: {other:?}"
+            ),
+        }
+        fs::remove_dir_all(&dir).ok();
     }
 
     // --- clear_stale_logoframe: フォールバック時の残骸削除 ---
