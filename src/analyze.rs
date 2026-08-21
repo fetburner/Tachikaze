@@ -649,50 +649,27 @@ fn run_auto_logo_detection(
             candidate.max_effect,
         );
 
-        let scan_config = scan::MakeLogoConfig {
-            ffmpeg: ffmpeg_path.to_path_buf(),
-            input: work_mp4.to_path_buf(),
-            cwd: cwd.to_path_buf(),
-            rect: candidate.estimated_rect,
-            video_size,
-            frame_count: u64::from(total_frames),
-            threshold: scan::DEFAULT_THRESHOLD,
-            name: auto_logo_name(naming_source),
-            service_id: scan::UNSPECIFIED_SERVICE_ID,
-        };
-
-        // 学習失敗（回帰係数 NaN 等）は「使えない候補」を弾く安全弁であり、
-        // 直列ループの前提（issue #135「罠」）。エラーにせず次候補へ進む。
-        let scan_output = match scan::run(&scan_config) {
-            Ok(output) => output,
-            Err(err) => {
-                eprintln!("[analyze] 候補{attempt}: 学習に失敗したため次候補へ進みます: {err}");
-                continue;
-            }
-        };
-
-        // 学習した候補を一旦キャッシュ内に `.lgd` として書き、既存の
-        // `detect_logo`（変更なし）にそのまま渡す。
-        let candidate_lgd_path = cwd.join(format!("logo-candidate-{attempt}.lgd"));
-        scan::write_lgd(&scan_output.logo, &candidate_lgd_path)?;
-
-        let detect_result = detect_logo(
+        match train_and_detect_candidate(
             ffmpeg_path,
-            &candidate_lgd_path,
             work_mp4,
             cwd,
             dtvi,
+            video_size,
+            total_frames,
             logoframe_path,
-        )?;
-        // 作業ディレクトリに書いた候補の `.lgd` は使い終わったら消す
-        // （レビュー指摘: 失敗した候補ぶんが残ると紛らわしい。成功した場合も
-        // `dict::save` が辞書側に別途保存するため、この一時ファイルは不要）。
-        remove_scratch_candidate_lgd(&candidate_lgd_path);
-
-        match detect_result {
-            Some(inlogo) => {
+            naming_source,
+            candidate.estimated_rect,
+            attempt,
+        )? {
+            CandidateOutcome::TrainingFailed(err) => {
+                eprintln!("[analyze] 候補{attempt}: 学習に失敗したため次候補へ進みます: {err}");
+            }
+            CandidateOutcome::DetectionFailed => {
+                eprintln!("[analyze] 候補{attempt}: 検出に失敗したため次候補へ進みます。");
+            }
+            CandidateOutcome::Success { inlogo, logo } => {
                 eprintln!("[analyze] 候補{attempt}: 検出に成功しました。ロゴ辞書へ保存します。");
-                match dict::save(dict_dir, &scan_output.logo, naming_source) {
+                match dict::save(dict_dir, &logo, naming_source) {
                     Ok(saved_path) => {
                         eprintln!("[analyze] ロゴ辞書へ保存しました: {}", saved_path.display());
                     }
@@ -704,9 +681,6 @@ fn run_auto_logo_detection(
                 }
                 return Ok(Some(inlogo));
             }
-            None => {
-                eprintln!("[analyze] 候補{attempt}: 検出に失敗したため次候補へ進みます。");
-            }
         }
     }
 
@@ -715,6 +689,221 @@ fn run_auto_logo_detection(
          （1回目の join_logo_scp の結果をそのまま使います）。"
     );
     Ok(None)
+}
+
+/// [`train_and_detect_candidate`] の結果。
+enum CandidateOutcome {
+    /// 学習（[`scan::FrameLearner::finish`]）が失敗した。理由の文言を保持し、
+    /// 呼び出し側で従来経路と同じ形式のメッセージを出す。
+    TrainingFailed(String),
+    /// 検出（[`decide_inlogo_from_scores`]）が閾値未達等で失敗した。
+    DetectionFailed,
+    /// 検出に成功した。`.lgd` として保存すべき [`LogoData`] を含む。
+    /// `LogoData` は係数配列を持つため他バリアントよりずっと大きく、`Box` で
+    /// 間接化して `enum` 全体のサイズを抑える（clippy::large_enum_variant）。
+    Success {
+        inlogo: PathBuf,
+        logo: Box<LogoData>,
+    },
+}
+
+/// 候補1件あたりの再生バッファ（[`train_and_detect_candidate`] が学習用デコードの
+/// 出力を検出にも再利用するために保持するバイト列）の上限。矩形面積×フレーム数の
+/// 推定サイズがこれを超える場合は、再生バッファを作らず
+/// [`train_and_detect_candidate_two_pass`]（学習→検出を別デコードで行う従来経路）
+/// にフォールバックする（issue #153「やること 4」）。
+///
+/// 実測30分1080p・典型的なロゴ矩形で約200MB（issue #153「PoC実測」）。候補は
+/// [`run_auto_logo_detection`] が1件ずつ順に処理するため同時に保持するのは1本
+/// だけだが、矩形推定が大きめの矩形を返した場合や映像が長い場合に無制限に
+/// 膨らむと困る。典型値の約2.5倍（1GiB）を上限とし、これを超える組み合わせは
+/// 稀（大きな矩形または長時間の映像）と判断し、正しさを優先して2回デコードに
+/// 逃げる。
+const SHARED_DECODE_PLAYBACK_LIMIT_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// 候補1件あたりの学習+検出を、可能なら1回のデコードで済ませる（issue #153
+/// 「解くべき問題」）。
+///
+/// # 罠: ffmpeg の gray 変換は `-vf` フィルタの通り方で画素値が1〜3ずれる
+///
+/// 実データで検証した結果、ffmpeg の `-pix_fmt gray` 変換は「輝度平面をそのまま
+/// コピーする」処理ではなく、直前に `-vf crop=w:h:x:y` を経由するかどうか・
+/// 経由する場合のオフセットによって、同じ元画素に対し異なる出力バイト値を
+/// 返す（libswscale の経路依存の丸め、issue #153「罠」）。「全画面を1回デコード
+/// してRustで複数候補を切り出す」設計は、この罠でクロップのオフセットに応じた
+/// ±1〜3階調のずれが生じ、実際に暴れん坊将軍の候補3で検出割合が0.715→0.001に
+/// 崩壊して採用ロゴが変わることを確認済みのため棄却した。本関数は代わりに
+/// **同一のクロップ位置（同一の `-vf crop` 呼び出し）に対して1回だけ ffmpeg を
+/// 起動し、その出力を学習と検出の両方に再利用する**方式を採る。呼ばれる ffmpeg
+/// のコマンドライン・矩形・`-pix_fmt gray` は従来の `scan::run`/`detect_logo` と
+/// 完全に同一なので、得られる画素列は従来経路とバイト単位で同一になる（decode が
+/// 決定的——同じファイル・同じコマンドラインなら常に同じバイト列を返す——という、
+/// はるかに弱く安全な前提にしか依存しない）。
+///
+/// 再生バッファの推定サイズが [`SHARED_DECODE_PLAYBACK_LIMIT_BYTES`] を超える
+/// 場合は、上記の共有を諦めて [`train_and_detect_candidate_two_pass`]（従来どおり
+/// 学習と検出をそれぞれ別デコードで行う経路）にフォールバックする。
+#[allow(clippy::too_many_arguments)]
+fn train_and_detect_candidate(
+    ffmpeg_path: &Path,
+    work_mp4: &Path,
+    cwd: &Path,
+    dtvi: &Dtvi,
+    video_size: VideoSize,
+    total_frames: u32,
+    logoframe_path: &Path,
+    naming_source: &Path,
+    rect: LogoRect,
+    attempt: usize,
+) -> Result<CandidateOutcome> {
+    let frame_bytes = u64::from(rect.w) * u64::from(rect.h);
+    let estimated_bytes = frame_bytes.saturating_mul(u64::from(total_frames));
+
+    if estimated_bytes > SHARED_DECODE_PLAYBACK_LIMIT_BYTES {
+        eprintln!(
+            "[analyze] 候補{attempt}: 再生バッファの推定サイズ（{estimated_bytes}バイト）が\
+             上限（{SHARED_DECODE_PLAYBACK_LIMIT_BYTES}バイト）を超えるため、学習と検出を\
+             それぞれ別デコードで行います。"
+        );
+        return train_and_detect_candidate_two_pass(
+            ffmpeg_path,
+            work_mp4,
+            cwd,
+            dtvi,
+            video_size,
+            total_frames,
+            logoframe_path,
+            naming_source,
+            rect,
+            attempt,
+        );
+    }
+
+    let frame_bytes_usize = frame_bytes as usize;
+    let mut learner = scan::FrameLearner::new(rect.w, rect.h, scan::DEFAULT_THRESHOLD);
+    // 再生バッファ: 候補の矩形（`frame_bytes` バイト）分のフレームをフレーム順に
+    // 連結して保持する（検出時に `chunks_exact` で1枚ずつ戻す）。
+    let mut playback = Vec::with_capacity(estimated_bytes as usize);
+
+    // ここで呼ぶ `stream_luma_frames` の引数（`rect`/`video_size`/フレーム数）は
+    // `scan::run` が組み立てる `MakeLogoConfig` と完全に同一。同じ ffmpeg
+    // コマンドラインを1回だけ実行し、その出力を学習と検出の両方に使う。
+    frames::stream_luma_frames(
+        ffmpeg_path,
+        work_mp4,
+        cwd,
+        rect,
+        video_size,
+        u64::from(total_frames),
+        |frame| {
+            learner.add_frame(frame)?;
+            playback.extend_from_slice(frame);
+            Ok(())
+        },
+    )?;
+
+    let scan_output = match scan::finish_learner(
+        &learner,
+        rect,
+        video_size,
+        auto_logo_name(naming_source),
+        scan::UNSPECIFIED_SERVICE_ID,
+    ) {
+        Ok(output) => output,
+        Err(err) => return Ok(CandidateOutcome::TrainingFailed(format!("{err}"))),
+    };
+
+    // 従来経路（`detect_logo`）と同じく、一旦 `.lgd` に書いて読み直す
+    // （`lgd::read` が返す `LogoData` から `LogoMask` を作る経路を揃えるため。
+    // f32 は `.lgd` の二進形式をロスレスに往復する、`lgd.rs` のモジュール
+    // doc comment「フォーマット」参照）。
+    let candidate_lgd_path = cwd.join(format!("logo-candidate-{attempt}.lgd"));
+    scan::write_lgd(&scan_output.logo, &candidate_lgd_path)?;
+    let logo_data = lgd::read(&candidate_lgd_path)?;
+    let mask = score::LogoMask::new(&logo_data)
+        .map_err(|err| anyhow!(".lgd からロゴマスクを構築できませんでした: {err}"))?;
+
+    let mut scores: Vec<(f32, f32)> = Vec::with_capacity(total_frames as usize);
+    for frame in playback.chunks_exact(frame_bytes_usize.max(1)) {
+        scores.push(mask.evaluate(frame));
+    }
+
+    let fps = dtvi_fps(dtvi);
+    let detect_result = decide_inlogo_from_scores(&scores, fps, logoframe_path)?;
+    // 作業ディレクトリに書いた候補の `.lgd` は使い終わったら消す（従来経路と
+    // 同じ扱い、`remove_scratch_candidate_lgd` の doc comment参照）。
+    remove_scratch_candidate_lgd(&candidate_lgd_path);
+
+    match detect_result {
+        Some(inlogo) => Ok(CandidateOutcome::Success {
+            inlogo,
+            logo: Box::new(scan_output.logo),
+        }),
+        None => Ok(CandidateOutcome::DetectionFailed),
+    }
+}
+
+/// [`train_and_detect_candidate`] のフォールバック経路: 学習（[`scan::run`]）と
+/// 検出（[`detect_logo`]、変更なし）をそれぞれ別デコードで行う、issue #153 導入
+/// 前の挙動そのもの。[`SHARED_DECODE_PLAYBACK_LIMIT_BYTES`] を超える候補、または
+/// 将来デコード共有を切り離したくなった場合の退避先として残す。
+#[allow(clippy::too_many_arguments)]
+fn train_and_detect_candidate_two_pass(
+    ffmpeg_path: &Path,
+    work_mp4: &Path,
+    cwd: &Path,
+    dtvi: &Dtvi,
+    video_size: VideoSize,
+    total_frames: u32,
+    logoframe_path: &Path,
+    naming_source: &Path,
+    rect: LogoRect,
+    attempt: usize,
+) -> Result<CandidateOutcome> {
+    let scan_config = scan::MakeLogoConfig {
+        ffmpeg: ffmpeg_path.to_path_buf(),
+        input: work_mp4.to_path_buf(),
+        cwd: cwd.to_path_buf(),
+        rect,
+        video_size,
+        frame_count: u64::from(total_frames),
+        threshold: scan::DEFAULT_THRESHOLD,
+        name: auto_logo_name(naming_source),
+        service_id: scan::UNSPECIFIED_SERVICE_ID,
+    };
+
+    // 学習失敗（回帰係数 NaN 等）は「使えない候補」を弾く安全弁であり、
+    // 直列ループの前提（issue #135「罠」）。エラーにせず次候補へ進む。
+    let scan_output = match scan::run(&scan_config) {
+        Ok(output) => output,
+        Err(err) => return Ok(CandidateOutcome::TrainingFailed(format!("{err}"))),
+    };
+
+    // 学習した候補を一旦キャッシュ内に `.lgd` として書き、既存の
+    // `detect_logo`（変更なし）にそのまま渡す。
+    let candidate_lgd_path = cwd.join(format!("logo-candidate-{attempt}.lgd"));
+    scan::write_lgd(&scan_output.logo, &candidate_lgd_path)?;
+
+    let detect_result = detect_logo(
+        ffmpeg_path,
+        &candidate_lgd_path,
+        work_mp4,
+        cwd,
+        dtvi,
+        logoframe_path,
+    )?;
+    // 作業ディレクトリに書いた候補の `.lgd` は使い終わったら消す
+    // （レビュー指摘: 失敗した候補ぶんが残ると紛らわしい。成功した場合も
+    // `dict::save` が辞書側に別途保存するため、この一時ファイルは不要）。
+    remove_scratch_candidate_lgd(&candidate_lgd_path);
+
+    match detect_result {
+        Some(inlogo) => Ok(CandidateOutcome::Success {
+            inlogo,
+            logo: Box::new(scan_output.logo),
+        }),
+        None => Ok(CandidateOutcome::DetectionFailed),
+    }
 }
 
 /// ffmpeg が実際に流したキーフレーム数と `.dtvi` 由来のキーフレーム数が一致する
@@ -891,6 +1080,11 @@ fn auto_logo_name(input: &Path) -> String {
 /// キャッシュを無視してフルパスへ落とす（CLAUDE.md 罠3の一般形）。キャッシュは
 /// 最適化であり無くても正しく動くため、書き込み失敗は警告に留めて続行する。
 ///
+/// スコア列が確定した後（キャッシュヒットでもフルデコードでも）の判定は
+/// [`decide_inlogo_from_scores`] に委譲する（issue #153「やること 2」で分離。
+/// 候補ごとの学習+検出を1回のデコードに共有する
+/// [`train_and_detect_candidate`] も同じ判定関数を使う）。
+///
 /// 検出フレーム割合が閾値（[`logo_detection_threshold`]）以上、**かつ**
 /// `LogoIntervals::text` が空でない場合にだけ logoframe テキストを
 /// `logoframe_path` に書いてそのパスを返す。
@@ -964,7 +1158,23 @@ fn detect_logo(
     }
 
     let fps = dtvi_fps(dtvi);
-    let result = logo_interval::write_result(&scores, fps);
+    decide_inlogo_from_scores(&scores, fps, logoframe_path)
+}
+
+/// [`detect_logo`] の判定部分（スコア列 → 区間 → 閾値判定 → logoframe 書き出し）
+/// だけを切り出したもの（issue #153「やること 2」）。プロセス（ffmpeg）を起動
+/// せずに検証できるだけでなく、スコア列の取得元を差し替えられるようにするため
+/// 分離した。[`train_and_detect_candidate`] は1回のデコードで作った再生バッファ
+/// から `scores` を組み立てて、ここに渡す。
+///
+/// 挙動は元の `detect_logo` の後半と完全に同一（`logo_interval::write_result` →
+/// 閾値判定 → `fs::write`/`clear_stale_logoframe`）で、1バイトも変えていない。
+fn decide_inlogo_from_scores(
+    scores: &[(f32, f32)],
+    fps: f64,
+    logoframe_path: &Path,
+) -> Result<Option<PathBuf>> {
+    let result = logo_interval::write_result(scores, fps);
 
     let fraction = if result.total_frames == 0 {
         0.0
@@ -2110,6 +2320,108 @@ mod tests {
             key_missing, key_empty,
             "ヘッダに無い場合と空文字列の場合は別キーになるはず"
         );
+    }
+
+    // --- 候補ごとの学習+検出の1回デコード共有（issue #153）: ffmpeg を起動しない
+    // 純粋ロジックの検証。
+    //
+    // 完了条件: 合成フレーム列を「従来の FrameLearner 直接供給」（学習だけを行う
+    // 単純なループ）と「1回のデコードを学習・検出の両方に再利用する経路」
+    // （`train_and_detect_candidate` の内部ループと同じ形: フレームごとに
+    // `FrameLearner::add_frame` と再生バッファへの `extend_from_slice` を同時に
+    // 行い、後で `chunks_exact` で読み戻す）の両方で処理して、学習結果
+    // （`FrameLearner::finish`）と、再生バッファから読み戻したフレーム列が
+    // 元のフレーム列とバイト単位で一致することを確認する。
+    //
+    // 「全画面1パスで複数候補に同時にクロップ供給する」設計は実データ検証
+    // （暴れん坊将軍、ぼっち・ざ・ろっく！）で ffmpeg の `-pix_fmt gray` が
+    // クロップのオフセットに応じて異なるバイト値を返すことが判明し撤回した
+    // （[`train_and_detect_candidate`] の doc comment「罠」参照）。このテストは
+    // その教訓を反映し、「同一のクロップ済みフレーム列を学習と検出の両方に
+    // **再利用**しても、学習結果も再生されるフレーム列も変化しない」ことだけを
+    // 検証する（クロップの正しさ自体は ffmpeg 側の話で Rust のユニットテストでは
+    // 検証できないため、対象にしない）。
+
+    #[test]
+    fn reused_decode_buffer_matches_direct_learner_feeding_and_replays_frames_unchanged() {
+        // 合成フレーム列: 4x2（=8バイト/フレーム）のクロップ済みフレームを
+        // 10枚作る。値がフレームごとに変化する（時間変化する信号、CLAUDE.md
+        // 「フィクスチャの音声は時間変化する信号にしてある」と同じ考え方）よう
+        // `bg(t) = 50 + 4*t` を基準に、画素位置ごとのオフセット（`i % 7`、最大6）を
+        // 足す。境界内の変動は最大6で `scan::DEFAULT_THRESHOLD`(12) を超えないため、
+        // 全フレームが学習に使える（`estimate_frame_background` の単色判定を通る）。
+        let rect = LogoRect {
+            x: 10,
+            y: 20,
+            w: 4,
+            h: 2,
+        };
+        let frame_bytes = rect.w as usize * rect.h as usize;
+        let cropped_frames: Vec<Vec<u8>> = (0..10u32)
+            .map(|t| {
+                let bg = 50 + 4 * t;
+                (0..frame_bytes as u32)
+                    .map(|i| (bg + (i % 7)) as u8)
+                    .collect()
+            })
+            .collect();
+
+        // --- 従来: 学習だけを行う単純なループ（`scan::run` が
+        //     `stream_luma_frames` からクロップ済みフレームを受け取って
+        //     `add_frame` するのと同じ形）。
+        let mut direct_learner = scan::FrameLearner::new(rect.w, rect.h, scan::DEFAULT_THRESHOLD);
+        for frame in &cropped_frames {
+            direct_learner.add_frame(frame).unwrap();
+        }
+
+        // --- 共有経路: `train_and_detect_candidate` の内部ループと同じ形
+        //     （学習と再生バッファへの追記を同時に行う）。
+        let mut shared_learner = scan::FrameLearner::new(rect.w, rect.h, scan::DEFAULT_THRESHOLD);
+        let mut playback: Vec<u8> = Vec::with_capacity(frame_bytes * cropped_frames.len());
+        for frame in &cropped_frames {
+            shared_learner.add_frame(frame).unwrap();
+            playback.extend_from_slice(frame);
+        }
+
+        // 学習結果（使用フレーム数・総フレーム数・回帰係数）が一致するはず
+        // （同じフレーム列を同じ順序で `add_frame` するだけなので、浮動小数点の
+        // 加算順序も完全に同一になる）。
+        assert_eq!(direct_learner.used_frames(), shared_learner.used_frames());
+        assert_eq!(direct_learner.total_frames(), shared_learner.total_frames());
+        match (direct_learner.finish(), shared_learner.finish()) {
+            (Ok((direct_a, direct_b)), Ok((shared_a, shared_b))) => {
+                assert_eq!(direct_a, shared_a, "a_y が共有経路と食い違っている");
+                assert_eq!(direct_b, shared_b, "b_y が共有経路と食い違っている");
+            }
+            (Err(direct_err), Err(shared_err)) => {
+                assert_eq!(
+                    format!("{direct_err}"),
+                    format!("{shared_err}"),
+                    "失敗の原因が共有経路と食い違っている"
+                );
+            }
+            other => panic!("成功/失敗が共有経路と食い違っている: {other:?}"),
+        }
+        // この合成データでは学習が成功するはず（テストデータの設計の確認）。
+        assert!(
+            shared_learner.finish().is_ok(),
+            "このテストデータでは学習が成功するはず（テストデータの設計を確認）"
+        );
+
+        // 再生バッファから `chunks_exact` で読み戻したフレーム列が、元のフレーム列と
+        // 完全に一致するはず（検出フェーズがこの再生バッファを読むため、ここが
+        // ずれると検出に使われる画素が学習時と食い違う）。
+        let replayed: Vec<&[u8]> = playback.chunks_exact(frame_bytes).collect();
+        assert_eq!(replayed.len(), cropped_frames.len());
+        for (i, (replayed_frame, original_frame)) in
+            replayed.iter().zip(cropped_frames.iter()).enumerate()
+        {
+            assert_eq!(
+                *replayed_frame,
+                original_frame.as_slice(),
+                "フレーム{i}: 再生バッファから読み戻した内容が元のフレームと食い違っている"
+            );
+        }
     }
 
     // --- clear_stale_logoframe: フォールバック時の残骸削除 ---
