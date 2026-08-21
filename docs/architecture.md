@@ -13,7 +13,7 @@
 | コマンド | 何をするか |
 |---|---|
 | `prepare` | elst 除去・字幕トラック除去・字幕抽出を1回の ffmpeg 呼び出しにまとめる（`cut` が拒否する構成の前処理） |
-| `analyze` | 外部3ツールを走らせて Trim リストを作る。`--report` で診断と gate 判定 |
+| `analyze` | 外部3ツールを走らせて Trim リストを作る。`--report` で診断と gate 判定。`--logo`/`--no-logo` 省略時はロゴ矩形を自動推定、`--no-logo` でロゴ無しに固定、`--logo-dir` で辞書の場所を変更 |
 | `cut` | Trim をキーフレーム境界へスナップし、mp4 をサンプル単位でロスレスカット |
 | `remap-subs` | 字幕サイドカーの時刻を cut 後タイムラインへ張り替える |
 | `auto` | `prepare`→`analyze`→gate→`cut`→`remap-subs` を対話なしで合成 |
@@ -60,12 +60,12 @@ tachikaze analyze IN.mp4 [-o trim.avs|-] [--report] [--cache-dir DIR]
 - `-inlogo` を渡さないときは、キャッシュに残る古い logoframe.txt を削除する
 - `.dtvi` の `frame_count` と読み取ったフレーム数が食い違う場合は手順3を実行せず中断する（CLAUDE.md 罠3。この検査は省略不可）
 
-**`--logo`/`--no-logo` を両方省略したときの自動推定（既定、E18-5・#135）。** `--logo` を明示したとき・`--no-logo` を指定したときは上記のとおり（`join_logo_scp` は1回だけ）。それ以外（既定）は次の直列ループで決める（`src/analyze.rs::run_auto_logo_detection`）:
+**`--logo`/`--no-logo` を両方省略したときの自動推定（既定）。** `--logo` を明示したとき・`--no-logo` を指定したときは上記のとおり（`join_logo_scp` は1回だけ）。それ以外（既定）は次の直列ループで決める（`src/analyze.rs::run_auto_logo_detection`）:
 
 1. まず `join_logo_scp` を `-inlogo` 無しで1回走らせ、「ロゴ無しの結果」として保持する
-2. その保持区間の補集合（CM区間、表示順フレーム番号）を求める。それと `.dtvi` のキーパケットの `frame_number` から、標本（キーフレーム）ごとの本編/CM分類器を作る（GOP=120固定の等間隔仮定は使わない、CLAUDE.md 罠3）
-3. ロゴ辞書（既定 `$XDG_DATA_HOME/tachikaze/logos`、`--logo-dir` で上書き）を見る。対象解像度と一致する候補があれば、学習をスキップしてそのまま検出を試す（`src/logo/dict.rs::select_candidate`）
-4. 辞書で決まらなければ、入力自身からロゴ矩形の候補列を推定する（`src/logo/estimate.rs::estimate_candidates`、AUC順の採用列）。先頭から最大5件を順に学習し（`src/logo/scan.rs::make-logo` と同じアルゴリズム）、検出まで試す。学習失敗（回帰係数 NaN 等）や検出失敗は次候補へ進み、成功した時点で打ち切る
+2. ロゴ辞書（既定 `$XDG_DATA_HOME/tachikaze/logos`、`--logo-dir` で上書き）を見る。対象解像度と一致する候補があれば、学習をスキップしてそのまま検出を試す（`src/logo/dict.rs::select_candidate`）。検出に成功すればここで確定し、下記3・4は実行しない
+3. 辞書で決まらなければ、手順1の保持区間の補集合（CM区間、表示順フレーム番号）を求める。それと `.dtvi` のキーパケットの `frame_number` から、標本（キーフレーム）ごとの本編/CM分類器を作る（GOP=120固定の等間隔仮定は使わない、CLAUDE.md 罠3）
+4. 入力自身からロゴ矩形の候補列を推定する（`src/logo/estimate.rs::estimate_candidates`、AUC順の採用列）。先頭から最大5件を順に学習し（`src/logo/scan.rs::make-logo` と同じアルゴリズム）、検出まで試す。学習失敗（回帰係数 NaN 等）や検出失敗は次候補へ進み、成功した時点で打ち切る
 5. 成功した候補の `.lgd` だけをロゴ辞書へ保存する。全候補が尽きればロゴ無しとして扱う（1回目の結果をそのまま使い、`join_logo_scp` の2回目は走らせない）。見つかった場合だけ `join_logo_scp` を `-inlogo` 付きでもう1回走らせる。その結果を最終の `trim.avs` とする
 
 各段階の結果（辞書ヒット・候補列とAUC・何番目の候補で成功したか・学習の有効フレーム数・検出フレーム割合・`-inlogo` を渡したか）は stderr に出る。
@@ -137,7 +137,9 @@ tachikaze auto IN.mp4 -o OUT.mp4 [--cm-output CM.mp4] [--ignore-gate] [-f|--forc
 tachikaze make-logo IN.mp4 --rect x,y,w,h -o OUT.lgd [--threshold N]
 ```
 
-1. ロゴ検出に使う `.lgd`（Amatsukaze 形式ロゴデータ）を、入力 mp4 とロゴ矩形だけから作る（`.dtvi` も外部3ツールも使わない）。ロゴ位置は `--rect`（`x,y,w,h`、2の倍数に丸める）で手動指定する。位置を自動探索しないのは、ロゴの形・色が局や番組ごとに異なり、対象素材だけから汎用的に検出する既存手段が無いため（Amatsukaze 側にも自動探索は無い）
+1. ロゴ検出に使う `.lgd`（Amatsukaze 形式ロゴデータ）を、入力 mp4 とロゴ矩形だけから作る（`.dtvi` も外部3ツールも使わない）。`make-logo` 自体は今もロゴ位置を `--rect`（`x,y,w,h`、2の倍数に丸める）で受け取る低レベルなコマンドである。
+
+   **判断の履歴（2026-08 改訂）**: 当初は「局・番組ごとにロゴの形と色が異なり、対象素材だけから汎用的に検出する既存手段が無い」ため矩形を自動探索しないと決めていた。「Amatsukaze 側にも自動探索は無い」という事実は今も正しい。その後、定常段差のブロック中央値と本編/CM 在不在の AUC という局非依存の統計量が実測で成立し（`src/logo/estimate.rs`、詳細は [cm-detection.md](cm-detection.md)「ロゴ検出」）、判断を変えた。`analyze`/`auto` が `--logo`/`--no-logo` を両方省略したとき、内部でこの矩形推定をして `make-logo` と同じ学習アルゴリズムを呼ぶ（下記「analyze」の「自動推定」節）。`make-logo` コマンド自体（手動で矩形を指定する経路）は変えていない。
 2. 矩形の外周1ピクセルが単色（最小値・最大値の差が `--threshold`、既定12、以下）のフレームだけを学習に使い、画素ごとに最小二乗で回帰係数 `a`/`b` を求める（`src/logo/scan.rs`）。既定で入力全体を走らせる。CM区間だけを指定すると「ロゴが無い」ロゴデータができてしまうため
 3. 有効フレーム数（何フレーム中いくつ使ったか）を必ず stderr に出す。壊れたロゴデータを黙って書き出さないよう、有効フレームが0件または4件未満（`MIN_USABLE_FRAMES`）の場合と、係数が NaN/inf/`a==0` になった場合は失敗させる。件数そのものを別に検査するのは、少数のフレームでは回帰係数が NaN/inf にならず黙って有限値になりうるため
 
@@ -283,6 +285,16 @@ $ ffmpeg -i IN.mp4 -c copy -use_editlist 0 -movflags +faststart OUT.mp4
 
 やらないと決めた理由: 実測した1局では `trim.avs` に効果が確認できず、CLI にオプションを追加する実装コスト（`-set` ではないため `--jls-set` と別の口が要る）に見合う利得が無いと判断した。局によっては固定遅延が大きく効果が出る可能性は残るため、実際に精度不足が観測された局が出たら対応を検討する。
 
+### ロゴ矩形推定・AUC 採用のパラメータは4局からの較正
+
+既知の限界として残す。閾値ラダー・サイズ上限・AUC 採用閾値 0.9・CM 標本ガード 20 枚は、実ファイル5本＋追検証4本のいずれも同じ4局（BS日テレ / TOKYO MX / フジテレビ / テレビ朝日）から決めた値である（[measurements.md](measurements.md)「ロゴ矩形の自動推定」）。局が増えれば見直しが必要になる可能性がある。
+
+### 相関方式の検出限界と、AUC 採用が誤ったロゴでも trim を改善しうること
+
+TOKYO MX の ED 区間（90秒）は、ロゴ自体は出ているのに段差が番組全体平均の半分まで落ちて相関方式が検出できず、CM と誤判定される。矩形推定ではなく相関方式そのものの限界であり、矩形の余白を振っても解消しない（[jls-settings.md](jls-settings.md)「既知の失敗モード: ロゴ検出」）。
+
+一方でテレビ朝日は局ロゴを天気パネルや時計から分離できないが、代わりに時計を採用すると `trim.avs` が改善した（CM 約4.25分を追加除去）。**効くのは「局ロゴを当てること」ではなく「検出結果が本編/CM と相関すること」であり、AUC 採用がこれを自動で拾う**。フジテレビ（L字放送）では本物のロゴと L字帯・台風テロップの断片の AUC が僅差で並んだ例もあり、僅差の逆転はあり得る。ただし AUC が高い候補は定義上本編/CM と相関しており、誤採用しても trim が悪化しにくいことをテレビ朝日の実例で確認済み。検出フレーム割合の絶対閾値と `auto` の gate が残りの防御。
+
 ### 見逃し候補ヒューリスティックとロゴ
 
 `src/report/missed.rs` は `.jls` のラベルを見ず、ギャップ長の一致だけで判定するため、ロゴの有無でロジックは変わらない。実測2本（BS11・TOKYO MX2、[jls-settings.md](jls-settings.md)「ロゴありでの見逃し警告」）ではロゴあり/なしで見逃し候補の件数に変化が無かった（どちらも0件）。ただし検出済み CM ブロック長が揃わない番組でロゴありを試した実測が無いため、一般に誤警告が増えないとは言えない。加えて MX2 は元々このヒューリスティックが発火しない構成だった。`find_missed_candidates` は保持区間内部の `.jls` エントリと長さを突き合わせる実装のため、見逃しブロックが単一の長い `:L` エントリの内側にあると検出対象にならない。「両方0件」という結果は、ロゴの有無というより検出条件自体が MX2 では成立していなかった可能性がある。
@@ -338,6 +350,7 @@ $ ffmpeg -i IN.mp4 -c copy -use_editlist 0 -movflags +faststart OUT.mp4
 | `subtitle.rs` | `remap-subs` 本体: ASS/SRT の Start/End を区間マップの区分的な線形写像で張り替える（シフト/破棄/クリップの分類、丸め方向） | 上記「remap-subs」 |
 | `logo/lgd.rs` | Amatsukaze 形式ロゴデータ `.lgd`（AviUtl 互換のベース部 + Amatsukaze 独自の float 部）の読み込み | [cm-detection.md](cm-detection.md) |
 | `logo/frames.rs` | ffmpeg を子プロセスとして起動し、ロゴ矩形の輝度平面をフレーム順にストリームで読む（`stream_luma_frames`、読み取ったフレーム数と `.dtvi` の `frame_count` の一致検査あり）。ロゴ矩形推定専用に、クロップせず全画面をキーフレームだけ読む関数（`stream_keyframe_luma_frames`、フレーム数一致検査なし）も持つ | [cm-detection.md](cm-detection.md) |
+| `logo/estimate.rs` | `estimate_candidates`: 入力自身からロゴ矩形の候補列を推定する。定常段差のブロック中央値で候補を作り（閾値ラダー・大構造除去・分裂併合）、本編/CM の在/不在 AUC で採点して採用列にする | [cm-detection.md](cm-detection.md)「ロゴ検出」、[measurements.md](measurements.md)「ロゴ矩形の自動推定」 |
 | `logo/score.rs` | ロゴマスク生成と相関スコア（`corr0`/`corr1`）。Amatsukaze `LogoScan.hpp` の相関方式を移植 | [cm-detection.md](cm-detection.md) |
 | `logo/scan.rs` | `make-logo` 本体: 外周1ピクセルが単色のフレームだけを使い、画素ごとに最小二乗で `.lgd` の係数 `a`/`b` を求める。`.lgd` の書き出し（ベース部はゼロ埋め） | 上記「make-logo」 |
 | `logo/interval.rs` | `corr0`/`corr1` の列からロゴ表示区間を判定し logoframe 形式で出力。Amatsukaze `LogoScan.hpp` の `LogoFrame::writeResult` を移植 | [cm-detection.md](cm-detection.md) |
@@ -374,3 +387,4 @@ struct DecodeIdx(u32);    // デコード順（mp4 のサンプル番号 / .dtvi
 7. `--verify` 指定時は ffprobe のパケット単位 CRC32 で元ファイルとの一致を確認（[lossless-cut.md](lossless-cut.md)）
 8. `--cm-output` 指定時は保持側と CM 側でフレーム数の合計 == 総フレーム数、`DecodeIdx` の集合が互いに素
 9. `analyze --logo` 指定時: ffmpeg から読み取ったロゴ矩形のフレーム数が `.dtvi` の `frame_count` と一致するか（不一致なら明示エラーで停止）。検査の実体は `src/logo/frames.rs::stream_luma_frames`。ロゴ検出は `cut` とは別の ffmpeg 供給経路を使うため、上記 4 とは別に必要な検査
+10. **自動推定（`--logo`/`--no-logo` 両方省略）でも罠3の防御は緩んでいない**。候補の推定（`logo/estimate.rs::estimate_candidates`）は `stream_keyframe_luma_frames` を使う。ロゴ辞書候補の採点（`logo/dict.rs::select_candidate`）も同じ関数を使う。この関数は意図的にフレーム数一致検査を持たない（キーフレームだけを読むため `.dtvi` の `frame_count` とは一致しない）。候補の推定は `classify_sample` が「標本の通し番号」で `.dtvi` 由来の配列を引くため、フレーム数がずれると静かに誤ったラベルを返しうる。そのため代わりに `verify_keyframe_count_matches_dtvi`（`src/analyze.rs`）で、ffmpeg が実際に流したキーフレーム数と `.dtvi` のキーフレーム数を突き合わせる。**辞書候補の採点（`dict::select_candidate`）にはこの突き合わせが無い。** `corr0`/`corr1` の平均を取るだけで通し番号を配列の添字に使わないため、フレーム数のずれが起きても「候補を1つ見送る」以上の実害が無い。**候補が決まった後の学習（`scan::run`）と検出（`detect_logo`）は、明示 `--logo` 指定時と同じ `stream_luma_frames` を通る**ため、上記9の検査を必ず経由する。推定用の供給関数が検出経路から直接呼ばれることはない。

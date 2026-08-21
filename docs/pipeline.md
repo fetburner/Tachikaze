@@ -67,7 +67,7 @@ Amatsukaze 側では `-o` ではなく **stdout** を別に解析している（
 [measurements.md](measurements.md)「ロゴの残存」）、残っていればこれが最も強い
 CM の手がかりになる。`analyze --logo <path>` は特定の `.lgd` を明示する経路である。
 `--logo`/`--no-logo` を両方省略した既定の経路では、入力自身からロゴ矩形を自動推定する
-（E18-5、`src/analyze.rs::run_auto_logo_detection`）。その結果も同じ `-inlogo` として渡す。
+（`src/analyze.rs::run_auto_logo_detection`）。その結果も同じ `-inlogo` として渡す。
 `--no-logo` を指定したときだけ、旧来どおり常に使わない。形式そのものは
 Amatsukaze の `LogoScan.hpp` が生成するもので、自前実装（`src/logo/`、
 `src/analyze.rs::detect_logo`）もこの形式でファイルを書く:

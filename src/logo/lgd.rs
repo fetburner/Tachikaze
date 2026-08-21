@@ -216,10 +216,9 @@ fn read_i16_le(bytes: &[u8], offset: usize) -> i16 {
 
 /// `[offset, offset+count*4)` を `f32`（リトルエンディアン）`count` 個として読む。
 fn read_f32_plane(bytes: &[u8], offset: usize, count: usize) -> Vec<f32> {
-    bytes[offset..offset + count * 4]
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
-        .collect()
+    // `count * 4` バイトちょうどのスライスなので余り（2番目の戻り値）は常に空。
+    let (chunks, _remainder) = bytes[offset..offset + count * 4].as_chunks::<4>();
+    chunks.iter().map(|c| f32::from_le_bytes(*c)).collect()
 }
 
 /// バイト列から `.lgd` の内容をパースする（ファイル I/O を含まない純粋な関数）。

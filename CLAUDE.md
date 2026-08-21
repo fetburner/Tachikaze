@@ -2,7 +2,7 @@
 
 mp4 に変換済みの録画ファイルを、**再エンコードせずに CM カット**するツール。CM 検出は既存ツール（chapter_exe → join_logo_scp）に任せ、本ツールは「Trim リスト → ロスレス出力」だけを担う。
 
-**状態**: `analyze` / `cut` / `prepare` / `remap-subs` / `auto` は**実装完了**。エピック E1〜E11 とそれぞれのサブ issue はすべてクローズ済み（経緯は `git log` の `[E1-1]`〜`[E11-7]`。E11 は字幕の保持と `auto`、#56）。言語は Rust、mp4 の読み書きは `mp4-atom` クレート。
+**状態**: `analyze` / `cut` / `prepare` / `remap-subs` / `auto` は**実装完了**。エピック E1〜E11 とそれぞれのサブ issue はすべてクローズ済み（経緯は `git log` の `[E1-1]`〜`[E11-7]`。E11 は字幕の保持と `auto`、#56）。E18（ロゴ矩形の自動推定とロゴ辞書、`[E18-1]`〜`[E18-6]`、#130）も実装完了。言語は Rust、mp4 の読み書きは `mp4-atom` クレート。
 
 ```console
 $ tachikaze analyze IN.mp4 -o trim.avs --report
@@ -96,3 +96,4 @@ $ gh issue create --template sub-issue --title '[E11-1] ...' --parent 56 --label
 - 映像は H.264、音声は `mp4-atom` が認識する音声 Codec 全般（代表例 Opus / AAC=`Mp4a`。判定は `src/mp4io/read.rs::is_audio_codec`、対応一覧と検証状況は [docs/mp4-atom.md](docs/mp4-atom.md)）。GOP は 120 フレーム固定でシーンチェンジ由来の IDR なし
 - キーフレーム境界に丸めるため**カット境界あたり平均 2.1〜2.5 秒の CM が残る**。これは許容する方針で決定済み
 - 開発・実行は macOS arm64。Amatsukaze 本体は移植しない（Windows API を 500 箇所以上使用）
+- ロゴ辞書（`.lgd`）の既定置き場所は `~/.local/share/tachikaze/logos`。`--cache-dir` とは別系統（[docs/architecture.md](docs/architecture.md)「パス解決」）
