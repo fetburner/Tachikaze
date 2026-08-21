@@ -11,12 +11,16 @@
 //!   （E14-6）。
 //! - [`interval`][]: `(corr0, corr1)` の列からロゴ表示区間を判定し、
 //!   logoframe 形式のテキストを書く。
+//! - [`hier`][]: ロゴ検出（`detect_logo`）の階層化方式（キーフレーム走査＋
+//!   状態が変わる GOP だけの部分デコード）のうち、ffmpeg も `.dtvi` の型も
+//!   扱わない純粋なロジック部分（E18-9）。
 //!
 //! 他形式（`.lgs` 等）は別 issue でこのファイルに `pub mod` 行が追加される。
 
 pub mod dict;
 pub mod estimate;
 pub mod frames;
+pub(crate) mod hier;
 pub mod interval;
 pub mod lgd;
 pub mod scan;

@@ -9,9 +9,10 @@
 //! ロゴ検出のフレーム供給に使う、`docs/toolchain-macos.md` の通常の開発依存）
 //! だけにする。
 //!
-//! 偽 `dtvindex` は `tests/data/sample_logo.dtvi`（実 `dtvindex build` 出力の
-//! 抜粋。ヘッダ全体 + 先頭40フレーム、`tests/data/sample.dtvi` と同じ規則）を
-//! そのままコピーする。ヘッダの `frame_count`/`width`/`height` が `sample_logo.mp4`
+//! 偽 `dtvindex` は `tests/data/sample_logo.dtvi`（実 `dtvindex build` 出力
+//! そのもの。ヘッダ + 全599フレーム、レビュー指摘で先頭40フレームの抜粋から
+//! 差し替えた。`tests/common::logo_dtvi_path` の doc comment参照）をそのまま
+//! コピーする。ヘッダの `frame_count`/`width`/`height` が `sample_logo.mp4`
 //! の実際の値（599 / 640 / 360）と一致していることが、ロゴ検出（実 ffmpeg で
 //! 実フレームを流す）の一致検査を通すために必須。
 //!
@@ -379,9 +380,13 @@ fn analyze_logo_below_threshold_falls_back_to_no_inlogo_and_matches_omitted_logo
     let lgd_path = tmp_dir.join("logo.lgd");
     run_make_logo(&common::logo_train_fixture_path(), LOGO_RECT, &lgd_path);
 
-    // `sample.mp4` には `.dtvi` の実測値がある（`tests/data/sample.dtvi`）ため、
-    // 偽 dtvindex にはそちらをコピーさせる（sample_logo.dtvi ではフレーム数
-    // 不一致になり、意図と異なるエラーで落ちてしまう）。
+    // `sample.mp4` 専用の完全な `.dtvi`（`tests/data/sample_no_logo.dtvi`、
+    // `common::no_logo_dtvi_path` の doc comment参照）を偽 dtvindex にコピー
+    // させる。`tests/data/sample.dtvi`（40フレームの抜粋、他の多くのテストが
+    // 共有するため変更しない）や `sample_logo.dtvi`（別ファイルの `.dtvi`。
+    // 実測で判明: 構造的なパラメータが完全に一致していても、ffmpeg の `-ss`
+    // シークの着地がファイルごとに微妙にずれることがあり、末尾GOPのフレーム数
+    // 検査（blocker3）で不一致になった）はどちらも使えない。
     // フォールバック実行と `--no-logo` 実行の両方に**同じキャッシュディレクトリ・
     // 同じ入力**を使う（`workdir` はキャッシュを実害なく上書きする設計、
     // `src/workdir.rs` の doc comment参照）。こうすることで join_logo_scp に
@@ -392,8 +397,11 @@ fn analyze_logo_below_threshold_falls_back_to_no_inlogo_and_matches_omitted_logo
     let input = common::fixture_path();
 
     let captured_args_fallback = tmp_dir.join("join_logo_scp_args_fallback.txt");
-    let bin_dir_fallback =
-        setup_fake_tools(&tmp_dir, &common::dtvi_path(), &captured_args_fallback);
+    let bin_dir_fallback = setup_fake_tools(
+        &tmp_dir,
+        &common::no_logo_dtvi_path(),
+        &captured_args_fallback,
+    );
     let output_fallback = tmp_dir.join("trim-fallback.avs");
     let result = run_analyze(
         &bin_dir_fallback,

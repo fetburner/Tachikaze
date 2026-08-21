@@ -36,6 +36,7 @@ use crate::jls::{self, JlsEntry};
 use crate::logo::dict;
 use crate::logo::estimate::{self, SampleLabel};
 use crate::logo::frames::{self, LogoRect, VideoSize};
+use crate::logo::hier;
 use crate::logo::lgd::{self, LogoData};
 use crate::logo::scan;
 use crate::logo::{interval as logo_interval, score};
@@ -1076,14 +1077,16 @@ fn auto_logo_name(input: &Path) -> String {
 /// `--logo` 指定時のロゴ検出経路（E14-8、issue #97「解くべき問題」）。
 ///
 /// `.lgd` を読み、ロゴ矩形（`imgx`/`imgy`/`w`/`h`）で `work_mp4` のフレームを
-/// 流し、フレームごとに `(corr0, corr1)` を評価して区間を作る。読み取った
-/// フレーム数が `dtvi` の `frame_count`（ヘッダ、`dtvi.rs` の doc comment参照）と
-/// 一致しなければ [`frames::stream_luma_frames`] がエラーを返し（CLAUDE.md
-/// 罠3）、そのエラーはこの関数から `?` でそのまま伝播する。呼び出し元
+/// 流し、フレームごとに `(corr0, corr1)` を評価して区間を作る。フレーム数の
+/// `.dtvi` との一致検査は、キャッシュヒット時は [`read_score_cache`]（保存
+/// されている要素数の検査）、デコードする場合は [`detect_logo_scores_hier`]
+/// （キーフレーム数の一致検査＋部分デコードの着地オラクル）が行う。いずれかの
+/// 検査に失敗すればエラーが `?` でそのまま伝播する。呼び出し元
 /// （[`run_pipeline`]）はこの時点でまだ `join_logo_scp` を起動していないため、
 /// この検査は必ず起動前に効く。
 ///
-/// この関数の主コストは上記のフルデコード（実測30分1080pで約19秒・CPU約162秒）。
+/// この関数の主コストはデコード（実測30分1080pで約19秒・CPU約162秒。
+/// [`detect_logo_scores_hier`] の階層化方式で約6割に短縮、issue #154）。
 /// ロゴ・入力が変わらない再実行（jls-settings の調整反復、`auto` のやり直し）
 /// でも毎回払うため、corr スコア列（`scores`）を `cwd`（キャッシュディレクトリ、
 /// `--cache-dir` 配下）に `logo-scores-<キー>.bin` として保存し、次回以降は
@@ -1163,17 +1166,15 @@ fn detect_logo(
     }
 
     if !loaded_from_cache {
-        frames::stream_luma_frames(
+        scores = detect_logo_scores_hier(
             ffmpeg_path,
             work_mp4,
             cwd,
+            &mask,
             rect,
             video_size,
+            dtvi,
             expected_frame_count,
-            |frame| {
-                scores.push(mask.evaluate(frame));
-                Ok(())
-            },
         )?;
 
         if let Err(err) = write_score_cache(&score_cache_file, &scores) {
@@ -1367,8 +1368,21 @@ const SCORE_CACHE_FORMAT_VERSION: u32 = 1;
 /// コードが期待する値と完全一致するかだけを見る。
 ///
 /// `0` = 全編フルデコード（`frames::stream_luma_frames`、issue #152 導入時点の
-/// 唯一の経路）。E18-9 で階層化方式を導入する際に新しい値へ切り替える。
-const SCORE_CACHE_DERIVATION: u32 = 0;
+/// 唯一の経路）。
+///
+/// `1` = キーフレーム走査＋部分デコードの階層化方式（`detect_logo_scores_hier`、
+/// issue #154）＋不動点化（レビュー指摘、blocker1）。理論上は `0` と同じ
+/// `scores` を返す設計だが、階層化方式の導入時にこの値を切り替えることで、
+/// E18-7/E18-8 時点（`0`）のバイナリが書いたキャッシュを E18-9 以降の
+/// バイナリが誤って再利用しない（逆方向も同様）。将来この方式のアルゴリズムを
+/// 変えたら、この値をさらに切り替えること。
+///
+/// `detect_logo_scores_hier` 内部の性能足切り（`HIER_FALLBACK_GOP_FRACTION_THRESHOLD`）
+/// が発動した場合の `scores` も、この `1` のタグで保存する。足切りは全編
+/// フルデコードへの切り替えを意味するが、キーが入力（`.lgd`・フレーム数・
+/// 入力識別子）を固定し、その入力に対してどちらの経路を通るかは決定的
+/// （同じ入力なら常に同じ経路になる）なため、タグの整合性は崩れない。
+const SCORE_CACHE_DERIVATION: u32 = 1;
 
 /// キャッシュファイルのヘッダ長（magic 4バイト + 形式版4バイト + 導出方法
 /// タグ4バイト + 要素数8バイト）。
@@ -1438,6 +1452,529 @@ fn read_score_cache(path: &Path, expected_frame_count: u64) -> Option<Vec<(f32, 
         offset += 8;
     }
     Some(scores)
+}
+
+/// 不動点化（`detect_logo_scores_hier`、issue #154 レビュー指摘、blocker1）の
+/// 収束判定に必要な、**連続して出力が変化しなかったラウンド数**。
+///
+/// 単純に「出力（`logo_interval::write_result` のテキスト）が前回と一致したら
+/// 収束」と判定すると誤る。**実測（ぼっち・ざ・ろっく！、ロゴが薄い入力）で
+/// 判明した罠**: `logo::interval::build_text` の境界精緻化の探索は、精緻化済み
+/// 区間の内側で（まだホールド補間のままの隣接GOPへ踏み込む前に）閾値を跨いで
+/// 停止することがある。この場合、出力は2ラウンド連続で変化しない（「偽の
+/// 安定」）にもかかわらず、まだホールド補間の影響を受けた誤った値のままである。
+/// 実測では2ラウンド安定した後、さらに隣接GOPへ精緻化を広げると出力が変化し、
+/// 最終的に全編フルデコードと一致する値（範囲欄の終端が2フレーム＝末尾GOPの
+/// 境界1つ手前から正しい値へ移動）に到達した。
+///
+/// そのため、単発の「1回一致」ではなく、この定数の値だけ連続して出力が
+/// 変化しないことを要求する。値は上記の実測（偽の安定が2ラウンド続いた）に
+/// 対して安全側の余裕を持たせて決めた。
+///
+/// **性能上の理由でこの値を無条件には使わない**（`detect_logo_scores_hier`
+/// 参照）: 出力が一度も変化していない入力（乙女ゲー・攻殻機動隊のような
+/// ロゴがはっきりしている入力で実測）では、1ラウンドの安定確認だけで
+/// 停止する。この定数を無条件に適用すると、最初から正しい値に到達している
+/// 入力でも毎回2ラウンド分の余分な精緻化（隣接GOPへの無条件マージン拡張）を
+/// 強いられ、実測で処理時間がフルデコードより悪化した。「偽の安定」は出力が
+/// 一度でも変化した入力でのみ実測で確認できているため、そのような入力に限り
+/// この定数を適用して慎重に確認する。
+///
+/// **この値は経験的に選んだ閾値であり、
+/// 「これだけ連続して変化しなければ数学的に絶対に収束している」という証明は
+/// 無い**（`build_text` の探索がホールド補間区間を任意の距離だけ跨いで
+/// 停止する可能性を排除できないため、原理的には無限に長い「偽の安定」を
+/// 否定できない）。この設計の正しさの根拠は、この経験的閾値**単体**ではなく、
+/// 実録画3本＋ロゴが薄い入力を含む実測で全編フルデコードとのバイト一致を
+/// 確認したこと（`docs/measurements.md`「キーフレーム走査と部分デコードに
+/// よるロゴ検出の階層化」）に置く。将来別の入力で「偽の安定」がこの値を超えて
+/// 続く事例が見つかった場合は、この値を大きくするか、根本的に異なる収束判定
+/// （例: 常に全GOPを精緻化して不動点化自体を止める）に切り替えることを検討する。
+const REQUIRED_STABLE_ROUNDS: u32 = 3;
+
+/// 不動点化（[`detect_logo_scores_hier`]）を放棄して全編フルデコード
+/// （[`decode_logo_scores_full`]）へフォールバックする、累計精緻化対象GOPの
+/// 割合の閾値（レビュー指摘後の追加対応: ロゴが薄い入力での性能悪化）。
+///
+/// **実測で判明した問題**: [`REQUIRED_STABLE_ROUNDS`] による正しさの修正
+/// （不動点化・余白拡張）を適用した結果、ロゴがはっきりしている入力（乙女
+/// ゲー・攻殻機動隊）では全編フルデコードと同等以上の速さを保ったが、ロゴが
+/// 薄い入力（ぼっち・ざ・ろっく！）では逆に全編フルデコードより遅くなった
+/// （実測: フルデコード33.3秒に対し階層化51.7秒、精緻化GOPが最終的に
+/// 405/450個=90%に達した）。GOPの大半を結局精緻化するなら、GOPごとに
+/// シーク・ffmpeg起動を挟む部分デコードは、1回のシークで済む全編フルデコード
+/// より不利になる。
+///
+/// **対策**: 不動点化の各ラウンドで部分デコードを始める前に、累計の精緻化
+/// 対象GOP数（`refine_targets.len()`、既に精緻化済みのGOPを含む）が全GOP数の
+/// この割合以上に達していないかを確認する。達していれば、それ以上部分デコード
+/// を続けても得にならないと判断し、[`decode_logo_scores_full`]（検証済みの
+/// 既存の全編フルデコード経路）へ即座に切り替える。フォールバック先は
+/// バイト単位で `detect_logo` の元の実装と同一のため、切り替えによる出力の
+/// 差異は無い。
+///
+/// **値の根拠**: 実測（乙女ゲー最終34%=155/451個で階層化が勝つ、ぼっちは
+/// 初回対象だけで約40%に達し最終的に90%まで伸びて階層化が負ける）から、
+/// 「初回の精緻化対象だけで40%に達する入力は、そのまま続けても大抵90%前後
+/// まで伸びて逆転負けする」という経験則で40%を選んだ。この値を跨いで
+/// フォールバックすると、ぼっちのような入力ではキーフレーム走査（実測約
+/// 5秒）だけの損失で全編フルデコードへ切り替えられる。34%で止まる乙女ゲーは
+/// 影響を受けない。将来別の入力でこの経験則が崩れる例が見つかれば、この値を
+/// 見直す。
+const HIER_FALLBACK_GOP_FRACTION_THRESHOLD: f64 = 0.4;
+
+/// 全編フルデコードで `(corr0, corr1)` スコア列を作る（issue #152 導入時点の
+/// 唯一の経路、[`detect_logo_scores_hier`] 導入前の `detect_logo` の実装から
+/// 1バイトも変えていない）。
+///
+/// [`detect_logo_scores_hier`] が [`HIER_FALLBACK_GOP_FRACTION_THRESHOLD`] を
+/// 超えたときのフォールバック先として使う他、将来階層化そのものを無効化する
+/// 選択肢が要る場合の退避先にもなる。
+fn decode_logo_scores_full(
+    ffmpeg_path: &Path,
+    work_mp4: &Path,
+    cwd: &Path,
+    mask: &score::LogoMask,
+    rect: LogoRect,
+    video_size: VideoSize,
+    expected_frame_count: u64,
+) -> Result<Vec<(f32, f32)>> {
+    let mut scores: Vec<(f32, f32)> = Vec::with_capacity(expected_frame_count as usize);
+    frames::stream_luma_frames(
+        ffmpeg_path,
+        work_mp4,
+        cwd,
+        rect,
+        video_size,
+        expected_frame_count,
+        |frame| {
+            scores.push(mask.evaluate(frame));
+            Ok(())
+        },
+    )?;
+    Ok(scores)
+}
+
+/// [`detect_logo`] のデコードを、キーフレーム走査＋状態が変わる GOP だけの
+/// 部分デコードに階層化した実装（issue #154「解くべき問題」）。
+///
+/// ロゴ区間の境界は CM 切り替わり付近にしかなく、区間の内部はキーフレームの
+/// 判定だけで決まる。全編フルデコード（実測30分1080pで約19秒・CPU約162秒）の
+/// 代わりに、キーフレーム走査（実測6.4秒・CPU8秒）で粗く判定し、判定が変わる
+/// GOP だけ部分デコード（実測0.12秒/GOP）する。`detect_logo` と同じ全長
+/// `(corr0, corr1)` 列を返すため、`logo_interval::write_result` は無改造で使う。
+/// 手順の詳細（GOP 構築・精緻化対象の選定・全長列の組み立て・不動点化）は
+/// `src/logo/hier.rs` のモジュール doc comment参照。
+///
+/// # 手順
+///
+/// 0. **フレーム数の自己整合性検査**（レビュー指摘、blocker3）: `.dtvi`
+///    ヘッダの `frame_count`（`expected_frame_count`）と、`.dtvi` のフレーム表
+///    の実際の行数（`dtvi.frames.len()`）が一致するか検査する。この検査が
+///    無いと、ヘッダだけ改竄された `.dtvi`（フレーム表は正しいまま）を渡すと
+///    後続の GOP 構築が改竄値を信用してしまい、末尾GOPの長さがずれた
+///    logoframe をエラー無しで書いてしまう（レビュアーの実証: `frame_count`
+///    を599→500に改竄すると、全編フルデコード経路（`stream_luma_frames`）は
+///    停止するがこの階層化方式は停止せず500フレーム分の logoframe を書いて
+///    いた）。
+/// 1. **キーフレーム走査**: [`frames::stream_keyframe_cropped_luma_frames`]
+///    でロゴ矩形をffmpeg側でクロップしたキーフレームを流し、`mask.evaluate`
+///    する。読めた枚数と [`dtvi_keyframe_frame_numbers`] の要素数の一致を
+///    検査する（CLAUDE.md 罠3）。**`stream_keyframe_luma_frames`（全画面）＋
+///    `dict::crop_frame`（Rust手動クロップ）は使わない**（`frames.rs`
+///    「実録画で見つかった罠」参照: 手動クロップと `-vf crop` はビット単位で
+///    一致せず、着地オラクルが実録画で誤って失敗する）。
+/// 2. **粗判定**: 各キーフレームの corr を [`logo_interval::raw_score`] /
+///    [`logo_interval::instant_label`]（`write_result` がフレーム単位で使う
+///    のと同じ式・同じ閾値 `THRESH`）で窓なしのロゴ在/不在にラベルづけする。
+/// 3. **初期の精緻化対象の選定**: [`hier::select_refine_targets`]
+///    （隣接キーフレームでラベルが変わる GOP とその前後1 GOP、先頭 GOP・
+///    末尾 GOP は常に選ぶ）。
+/// 4. **性能フォールバック**（レビュー指摘後の追加対応）: 手順5の各ラウンドで
+///    部分デコードを始める前に必ず
+///    [`hier::should_fall_back_to_full_decode`] を確認する。累計の精緻化
+///    対象GOPの割合が [`HIER_FALLBACK_GOP_FRACTION_THRESHOLD`] 以上に達して
+///    いれば、それ以上部分デコードを続けずに [`decode_logo_scores_full`]
+///    （全編フルデコード）へ即座に切り替えて返す。ロゴが薄い入力
+///    （ぼっち・ざ・ろっく！）では初回の精緻化対象選定（手順3）だけで
+///    この閾値に達し、部分デコードを一度も行わずに切り替わる。値の根拠は
+///    同定数の doc comment参照。
+/// 5. **不動点化**（レビュー指摘、blocker1）: 精緻化対象を
+///    [`hier::group_consecutive`] で連続範囲にまとめ、範囲ごとに部分デコード
+///    する。**末尾GOPを含む範囲だけ**「末尾GOPの部分デコード」（後述）の
+///    EOF方式を使い、それ以外は [`frames::decode_frame_range_luma_frames`]、
+///    `-ss` の秒数は [`hier::seek_seconds_for_pts`]（`.dtvi` のフレーム表に
+///    記録された実測 pts をそのまま使う。`frame_number / fps` による近似では
+///    `.dtvi` の `start_time` 分のオフセットを見落とす。レビュー指摘・実録画・
+///    E2Eで判明: 詳細は同関数の doc comment「罠1」「罠2」参照）を使う。
+///    各範囲の先頭フレームの
+///    corr が手順1で得た同じキーフレームの corr と完全一致することを
+///    [`verify_landing_oracle`] で検査する（着地オラクル、CLAUDE.md 罠3の
+///    一般形）。[`hier::assemble_full_scores`] で全長 corr 列を組み立て、
+///    無改造の `logo_interval::write_result` に通す。出力（S/E行の範囲欄）が
+///    まだホールド補間のままの GOP を指していれば、それも精緻化対象に加える。
+///    さらに**現在精緻化済みのGOPの隣接GOP**も無条件に精緻化対象に加え
+///    （出力の範囲欄だけを見る方式では、その出力自身が指す範囲の外を
+///    絶対に発見できないため。レビュー指摘・実測で判明）、[`REQUIRED_STABLE_ROUNDS`]
+///    回連続で出力が変化しなくなるまで繰り返す（1回の一致だけでは「境界探索が
+///    ホールド補間区間の内側で停止した偽の安定」を収束と誤判定しうる。
+///    同定数の doc comment参照）。GOP数は有限で対象集合は単調増加のため
+///    必ず停止する。
+///
+///    **末尾GOPの部分デコード**（レビュー指摘、blocker3）: `.dtvi` ヘッダの
+///    `frame_count` を信用せず、[`frames::decode_from_seek_until_eof_luma_frames`]
+///    でメディアの終端まで実際に読む。実際に読めた枚数が
+///    `expected_frame_count - 開始フレーム番号`（`checked_sub`、アンダーフロー
+///    時はエラー）と一致しなければ停止する（媒体側の真値での検査）。
+/// 6. 精緻化した GOP 数・総 GOP 数・追加デコードしたフレーム数・不動点化の
+///    反復回数を stderr に1行出す（性能測定用）。
+#[allow(clippy::too_many_arguments)]
+fn detect_logo_scores_hier(
+    ffmpeg_path: &Path,
+    work_mp4: &Path,
+    cwd: &Path,
+    mask: &score::LogoMask,
+    rect: LogoRect,
+    video_size: VideoSize,
+    dtvi: &Dtvi,
+    expected_frame_count: u64,
+) -> Result<Vec<(f32, f32)>> {
+    // 手順0: フレーム数の自己整合性検査（レビュー指摘、blocker3）。
+    anyhow::ensure!(
+        expected_frame_count == dtvi.frames.len() as u64,
+        ".dtvi ヘッダの frame_count（{expected_frame_count}）と、.dtvi のフレーム表の\
+         実際の行数（{}）が一致しません。ヘッダが改竄されている、または .dtvi が\
+         壊れている可能性があります。この不一致を無視すると、階層化方式の末尾GOPの\
+         長さがヘッダの主張値から計算され、実際のメディアより短い/長い logoframe を\
+         黙って書いてしまいます（CLAUDE.md 罠3の一般形）。",
+        dtvi.frames.len()
+    );
+
+    // 手順1: キーフレーム走査。ロゴ矩形は ffmpeg 側（`-vf crop`）で切り出す。
+    // 部分デコード（`decode_frame_range_luma_frames`/
+    // `decode_from_seek_until_eof_luma_frames`）も同じ `-vf crop` 経由なので、
+    // 着地オラクル（手順5）でビット単位の完全一致を要求できる
+    // （`stream_keyframe_luma_frames`＋`dict::crop_frame`の組は使わない。
+    // 手順1のdoc comment参照）。
+    let mut kf_scores: Vec<(f32, f32)> = Vec::new();
+    let read_keyframe_count = frames::stream_keyframe_cropped_luma_frames(
+        ffmpeg_path,
+        work_mp4,
+        cwd,
+        rect,
+        video_size,
+        |frame| {
+            kf_scores.push(mask.evaluate(frame));
+            Ok(())
+        },
+    )?;
+
+    let kf_frame_numbers_u32 = dtvi_keyframe_frame_numbers(dtvi);
+    anyhow::ensure!(
+        read_keyframe_count as usize == kf_frame_numbers_u32.len(),
+        "ffmpeg が実際に流したキーフレーム数（{read_keyframe_count}枚）が .dtvi の\
+         キーフレーム数（{}枚、キーパケットの frame_number の個数）と一致しません。\
+         この不一致を無視して後続の階層化方式に進むと、キーフレームのcorrと\
+         フレーム番号の対応が黙ってずれます（CLAUDE.md 罠3の一般形）。",
+        kf_frame_numbers_u32.len()
+    );
+    let kf_frame_numbers: Vec<u64> = kf_frame_numbers_u32.iter().map(|&n| u64::from(n)).collect();
+
+    // 手順2: 粗判定。`write_result` がフレーム単位で使うのと同じ式・閾値。
+    let labels: Vec<Option<bool>> = kf_scores
+        .iter()
+        .map(|&(corr0, corr1)| logo_interval::instant_label(logo_interval::raw_score(corr0, corr1)))
+        .collect();
+
+    let gops = hier::build_gops(&kf_frame_numbers, expected_frame_count);
+    let total_gops = gops.len();
+    let last_gop_index = total_gops
+        .checked_sub(1)
+        .ok_or_else(|| anyhow!("内部エラー: GOPが1つも構築されませんでした"))?;
+    let fps = dtvi_fps(dtvi);
+    let time_base_seconds = dtvi_time_base_seconds(dtvi);
+
+    // 手順3: 初期の精緻化対象の選定。
+    let initial_targets = hier::select_refine_targets(&labels);
+
+    // 手順5: 不動点化（レビュー指摘、blocker1）。GOP数は有限で対象集合は
+    // 単調増加のため、高々 `total_gops` 回の反復で全GOPが精緻化される（安全弁の
+    // `decoded_gops.len() == total_gops` に到達する）。[`REQUIRED_STABLE_ROUNDS`]
+    // 回分の安定確認ラウンドも、まだ精緻化していないGOPが残っていれば同じ
+    // マージン拡張の中で進むため、追加の反復回数として別に確保する。
+    // 収束しない場合は実装の不具合として停止する（黙って無限ループ・無限
+    // デコードにはしない）。各ラウンドの冒頭では、手順4の性能フォールバック
+    // 判定を先に行う。
+    let mut refine_targets: std::collections::BTreeSet<usize> =
+        initial_targets.into_iter().collect();
+    let mut decoded_gops: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+    let mut refined: Vec<hier::RefinedRange> = Vec::new();
+    let mut refined_frames: u64 = 0;
+    let mut previous_text: Option<String> = None;
+    let mut stable_rounds: u32 = 0;
+    let mut ever_observed_change = false;
+    let max_iterations = total_gops
+        .saturating_add(REQUIRED_STABLE_ROUNDS as usize)
+        .saturating_add(2);
+    let mut iterations = 0usize;
+
+    let full_scores = loop {
+        iterations += 1;
+        anyhow::ensure!(
+            iterations <= max_iterations,
+            "ロゴ検出の階層化方式（不動点化）が{max_iterations}回の反復を超えても\
+             収束しませんでした。GOP数（{total_gops}）は有限で精緻化対象は単調増加\
+             のはずなので、これは実装の不具合を示しています。"
+        );
+
+        // 手順4: 性能フォールバック（レビュー指摘後の追加対応）: このラウンドの部分
+        // デコードを始める前に、累計の精緻化対象GOPの割合が閾値以上に達して
+        // いないか確認する。達していればここで階層化を放棄し、全編フル
+        // デコードへ切り替える（`HIER_FALLBACK_GOP_FRACTION_THRESHOLD` の
+        // doc comment参照）。ロゴが薄い入力は初回の精緻化対象選定
+        // （手順3）だけでこの閾値に達することが多く、その場合は部分デコードを
+        // 一度も行わずにここで切り替わる。
+        if hier::should_fall_back_to_full_decode(
+            refine_targets.len(),
+            total_gops,
+            HIER_FALLBACK_GOP_FRACTION_THRESHOLD,
+        ) {
+            eprintln!(
+                "[analyze] 階層化ロゴ検出: 累計の精緻化対象GOPが{}/{total_gops}個\
+                 （割合 {:.3}）に達し、閾値（{HIER_FALLBACK_GOP_FRACTION_THRESHOLD:.3}）を\
+                 超えたため階層化を放棄し、全編フルデコードへフォールバックします。",
+                refine_targets.len(),
+                refine_targets.len() as f64 / total_gops as f64,
+            );
+            return decode_logo_scores_full(
+                ffmpeg_path,
+                work_mp4,
+                cwd,
+                mask,
+                rect,
+                video_size,
+                expected_frame_count,
+            );
+        }
+
+        let pending: Vec<usize> = refine_targets
+            .iter()
+            .copied()
+            .filter(|idx| !decoded_gops.contains(idx))
+            .collect();
+
+        for &(start_kf_idx, end_kf_idx) in &hier::group_consecutive(pending) {
+            let start_frame = gops[start_kf_idx].start;
+            // レビュー指摘・issue #154「罠2」: pts は0始まりとは限らないため
+            // `frame_number / fps` では近似できない。`.dtvi` のフレーム表に
+            // 記録された実測 pts をそのまま使う（`dtvi.frames` は
+            // `frame_number` の昇順0始まり連番で並ぶことが手順0の検査で
+            // 保証されているため、添字に直接使える）。
+            let start_frame_pts = dtvi
+                .frames
+                .get(start_frame as usize)
+                .ok_or_else(|| {
+                    anyhow!(
+                        "内部エラー: 開始フレーム（{start_frame}）が .dtvi のフレーム表の\
+                         範囲外です（フレーム表の行数: {}）。",
+                        dtvi.frames.len()
+                    )
+                })?
+                .pts;
+            let seek_seconds = hier::seek_seconds_for_pts(start_frame_pts, time_base_seconds);
+            let mut decoded: Vec<(f32, f32)> = Vec::new();
+
+            if end_kf_idx == last_gop_index {
+                // 末尾GOPを含む範囲（手順5b、blocker3）: `.dtvi` ヘッダの
+                // `frame_count` を信用せず、メディアの終端まで実際に読む。
+                let expected_tail_frames = expected_frame_count
+                    .checked_sub(start_frame)
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "内部エラー: 末尾GOPの開始フレーム（{start_frame}）が\
+                             全フレーム数（{expected_frame_count}）を超えています。"
+                        )
+                    })?;
+                // レビュー指摘（nit）: `frame_count == 0` は本来起こらない前提
+                // （GOPは常に1フレーム以上を含む）だが、崩れた場合に
+                // `decoded[0]` が範囲外アクセスの生パニックになるより、
+                // ここで意図が分かるエラーにする。
+                anyhow::ensure!(
+                    expected_tail_frames > 0,
+                    "内部エラー: 末尾GOPの期待フレーム数が0です（開始フレーム\
+                     {start_frame}、全フレーム数{expected_frame_count}）。GOPは常に\
+                     1フレーム以上を含む前提が崩れています。"
+                );
+
+                let read_count = frames::decode_from_seek_until_eof_luma_frames(
+                    ffmpeg_path,
+                    work_mp4,
+                    cwd,
+                    rect,
+                    video_size,
+                    seek_seconds,
+                    |frame| {
+                        decoded.push(mask.evaluate(frame));
+                        Ok(())
+                    },
+                )?;
+                anyhow::ensure!(
+                    read_count == expected_tail_frames,
+                    "末尾GOPの部分デコードで実際に読めたフレーム数（{read_count}枚）が、\
+                     .dtvi から算出した期待値（{expected_tail_frames}枚 = frame_count\
+                     {expected_frame_count} - 開始フレーム{start_frame}）と一致しません。\
+                     .dtvi のフレーム数がメディアの実際の値と食い違っている可能性が\
+                     あります（CLAUDE.md 罠3の一般形）。"
+                );
+            } else {
+                let end_frame_exclusive = gops[end_kf_idx].end;
+                let frame_count =
+                    end_frame_exclusive
+                        .checked_sub(start_frame)
+                        .ok_or_else(|| {
+                            anyhow!(
+                                "内部エラー: GOPの終端（{end_frame_exclusive}）が開始\
+                         （{start_frame}）より前です。"
+                            )
+                        })?;
+                // レビュー指摘（nit）: 上記と同じ理由で、デコード前に
+                // `frame_count > 0` を明示する。
+                anyhow::ensure!(
+                    frame_count > 0,
+                    "内部エラー: GOPの期待フレーム数が0です（開始フレーム{start_frame}、\
+                     終端{end_frame_exclusive}）。GOPは常に1フレーム以上を含む前提が\
+                     崩れています。"
+                );
+                frames::decode_frame_range_luma_frames(
+                    ffmpeg_path,
+                    work_mp4,
+                    cwd,
+                    rect,
+                    video_size,
+                    seek_seconds,
+                    frame_count,
+                    |frame| {
+                        decoded.push(mask.evaluate(frame));
+                        Ok(())
+                    },
+                )?;
+            }
+
+            // `frame_count`/`expected_tail_frames` を上で0でないことを検査済み
+            // なので、`read_frames`/`read_keyframe_frames` が成功した時点で
+            // `decoded` は空でないことが保証されている（0枚のまま成功で返る
+            // 経路は無い）。
+            verify_landing_oracle(start_frame, kf_scores[start_kf_idx], decoded[0])?;
+
+            refined_frames += decoded.len() as u64;
+            refined.push(hier::RefinedRange {
+                start_frame,
+                scores: decoded,
+            });
+            decoded_gops.extend(start_kf_idx..=end_kf_idx);
+        }
+
+        let full_scores = hier::assemble_full_scores(
+            &kf_frame_numbers,
+            &kf_scores,
+            expected_frame_count,
+            &refined,
+        );
+        let probe = logo_interval::write_result(&full_scores, fps);
+
+        // 収束判定は「テキスト出力が前回と一致したか」を [`REQUIRED_STABLE_ROUNDS`]
+        // 回連続で確認できたかで行う（レビュー指摘の「境界探索が触ったフレームは
+        // すべて実測値」という不変条件の代理指標）。**1回一致しただけでは
+        // 収束と判定しない**理由（レビュー指摘・実測で判明した罠）: `build_text`
+        // の境界探索は精緻化済み区間の内側で（ホールド補間区間に踏み込む前に）
+        // 閾値を跨いで停止することがあり、その状態で1〜2ラウンド出力が変わらない
+        // 「偽の安定」に達してもまだ全編フルデコードと食い違っている場合がある
+        // （実測: ぼっち・ざ・ろっく！で出力が2ラウンド連続で変化しない状態を経て、
+        // その後さらに精緻化を進めると出力が変わり、最終的に全編フルデコードと
+        // 一致する値に到達した）。[`REQUIRED_STABLE_ROUNDS`] の doc comment参照。
+        //
+        // 精緻化対象は、出力（S/E行の範囲欄）が指すGOP（`touched_gops`、速く
+        // 収束する場合の主経路）に加えて、**現在精緻化済みのGOPの隣接GOP**
+        // （`margin_gops`）も無条件に加える。この無条件マージン拡張こそが
+        // 上記の「偽の安定」を実際に突破する（`touched_gops` だけでは出力
+        // 自身が指す範囲の外を絶対に発見できないため、単独では機能しない）。
+        // レビュー指摘後の追加調整（性能）: 初回ラウンドは比較対象
+        // （`previous_text`）が無いため安定判定の対象にしない。1ラウンド目
+        // だけで確定させず、必ず2ラウンド目の結果と突き合わせる。
+        if let Some(prev_text) = previous_text.as_deref() {
+            if prev_text == probe.text {
+                stable_rounds += 1;
+            } else {
+                // 出力が実際に変化した = このGOPまでは「偽の安定」が起こり
+                // うる入力だという証拠。以降は要求ラウンド数を
+                // REQUIRED_STABLE_ROUNDS まで上げ、より慎重に確認する
+                // （実測: ぼっち・ざ・ろっく！のような弱いロゴでのみ発生し、
+                // 乙女ゲー・攻殻機動隊のような強いロゴでは一度も変化しない）。
+                ever_observed_change = true;
+                stable_rounds = 0;
+            }
+        }
+        previous_text = Some(probe.text.clone());
+        // 一度も出力が変化していない入力では、1ラウンドの安定確認だけで
+        // 十分と判断する（「偽の安定」は出力が変化した経験がある入力でしか
+        // 実測で確認していないため）。変化を経験した入力では
+        // `REQUIRED_STABLE_ROUNDS` 回まで慎重に確認する。
+        let required_stable_rounds = if ever_observed_change {
+            REQUIRED_STABLE_ROUNDS
+        } else {
+            1
+        };
+        if stable_rounds >= required_stable_rounds || decoded_gops.len() == total_gops {
+            break full_scores;
+        }
+
+        let touched_ranges = hier::touched_frame_ranges_from_logoframe_text(&probe.text);
+        let touched_gops = hier::gops_overlapping_ranges(&gops, &touched_ranges);
+        refine_targets.extend(touched_gops);
+        for &idx in &decoded_gops.clone() {
+            if idx > 0 {
+                refine_targets.insert(idx - 1);
+            }
+            if idx + 1 < total_gops {
+                refine_targets.insert(idx + 1);
+            }
+        }
+    };
+
+    // 手順6: 測定用の統計を stderr に1行出す。
+    eprintln!(
+        "[analyze] 階層化ロゴ検出: キーフレーム{}枚、精緻化GOP {}/{total_gops}個\
+         （不動点化{iterations}回）、追加デコードフレーム数{refined_frames}枚\
+         （全フレーム数{expected_frame_count}枚）",
+        kf_frame_numbers.len(),
+        decoded_gops.len(),
+    );
+
+    Ok(full_scores)
+}
+
+/// 部分デコードの着地オラクル（issue #154「やること 5」）。
+///
+/// 部分デコードの先頭フレームは、シークが正しく着地していれば
+/// `start_frame` にあるキーフレームそのものであり、キーフレーム走査
+/// （手順1）で同じキーフレームに対して得た corr と**完全一致**するはず。
+/// 一致しなければシークが意図と違うフレームに着地した可能性があるとして
+/// エラーで停止する（黙って続行しない。CLAUDE.md 罠3の一般形）。
+///
+/// プロセス（ffmpeg）を起動せずに検証できるよう、
+/// [`detect_logo_scores_hier`] から分離した純粋関数にしている。
+fn verify_landing_oracle(
+    start_frame: u64,
+    expected_first: (f32, f32),
+    actual_first: (f32, f32),
+) -> Result<()> {
+    anyhow::ensure!(
+        expected_first == actual_first,
+        "部分デコードの着地オラクルに失敗しました（フレーム{start_frame}でシーク、\
+         期待するcorr={expected_first:?}、実際のcorr={actual_first:?}）。シークが\
+         意図と違うフレームに着地した可能性があります（CLAUDE.md 罠3の一般形）。"
+    );
+    Ok(())
 }
 
 /// [`inlogo_decision`] の結果。`-inlogo` を渡すかどうかと、渡さない場合の
@@ -1554,6 +2091,31 @@ fn dtvi_fps(dtvi: &Dtvi) -> f64 {
     };
     let num = parse("frame_rate_num", 30000.0);
     let den = parse("frame_rate_den", 1001.0);
+    if den == 0.0 {
+        num
+    } else {
+        num / den
+    }
+}
+
+/// `.dtvi` ヘッダの `time_base_num`/`time_base_den` から、pts の1単位あたりの
+/// 秒数を求める（レビュー指摘・issue #154「罠2」: `pts` は `frame_number / fps`
+/// では近似できない。`hier::seek_seconds_for_pts` に渡す `time_base_seconds`
+/// を作るための専用関数。`dtvi_fps` の `frame_rate_num`/`frame_rate_den`
+/// とは意味も既定値も異なる別のヘッダ項目である点に注意（fps はフレーム表示
+/// 間隔、time_base は pts/dts の目盛りの粒度で、両者が同じ値になるとは
+/// 限らない。手元の実測ではたまたま `time_base_num/den` が
+/// `frame_rate_den/frame_rate_num` の逆数と一致していたが、規格上その保証は
+/// 無いため別に読む）。キーが無い・数値でない場合は 1/30000（実測で確認した
+/// 対象素材の既定値）にフォールバックする。
+fn dtvi_time_base_seconds(dtvi: &Dtvi) -> f64 {
+    let parse = |key: &str, default: f64| {
+        dtvi.header_value(key)
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .unwrap_or(default)
+    };
+    let num = parse("time_base_num", 1.0);
+    let den = parse("time_base_den", 30000.0);
     if den == 0.0 {
         num
     } else {
@@ -2525,6 +3087,30 @@ mod tests {
             ),
         }
         fs::remove_dir_all(&dir).ok();
+    }
+
+    // --- verify_landing_oracle（issue #154）: プロセス起動なしの純粋ロジックの
+    // 検証。着地オラクル失敗時にエラーで停止する（黙って続行しない）ことを
+    // 完了条件どおり固定する。
+
+    #[test]
+    fn verify_landing_oracle_accepts_exact_match() {
+        assert!(verify_landing_oracle(120, (0.5, -0.25), (0.5, -0.25)).is_ok());
+    }
+
+    #[test]
+    fn verify_landing_oracle_rejects_any_mismatch() {
+        // ほんの僅かな差（シーク秒の計算を誤って1フレームずれて着地した場合に
+        // 典型的に出るズレ）でも許容せず、必ずエラーで停止する
+        // （hier::seek_seconds_for_pts の修正により、実録画・E2Eいずれでも
+        // 完全一致することを確認済み。issue #154「やること 5」）。
+        let err = verify_landing_oracle(120, (0.5, -0.25), (0.500_001, -0.25))
+            .expect_err("わずかな不一致でもエラーになるはず");
+        let message = format!("{err}");
+        assert!(
+            message.contains("着地オラクル"),
+            "エラーメッセージに着地オラクルの言及が無い: {message}"
+        );
     }
 
     // --- clear_stale_logoframe: フォールバック時の残骸削除 ---
