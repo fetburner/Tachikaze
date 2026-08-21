@@ -36,6 +36,7 @@ use crate::jls::{self, JlsEntry};
 use crate::logo::dict;
 use crate::logo::estimate::{self, SampleLabel};
 use crate::logo::frames::{self, LogoRect, VideoSize};
+use crate::logo::hier;
 use crate::logo::lgd::{self, LogoData};
 use crate::logo::scan;
 use crate::logo::{interval as logo_interval, score};
@@ -1076,14 +1077,16 @@ fn auto_logo_name(input: &Path) -> String {
 /// `--logo` 指定時のロゴ検出経路（E14-8、issue #97「解くべき問題」）。
 ///
 /// `.lgd` を読み、ロゴ矩形（`imgx`/`imgy`/`w`/`h`）で `work_mp4` のフレームを
-/// 流し、フレームごとに `(corr0, corr1)` を評価して区間を作る。読み取った
-/// フレーム数が `dtvi` の `frame_count`（ヘッダ、`dtvi.rs` の doc comment参照）と
-/// 一致しなければ [`frames::stream_luma_frames`] がエラーを返し（CLAUDE.md
-/// 罠3）、そのエラーはこの関数から `?` でそのまま伝播する。呼び出し元
+/// 流し、フレームごとに `(corr0, corr1)` を評価して区間を作る。フレーム数の
+/// `.dtvi` との一致検査は、キャッシュヒット時は [`read_score_cache`]（保存
+/// されている要素数の検査）、デコードする場合は [`detect_logo_scores_hier`]
+/// （キーフレーム数の一致検査＋部分デコードの着地オラクル）が行う。いずれかの
+/// 検査に失敗すればエラーが `?` でそのまま伝播する。呼び出し元
 /// （[`run_pipeline`]）はこの時点でまだ `join_logo_scp` を起動していないため、
 /// この検査は必ず起動前に効く。
 ///
-/// この関数の主コストは上記のフルデコード（実測30分1080pで約19秒・CPU約162秒）。
+/// この関数の主コストはデコード（実測30分1080pで約19秒・CPU約162秒。
+/// [`detect_logo_scores_hier`] の階層化方式で約6割に短縮、issue #154）。
 /// ロゴ・入力が変わらない再実行（jls-settings の調整反復、`auto` のやり直し）
 /// でも毎回払うため、corr スコア列（`scores`）を `cwd`（キャッシュディレクトリ、
 /// `--cache-dir` 配下）に `logo-scores-<キー>.bin` として保存し、次回以降は
@@ -1163,17 +1166,15 @@ fn detect_logo(
     }
 
     if !loaded_from_cache {
-        frames::stream_luma_frames(
+        scores = detect_logo_scores_hier(
             ffmpeg_path,
             work_mp4,
             cwd,
+            &mask,
             rect,
             video_size,
+            dtvi,
             expected_frame_count,
-            |frame| {
-                scores.push(mask.evaluate(frame));
-                Ok(())
-            },
         )?;
 
         if let Err(err) = write_score_cache(&score_cache_file, &scores) {
@@ -1438,6 +1439,181 @@ fn read_score_cache(path: &Path, expected_frame_count: u64) -> Option<Vec<(f32, 
         offset += 8;
     }
     Some(scores)
+}
+
+/// [`detect_logo`] のデコードを、キーフレーム走査＋状態が変わる GOP だけの
+/// 部分デコードに階層化した実装（issue #154「解くべき問題」）。
+///
+/// ロゴ区間の境界は CM 切り替わり付近にしかなく、区間の内部はキーフレームの
+/// 判定だけで決まる。全編フルデコード（実測30分1080pで約19秒・CPU約162秒）の
+/// 代わりに、キーフレーム走査（実測6.4秒・CPU8秒）で粗く判定し、判定が変わる
+/// GOP だけ部分デコード（実測0.12秒/GOP）する。`detect_logo` と同じ全長
+/// `(corr0, corr1)` 列を返すため、`logo_interval::write_result` は無改造で使う。
+/// 手順の詳細（GOP 構築・精緻化対象の選定・全長列の組み立て）は
+/// `src/logo/hier.rs` のモジュール doc comment参照。
+///
+/// # 手順
+///
+/// 1. **キーフレーム走査**: [`frames::stream_keyframe_cropped_luma_frames`]
+///    でロゴ矩形をffmpeg側でクロップしたキーフレームを流し、`mask.evaluate`
+///    する。読めた枚数と [`dtvi_keyframe_frame_numbers`] の要素数の一致を
+///    検査する（CLAUDE.md 罠3）。**`stream_keyframe_luma_frames`（全画面）＋
+///    `dict::crop_frame`（Rust手動クロップ）は使わない**（`frames.rs`
+///    「実録画で見つかった罠」参照: 手動クロップと `-vf crop` はビット単位で
+///    一致せず、着地オラクルが実録画で誤って失敗する）。
+/// 2. **粗判定**: 各キーフレームの corr を [`logo_interval::raw_score`] /
+///    [`logo_interval::instant_label`]（`write_result` がフレーム単位で使う
+///    のと同じ式・同じ閾値 `THRESH`）で窓なしのロゴ在/不在にラベルづけする。
+/// 3. **精緻化対象の選定**: [`hier::select_refine_targets`]
+///    （隣接キーフレームでラベルが変わる GOP とその前後1 GOP、先頭 GOP・
+///    末尾 GOP は常に選ぶ）。
+/// 4. **GOP の部分デコード**: [`hier::group_consecutive`] で連続範囲に
+///    まとめ、範囲ごとに [`frames::decode_frame_range_luma_frames`] を1回
+///    起動する。`-ss` の秒数は [`hier::seek_seconds_for_frame`]（対象
+///    キーフレームの pts のわずかに手前。レビュー指摘・実録画で判明:
+///    「pts の少し後」を指定すると ffmpeg の既定のフレーム精度シークが
+///    対象キーフレーム自身を「まだ来ていない」と判断して1フレーム後ろに
+///    着地する。詳細は同関数の doc comment参照）。
+/// 5. **着地オラクル**: 部分デコードの先頭フレームの corr が、手順1で得た
+///    同じキーフレームの corr と完全一致することを [`verify_landing_oracle`]
+///    で検査する。一致しなければシークが意図と違うフレームに着地した可能性が
+///    あるとしてエラーで停止する（CLAUDE.md 罠3の一般形）。
+/// 6. **全長 corr 列の組み立て**: [`hier::assemble_full_scores`]
+///    （精緻化した GOP は実測 corr、それ以外は直前のキーフレームの corr を
+///    ホールドして埋める）。
+/// 7. 精緻化した GOP 数・総 GOP 数・追加デコードしたフレーム数を stderr に
+///    1行出す（性能測定用）。
+#[allow(clippy::too_many_arguments)]
+fn detect_logo_scores_hier(
+    ffmpeg_path: &Path,
+    work_mp4: &Path,
+    cwd: &Path,
+    mask: &score::LogoMask,
+    rect: LogoRect,
+    video_size: VideoSize,
+    dtvi: &Dtvi,
+    expected_frame_count: u64,
+) -> Result<Vec<(f32, f32)>> {
+    // 手順1: キーフレーム走査。ロゴ矩形は ffmpeg 側（`-vf crop`）で切り出す。
+    // 第2段の部分デコード（`decode_frame_range_luma_frames`）も同じ `-vf crop`
+    // 経由なので、着地オラクル（手順5）でビット単位の完全一致を要求できる
+    // （`stream_keyframe_luma_frames`＋`dict::crop_frame`の組は使わない。
+    // 手順1のdoc comment参照）。
+    let mut kf_scores: Vec<(f32, f32)> = Vec::new();
+    let read_keyframe_count = frames::stream_keyframe_cropped_luma_frames(
+        ffmpeg_path,
+        work_mp4,
+        cwd,
+        rect,
+        video_size,
+        |frame| {
+            kf_scores.push(mask.evaluate(frame));
+            Ok(())
+        },
+    )?;
+
+    let kf_frame_numbers_u32 = dtvi_keyframe_frame_numbers(dtvi);
+    anyhow::ensure!(
+        read_keyframe_count as usize == kf_frame_numbers_u32.len(),
+        "ffmpeg が実際に流したキーフレーム数（{read_keyframe_count}枚）が .dtvi の\
+         キーフレーム数（{}枚、キーパケットの frame_number の個数）と一致しません。\
+         この不一致を無視して後続の階層化方式に進むと、キーフレームのcorrと\
+         フレーム番号の対応が黙ってずれます（CLAUDE.md 罠3の一般形）。",
+        kf_frame_numbers_u32.len()
+    );
+    let kf_frame_numbers: Vec<u64> = kf_frame_numbers_u32.iter().map(|&n| u64::from(n)).collect();
+
+    // 手順2: 粗判定。`write_result` がフレーム単位で使うのと同じ式・閾値。
+    let labels: Vec<Option<bool>> = kf_scores
+        .iter()
+        .map(|&(corr0, corr1)| logo_interval::instant_label(logo_interval::raw_score(corr0, corr1)))
+        .collect();
+
+    // 手順3: 精緻化対象の選定。
+    let targets = hier::select_refine_targets(&labels);
+    let total_refine_targets = targets.len();
+    let ranges = hier::group_consecutive(targets);
+    let gops = hier::build_gops(&kf_frame_numbers, expected_frame_count);
+    let total_gops = gops.len();
+
+    let fps = dtvi_fps(dtvi);
+
+    // 手順4-5: GOPの部分デコードと着地オラクル。
+    let mut refined: Vec<hier::RefinedRange> = Vec::new();
+    let mut refined_frames: u64 = 0;
+    for &(start_kf_idx, end_kf_idx) in &ranges {
+        let start_frame = gops[start_kf_idx].start;
+        let end_frame_exclusive = gops[end_kf_idx].end;
+        let frame_count = end_frame_exclusive - start_frame;
+        let seek_seconds = hier::seek_seconds_for_frame(start_frame, fps);
+
+        let mut decoded: Vec<(f32, f32)> = Vec::with_capacity(frame_count as usize);
+        frames::decode_frame_range_luma_frames(
+            ffmpeg_path,
+            work_mp4,
+            cwd,
+            rect,
+            video_size,
+            seek_seconds,
+            frame_count,
+            |frame| {
+                decoded.push(mask.evaluate(frame));
+                Ok(())
+            },
+        )?;
+
+        verify_landing_oracle(start_frame, kf_scores[start_kf_idx], decoded[0])?;
+
+        refined_frames += decoded.len() as u64;
+        refined.push(hier::RefinedRange {
+            start_frame,
+            scores: decoded,
+        });
+    }
+
+    // 手順6: 全長 corr 列の組み立て（無改造の write_result に渡す）。
+    let full_scores = hier::assemble_full_scores(
+        &kf_frame_numbers,
+        &kf_scores,
+        expected_frame_count,
+        &refined,
+    );
+
+    // 手順7: 測定用の統計を stderr に1行出す。
+    eprintln!(
+        "[analyze] 階層化ロゴ検出: キーフレーム{}枚、精緻化GOP {}/{}個、\
+         追加デコードフレーム数{}枚（全フレーム数{expected_frame_count}枚）",
+        kf_frame_numbers.len(),
+        total_refine_targets,
+        total_gops,
+        refined_frames,
+    );
+
+    Ok(full_scores)
+}
+
+/// 部分デコードの着地オラクル（issue #154「やること 5」）。
+///
+/// 部分デコードの先頭フレームは、シークが正しく着地していれば
+/// `start_frame` にあるキーフレームそのものであり、キーフレーム走査
+/// （手順1）で同じキーフレームに対して得た corr と**完全一致**するはず。
+/// 一致しなければシークが意図と違うフレームに着地した可能性があるとして
+/// エラーで停止する（黙って続行しない。CLAUDE.md 罠3の一般形）。
+///
+/// プロセス（ffmpeg）を起動せずに検証できるよう、
+/// [`detect_logo_scores_hier`] から分離した純粋関数にしている。
+fn verify_landing_oracle(
+    start_frame: u64,
+    expected_first: (f32, f32),
+    actual_first: (f32, f32),
+) -> Result<()> {
+    anyhow::ensure!(
+        expected_first == actual_first,
+        "部分デコードの着地オラクルに失敗しました（フレーム{start_frame}でシーク、\
+         期待するcorr={expected_first:?}、実際のcorr={actual_first:?}）。シークが\
+         意図と違うフレームに着地した可能性があります（CLAUDE.md 罠3の一般形）。"
+    );
+    Ok(())
 }
 
 /// [`inlogo_decision`] の結果。`-inlogo` を渡すかどうかと、渡さない場合の
@@ -2525,6 +2701,30 @@ mod tests {
             ),
         }
         fs::remove_dir_all(&dir).ok();
+    }
+
+    // --- verify_landing_oracle（issue #154）: プロセス起動なしの純粋ロジックの
+    // 検証。着地オラクル失敗時にエラーで停止する（黙って続行しない）ことを
+    // 完了条件どおり固定する。
+
+    #[test]
+    fn verify_landing_oracle_accepts_exact_match() {
+        assert!(verify_landing_oracle(120, (0.5, -0.25), (0.5, -0.25)).is_ok());
+    }
+
+    #[test]
+    fn verify_landing_oracle_rejects_any_mismatch() {
+        // ほんの僅かな差（シーク秒の計算を誤って1フレームずれて着地した場合に
+        // 典型的に出るズレ）でも許容せず、必ずエラーで停止する
+        // （hier::seek_seconds_for_frame の修正により、実録画でも完全一致する
+        // ことを確認済み。issue #154「やること 5」）。
+        let err = verify_landing_oracle(120, (0.5, -0.25), (0.500_001, -0.25))
+            .expect_err("わずかな不一致でもエラーになるはず");
+        let message = format!("{err}");
+        assert!(
+            message.contains("着地オラクル"),
+            "エラーメッセージに着地オラクルの言及が無い: {message}"
+        );
     }
 
     // --- clear_stale_logoframe: フォールバック時の残骸削除 ---

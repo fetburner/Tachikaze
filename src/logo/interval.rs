@@ -74,6 +74,30 @@
 //! 超えて戻る入力では逆イテレータ範囲が反転して UB になる（本実装はその
 //! ケースで安全に `it` で止まる）。
 
+/// 1フレームの `(corr0, corr1)` から生スコアを求める（[`write_result`] 手順1と
+/// 同じ式）。`corr0` のマイナスと `corr1` のプラスはノイズなので捨てる。
+///
+/// ロゴ検出の階層化方式（`src/logo/hier.rs`、issue #154）がキーフレーム単体を
+/// 窓なしで粗く判定する際にもこの式を使うため、複製せず `pub(crate)` で共有する。
+pub(crate) fn raw_score(corr0: f32, corr1: f32) -> f32 {
+    corr0.max(0.0) + corr1.min(0.0)
+}
+
+/// 窓を使わない瞬時判定。[`Judgement::from_threshold`] を移動平均判定と同じ
+/// 閾値 [`THRESH`] で生スコアに直接適用したもの。`None` は不明
+/// （[`Judgement::Unknown`]）。
+///
+/// `write_result` 本体はこの関数を使わない（窓（MinMax・移動平均）を通した
+/// 判定だけを使う）。窓を作れない孤立した1フレームだけの粗い判定
+/// （ロゴ検出の階層化方式のキーフレーム走査、issue #154）のために公開する。
+pub(crate) fn instant_label(raw: f32) -> Option<bool> {
+    match Judgement::from_threshold(raw, THRESH) {
+        Judgement::HasLogo => Some(true),
+        Judgement::NoLogo => Some(false),
+        Judgement::Unknown => None,
+    }
+}
+
 /// フレーム1個の判定値。**数値のまま扱わず列挙型にする**
 /// （原典は `int`（0/1/2）で、取り違えても例外が飛ばない）。
 ///
@@ -142,7 +166,7 @@ pub fn write_result(scores: &[(f32, f32)], fps: f64) -> LogoIntervals {
     // 手順1: 生スコア。corr0のマイナスとcorr1のプラスはノイズなので捨てる。
     let raw: Vec<f32> = scores
         .iter()
-        .map(|&(corr0, corr1)| corr0.max(0.0) + corr1.min(0.0))
+        .map(|&(corr0, corr1)| raw_score(corr0, corr1))
         .collect();
 
     // 窓サイズ。原典は fps をまず整数に丸めてから使う（`framesPerSec`）ので、
@@ -369,6 +393,28 @@ fn build_text(result: &[Judgement], score: &[f32]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---------------------------------------------------------------
+    // raw_score / instant_label（ロゴ検出の階層化方式が使う共有ロジック、
+    // issue #154）
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn raw_score_drops_negative_corr0_and_positive_corr1() {
+        assert_eq!(raw_score(-1.0, 0.5), 0.0);
+        assert_eq!(raw_score(1.0, 0.5), 1.0);
+        assert_eq!(raw_score(1.0, -0.5), 0.5);
+    }
+
+    #[test]
+    fn instant_label_matches_write_result_threshold() {
+        assert_eq!(instant_label(1.0), Some(true));
+        assert_eq!(instant_label(-1.0), Some(false));
+        assert_eq!(instant_label(0.0), None);
+        // THRESH = 0.2 の境界。
+        assert_eq!(instant_label(0.19), None);
+        assert_eq!(instant_label(0.21), Some(true));
+    }
 
     /// テスト用の生スコアを `(corr0, corr1)` に変換する。テスト側は
     /// `raw[n] = max(0,corr0)+min(0,corr1)` の詳細を気にせず生スコアだけを
