@@ -301,7 +301,7 @@ TOKYO MX の ED 区間（90秒）は、ロゴ自体は出ているのに段差�
 
 ### ロゴ検出の階層化方式の収束判定・性能足切りは経験的な閾値である
 
-`detect_logo_scores_hier`（issue #154）の不動点化の収束判定
+`detect_logo_scores_hier` の不動点化の収束判定
 （`REQUIRED_STABLE_ROUNDS`）は、実測に基づく経験的な閾値である。性能足切り
 （`HIER_FALLBACK_GOP_FRACTION_THRESHOLD`）も同様に経験的な閾値である。
 数学的な収束証明は無い。前者は実測で観測した「偽の安定」（2ラウンド）に
