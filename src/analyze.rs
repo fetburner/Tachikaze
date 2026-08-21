@@ -866,6 +866,31 @@ fn auto_logo_name(input: &Path) -> String {
 /// （[`run_pipeline`]）はこの時点でまだ `join_logo_scp` を起動していないため、
 /// この検査は必ず起動前に効く。
 ///
+/// この関数の主コストは上記のフルデコード（実測30分1080pで約19秒・CPU約162秒）。
+/// ロゴ・入力が変わらない再実行（jls-settings の調整反復、`auto` のやり直し）
+/// でも毎回払うため、corr スコア列（`scores`）を `cwd`（キャッシュディレクトリ、
+/// `--cache-dir` 配下）に `logo-scores-<キー>.bin` として保存し、次回以降は
+/// デコードそのものを省略する（issue #152「解くべき問題」）。キーは
+/// [`score_cache_key`] が `.lgd` のバイト列 + `expected_frame_count` に加え、
+/// `.dtvi` ヘッダの `source_size`/`source_mtime_ns`/`source_fingerprint`
+/// （入力ファイルそのものの識別子）から作る。**レビュー指摘**: 当初は
+/// `.lgd` + `expected_frame_count` だけだったため、`workdir::cache_dir_for_input`
+/// と同じ「同じパスに別内容のファイルが置かれた場合を区別できない」リスク
+/// （`src/auto.rs` モジュール doc comment「キャッシュを短絡しない」）をこの
+/// スコアキャッシュ自身が持っていた（同一パスへの録画の上書き後、古いロゴ
+/// 区間で誤った logoframe を書く実害を実測で確認）。上記3項目を鍵に含めた
+/// ことで、入力の実体が変われば必ず別キーになる。
+///
+/// キャッシュファイルには magic・形式版・[`ScoreCacheDerivation`]（スコア列の
+/// 導出方法）も書き込む（レビュー指摘: `.lgd`/フレーム数/入力識別子が同じでも、
+/// スコア列を作る**アルゴリズム自体**が変わった場合に古いキャッシュを黙って
+/// 再利用しないため）。いずれか一致しない場合はキャッシュを無視してフルパスへ
+/// 落とす（[`read_score_cache`] 参照）。
+///
+/// ヒット時に読み取った要素数が `expected_frame_count` と一致しない場合も
+/// キャッシュを無視してフルパスへ落とす（CLAUDE.md 罠3の一般形）。キャッシュは
+/// 最適化であり無くても正しく動くため、書き込み失敗は警告に留めて続行する。
+///
 /// 検出フレーム割合が閾値（[`logo_detection_threshold`]）以上、**かつ**
 /// `LogoIntervals::text` が空でない場合にだけ logoframe テキストを
 /// `logoframe_path` に書いてそのパスを返す。
@@ -900,19 +925,43 @@ fn detect_logo(
     let video_size = dtvi_video_size(dtvi)?;
     let expected_frame_count = dtvi_frame_count(dtvi)?;
 
+    let lgd_bytes = fs::read(lgd_path).path_ctx(".lgd の読み込み（キャッシュキー用）", lgd_path)?;
+    let score_cache_file =
+        score_cache_path(cwd, score_cache_key(&lgd_bytes, expected_frame_count, dtvi));
+
     let mut scores: Vec<(f32, f32)> = Vec::new();
-    frames::stream_luma_frames(
-        ffmpeg_path,
-        work_mp4,
-        cwd,
-        rect,
-        video_size,
-        expected_frame_count,
-        |frame| {
-            scores.push(mask.evaluate(frame));
-            Ok(())
-        },
-    )?;
+    let mut loaded_from_cache = false;
+    if let Some(cached) = read_score_cache(&score_cache_file, expected_frame_count) {
+        eprintln!(
+            "[analyze] corr スコア列をキャッシュから読み込みました（デコードを省略します）: {}",
+            score_cache_file.display()
+        );
+        scores = cached;
+        loaded_from_cache = true;
+    }
+
+    if !loaded_from_cache {
+        frames::stream_luma_frames(
+            ffmpeg_path,
+            work_mp4,
+            cwd,
+            rect,
+            video_size,
+            expected_frame_count,
+            |frame| {
+                scores.push(mask.evaluate(frame));
+                Ok(())
+            },
+        )?;
+
+        if let Err(err) = write_score_cache(&score_cache_file, &scores) {
+            eprintln!(
+                "[analyze] 警告: corr スコア列のキャッシュ書き込みに失敗しました\
+                 （最適化のためのキャッシュであり、無くても処理は続行します）: {} ({err})",
+                score_cache_file.display()
+            );
+        }
+    }
 
     let fps = dtvi_fps(dtvi);
     let result = logo_interval::write_result(&scores, fps);
@@ -971,6 +1020,186 @@ fn detect_logo(
             Ok(None)
         }
     }
+}
+
+// --- corr スコア列キャッシュ（issue #152、レビュー指摘で入力識別子と
+// フォーマット検査を追加） ---
+//
+// `detect_logo` の主コストは `frames::stream_luma_frames` による全編フル
+// デコード（実測30分1080pで約19秒）。その出力である `scores`（corr スコア列）
+// を `cwd`（キャッシュディレクトリ）内のファイルへ保存し、ロゴ・入力とも
+// 変わらない再実行ではデコードそのものを丸ごと省く。
+
+/// FNV-1a（64bit）の実装。`std::collections::hash_map::DefaultHasher` は
+/// バージョン間の安定性が保証されない（`Hasher` トレイトのドキュメントに
+/// 明記されている）ため、プロセスを跨いで永続化するキャッシュファイル名には
+/// 使えない。依存クレートを増やさずに済み、仕様が枯れていて実装も数行で済む
+/// FNV-1a を自前で書く。
+fn fnv1a_64(bytes: &[u8]) -> u64 {
+    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = OFFSET_BASIS;
+    for &b in bytes {
+        hash ^= u64::from(b);
+        hash = hash.wrapping_mul(PRIME);
+    }
+    hash
+}
+
+/// キャッシュキー: `.lgd` のバイト列 + `expected_frame_count` + 入力ファイル
+/// 自体の識別子（`.dtvi` ヘッダの `source_size`/`source_mtime_ns`/
+/// `source_fingerprint`）から作る（issue #152「やること 2」、レビュー指摘）。
+///
+/// **レビュー指摘で発覚した実害**: 当初は `.lgd` + `expected_frame_count` だけ
+/// だったため、キャッシュファイルのパス（`score_cache_path`）は `cwd`
+/// （入力ごとの作業ディレクトリ）に置かれるとはいえ、`cwd` 自体が
+/// `workdir::cache_dir_for_input` の「入力絶対パスのハッシュ」だけで決まる
+/// （`src/auto.rs` モジュール doc comment「キャッシュを短絡しない」）ため、
+/// **同じパスに別内容の録画ファイルが上書きされ、かつ偶然フレーム数まで
+/// 一致する場合**、古いスコア列を新しい入力に対して誤って使ってしまう
+/// （実測で確認: 上書き後も検出フレーム数が古い動画の値のまま変わらず、
+/// 誤った logoframe を書いた）。`source_size`/`source_mtime_ns`/
+/// `source_fingerprint` は入力ファイルの実体を識別する値（`.dtvi` ヘッダ、
+/// `dtvi.rs` の doc comment参照）なので、これらを鍵に含めれば
+/// 「同じパスだが別内容」を確実に別キーにできる。
+///
+/// `.lgd` が変わる（再学習・別ロゴ）、`.dtvi` の `frame_count` が変わる、
+/// または入力の実体が変わると必ず別キーになる。ヘッダにキーが無い場合
+/// （将来の `.dtvi` フォーマット変更等）も、値の有無自体を区別できるよう
+/// 存在フラグを1バイト挟んで連結する（「キーが無い」と「キーの値が空文字列」
+/// が同じバイト列に化けないようにするため）。全体を1回の FNV-1a に通す
+/// （FNV-1a はストリーミング可能で、別々にハッシュしてから混ぜるより衝突
+/// 耐性の議論が単純）。
+fn score_cache_key(lgd_bytes: &[u8], expected_frame_count: u64, dtvi: &Dtvi) -> u64 {
+    let mut buf = Vec::with_capacity(lgd_bytes.len() + 8);
+    buf.extend_from_slice(lgd_bytes);
+    buf.extend_from_slice(&expected_frame_count.to_le_bytes());
+    for key in ["source_size", "source_mtime_ns", "source_fingerprint"] {
+        match dtvi.header_value(key) {
+            Some(value) => {
+                buf.push(1);
+                buf.extend_from_slice(value.as_bytes());
+            }
+            None => buf.push(0),
+        }
+        // フィールドの区切り。値のバイト列の中に紛れ込んでも次のフィールドの
+        // 存在フラグ（0/1）が続くため境界の曖昧さは生じない。
+        buf.push(0xff);
+    }
+    fnv1a_64(&buf)
+}
+
+/// キャッシュファイルのパス（`cwd` = キャッシュディレクトリ内、
+/// `docs/architecture.md`「パス解決」の「キャッシュ（再生成可能な中間物）」に
+/// 合致する置き場所）。
+///
+/// 同じ入力で `.lgd` を再学習すると鍵が変わり、古いキーのファイルは
+/// `cwd` に残り続ける。`analyze` を再実行するたびに他候補分も含めて掃除する
+/// と、`run_auto_logo_detection` の候補直列ループが同じ `cwd` で複数の `.lgd`
+/// を順に試す最中に自分自身の直前の結果まで消してしまいかねず、掃除の範囲を
+/// 「今回のキー以外」に絞る判定はこの関数の外（呼び出し元）の知識が要って
+/// 複雑になる。`--cache-dir` 配下は元々「消えても `analyze` の再実行で
+/// 作り直せる中間物」という規約（`docs/architecture.md`「パス解決」）のため、
+/// 古いキーのファイルが溜まる問題は自動掃除を作らず、キャッシュディレクトリ
+/// ごと消す既存の運用に委ねる（issue #152「やること 6」）。
+fn score_cache_path(cwd: &Path, key: u64) -> PathBuf {
+    cwd.join(format!("logo-scores-{key:016x}.bin"))
+}
+
+/// キャッシュファイルの先頭に置く magic バイト列。
+const SCORE_CACHE_MAGIC: [u8; 4] = *b"TKSC";
+
+/// キャッシュファイルの構造上のバージョン（レビュー指摘、要修正5）。
+///
+/// ここでいう「構造」は、このファイル自体のバイナリレイアウト（フィールドの
+/// 並び・型）を指す。[`SCORE_CACHE_DERIVATION`] とは独立に管理する（後方の
+/// フィールド1個を増やすような変更はここだけを上げれば済み、スコア列を作る
+/// アルゴリズム自体は変わらないケースがあるため）。
+const SCORE_CACHE_FORMAT_VERSION: u32 = 1;
+
+/// キャッシュに保存された `scores` を作った**アルゴリズム自体**の識別子
+/// （レビュー指摘、要修正5）。
+///
+/// `.lgd`・フレーム数・入力識別子がすべて一致していても、`scores` を組み立てる
+/// アルゴリズムが変わった場合（例: 全編フルデコードから、キーフレーム走査＋
+/// 部分デコードの階層化方式（issue #154）への変更）は古いキャッシュを黙って
+/// 再利用してはならない。もし新旧アルゴリズムの出力が理論上同一になるはずでも、
+/// 実装のバグ等で食い違う可能性を残さないため、アルゴリズムを変えたら必ず
+/// この値も変える。値そのものに意味はなく、[`read_score_cache`] で現在の
+/// コードが期待する値と完全一致するかだけを見る。
+///
+/// `0` = 全編フルデコード（`frames::stream_luma_frames`、issue #152 導入時点の
+/// 唯一の経路）。E18-9 で階層化方式を導入する際に新しい値へ切り替える。
+const SCORE_CACHE_DERIVATION: u32 = 0;
+
+/// キャッシュファイルのヘッダ長（magic 4バイト + 形式版4バイト + 導出方法
+/// タグ4バイト + 要素数8バイト）。
+const SCORE_CACHE_HEADER_LEN: usize = 4 + 4 + 4 + 8;
+
+/// `scores` をキャッシュファイルへ書く。フォーマット: magic（4バイト）+
+/// 形式版（`u32`, LE）+ 導出方法タグ（`u32`, LE）+ 要素数（`u64`, LE）+
+/// `(f32, f32)` のペアを LE で並べたもの。
+fn write_score_cache(path: &Path, scores: &[(f32, f32)]) -> std::io::Result<()> {
+    let mut buf = Vec::with_capacity(SCORE_CACHE_HEADER_LEN + scores.len() * 8);
+    buf.extend_from_slice(&SCORE_CACHE_MAGIC);
+    buf.extend_from_slice(&SCORE_CACHE_FORMAT_VERSION.to_le_bytes());
+    buf.extend_from_slice(&SCORE_CACHE_DERIVATION.to_le_bytes());
+    buf.extend_from_slice(&(scores.len() as u64).to_le_bytes());
+    for (a, b) in scores {
+        buf.extend_from_slice(&a.to_le_bytes());
+        buf.extend_from_slice(&b.to_le_bytes());
+    }
+    fs::write(path, buf)
+}
+
+/// キャッシュファイルから `scores` を復元する。次のいずれかに該当する場合は
+/// `None` を返し、呼び出し側はフルパス（フルデコード）に落ちる:
+///
+/// - ファイルが無い・読めない
+/// - magic が一致しない（このツールが書いたキャッシュではない）
+/// - [`SCORE_CACHE_FORMAT_VERSION`] または [`SCORE_CACHE_DERIVATION`] が
+///   現在のコードの値と一致しない（レビュー指摘、要修正5: `scores` を作る
+///   アルゴリズムが変わった後に古いキャッシュを黙って使わないための検査）
+/// - 保存されている要素数が `expected_frame_count` と一致しない、または
+///   ファイルサイズが要素数から導ける期待値と食い違う（壊れている）
+///
+/// **要素数検査を省くと静かに壊れる**（CLAUDE.md 罠3の一般形、issue
+/// #152「罠」）: フレーム数が違う `.dtvi` に対して古いスコア列を使うと、
+/// 例外を出さずロゴ区間がずれた trim が出る。
+fn read_score_cache(path: &Path, expected_frame_count: u64) -> Option<Vec<(f32, f32)>> {
+    let bytes = fs::read(path).ok()?;
+    if bytes.len() < SCORE_CACHE_HEADER_LEN {
+        return None;
+    }
+    if bytes[0..4] != SCORE_CACHE_MAGIC {
+        return None;
+    }
+    let format_version = u32::from_le_bytes(bytes[4..8].try_into().ok()?);
+    if format_version != SCORE_CACHE_FORMAT_VERSION {
+        return None;
+    }
+    let derivation = u32::from_le_bytes(bytes[8..12].try_into().ok()?);
+    if derivation != SCORE_CACHE_DERIVATION {
+        return None;
+    }
+    let count = u64::from_le_bytes(bytes[12..20].try_into().ok()?);
+    if count != expected_frame_count {
+        return None;
+    }
+    let count_usize = usize::try_from(count).ok()?;
+    let expected_len = SCORE_CACHE_HEADER_LEN.checked_add(count_usize.checked_mul(8)?)?;
+    if bytes.len() != expected_len {
+        return None;
+    }
+    let mut scores = Vec::with_capacity(count_usize);
+    let mut offset = SCORE_CACHE_HEADER_LEN;
+    for _ in 0..count_usize {
+        let a = f32::from_le_bytes(bytes[offset..offset + 4].try_into().ok()?);
+        let b = f32::from_le_bytes(bytes[offset + 4..offset + 8].try_into().ok()?);
+        scores.push((a, b));
+        offset += 8;
+    }
+    Some(scores)
 }
 
 /// [`inlogo_decision`] の結果。`-inlogo` を渡すかどうかと、渡さない場合の
@@ -1711,6 +1940,176 @@ mod tests {
     #[test]
     fn auto_logo_name_falls_back_when_stem_is_unavailable() {
         assert_eq!(auto_logo_name(Path::new("/")), "tachikaze-auto-logo");
+    }
+
+    // --- corr スコア列キャッシュ（issue #152）: プロセス起動なしの純粋ロジックのテスト ---
+
+    #[test]
+    fn score_cache_round_trip_restores_scores() {
+        let dir = unique_scratch_dir("score-cache-roundtrip");
+        let path = dir.join("logo-scores-test.bin");
+        let scores: Vec<(f32, f32)> = vec![(0.1, 0.2), (-1.5, 3.25), (0.0, 0.0)];
+
+        write_score_cache(&path, &scores).expect("キャッシュの書き込みに成功するはず");
+        let restored =
+            read_score_cache(&path, scores.len() as u64).expect("キャッシュの復元に成功するはず");
+        assert_eq!(restored, scores);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn score_cache_mismatched_frame_count_is_rejected() {
+        // 保存されている要素数と expected_frame_count が食い違う場合は、
+        // 壊れたキャッシュとして無視してフルパスに落とす（None を返す）。
+        let dir = unique_scratch_dir("score-cache-mismatch");
+        let path = dir.join("logo-scores-test.bin");
+        let scores: Vec<(f32, f32)> = vec![(0.1, 0.2), (-1.5, 3.25), (0.0, 0.0)];
+
+        write_score_cache(&path, &scores).expect("キャッシュの書き込みに成功するはず");
+        let restored = read_score_cache(&path, (scores.len() as u64) + 1);
+        assert!(restored.is_none(), "要素数不一致なら None を返すはず");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn score_cache_truncated_file_is_rejected() {
+        // ファイルサイズが半端（要素数どおりのバイト数に届かない）な場合も
+        // 壊れたキャッシュとして None を返す。
+        let dir = unique_scratch_dir("score-cache-truncated");
+        let path = dir.join("logo-scores-test.bin");
+        let scores: Vec<(f32, f32)> = vec![(0.1, 0.2), (-1.5, 3.25), (0.0, 0.0)];
+        write_score_cache(&path, &scores).expect("キャッシュの書き込みに成功するはず");
+
+        let mut bytes = fs::read(&path).unwrap();
+        bytes.truncate(bytes.len() - 3);
+        fs::write(&path, &bytes).unwrap();
+
+        assert!(read_score_cache(&path, scores.len() as u64).is_none());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn score_cache_missing_file_is_rejected() {
+        let dir = unique_scratch_dir("score-cache-missing");
+        let path = dir.join("logo-scores-does-not-exist.bin");
+        assert!(read_score_cache(&path, 0).is_none());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn score_cache_wrong_magic_is_rejected() {
+        // このツールが書いたキャッシュではないファイル（magic不一致）は
+        // 無視してフルパスに落とす。
+        let dir = unique_scratch_dir("score-cache-wrong-magic");
+        let path = dir.join("logo-scores-test.bin");
+        let scores: Vec<(f32, f32)> = vec![(0.1, 0.2)];
+        write_score_cache(&path, &scores).expect("キャッシュの書き込みに成功するはず");
+
+        let mut bytes = fs::read(&path).unwrap();
+        bytes[0..4].copy_from_slice(b"XXXX");
+        fs::write(&path, &bytes).unwrap();
+
+        assert!(read_score_cache(&path, scores.len() as u64).is_none());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn score_cache_wrong_format_version_is_rejected() {
+        // レビュー指摘（要修正5）: 形式版が現在のコードの値と食い違うキャッシュ
+        // は黙って再利用せず、フルパスに落とす。
+        let dir = unique_scratch_dir("score-cache-wrong-format-version");
+        let path = dir.join("logo-scores-test.bin");
+        let scores: Vec<(f32, f32)> = vec![(0.1, 0.2)];
+        write_score_cache(&path, &scores).expect("キャッシュの書き込みに成功するはず");
+
+        let mut bytes = fs::read(&path).unwrap();
+        let bumped = SCORE_CACHE_FORMAT_VERSION.wrapping_add(1);
+        bytes[4..8].copy_from_slice(&bumped.to_le_bytes());
+        fs::write(&path, &bytes).unwrap();
+
+        assert!(read_score_cache(&path, scores.len() as u64).is_none());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn score_cache_wrong_derivation_is_rejected() {
+        // レビュー指摘（要修正5）: `scores` を作るアルゴリズム自体が変わった
+        // ことを示す導出方法タグが食い違うキャッシュは黙って再利用しない
+        // （E18-9 で階層化方式を導入した際にこの検査が効く）。
+        let dir = unique_scratch_dir("score-cache-wrong-derivation");
+        let path = dir.join("logo-scores-test.bin");
+        let scores: Vec<(f32, f32)> = vec![(0.1, 0.2)];
+        write_score_cache(&path, &scores).expect("キャッシュの書き込みに成功するはず");
+
+        let mut bytes = fs::read(&path).unwrap();
+        let bumped = SCORE_CACHE_DERIVATION.wrapping_add(1);
+        bytes[8..12].copy_from_slice(&bumped.to_le_bytes());
+        fs::write(&path, &bytes).unwrap();
+
+        assert!(read_score_cache(&path, scores.len() as u64).is_none());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn score_cache_key_differs_when_lgd_bytes_differ() {
+        let dtvi = dtvi_with_header(&[]);
+        let key_a = score_cache_key(b"lgd-a", 100, &dtvi);
+        let key_b = score_cache_key(b"lgd-b", 100, &dtvi);
+        assert_ne!(key_a, key_b, ".lgd が変われば別キーになるはず");
+    }
+
+    #[test]
+    fn score_cache_key_differs_when_frame_count_differs() {
+        let dtvi = dtvi_with_header(&[]);
+        let key_a = score_cache_key(b"same-lgd", 100, &dtvi);
+        let key_b = score_cache_key(b"same-lgd", 101, &dtvi);
+        assert_ne!(key_a, key_b, "frame_count が変われば別キーになるはず");
+    }
+
+    #[test]
+    fn score_cache_key_differs_when_source_identity_differs() {
+        // レビュー指摘の実害（同じパスに別内容の録画が上書きされた場合）を
+        // 固定するテスト: source_size/source_mtime_ns/source_fingerprint の
+        // いずれか1つでも変われば別キーになる。
+        let dtvi_a = dtvi_with_header(&[
+            ("source_size", "1000"),
+            ("source_mtime_ns", "111"),
+            ("source_fingerprint", "aaaa"),
+        ]);
+        let dtvi_b = dtvi_with_header(&[
+            ("source_size", "2000"),
+            ("source_mtime_ns", "111"),
+            ("source_fingerprint", "aaaa"),
+        ]);
+        let dtvi_c = dtvi_with_header(&[
+            ("source_size", "1000"),
+            ("source_mtime_ns", "111"),
+            ("source_fingerprint", "bbbb"),
+        ]);
+        let key_a = score_cache_key(b"same-lgd", 100, &dtvi_a);
+        let key_b = score_cache_key(b"same-lgd", 100, &dtvi_b);
+        let key_c = score_cache_key(b"same-lgd", 100, &dtvi_c);
+        assert_ne!(key_a, key_b, "source_size が変われば別キーになるはず");
+        assert_ne!(
+            key_a, key_c,
+            "source_fingerprint が変われば別キーになるはず"
+        );
+    }
+
+    #[test]
+    fn score_cache_key_differs_when_source_identity_header_is_missing_vs_empty() {
+        // ヘッダに全く無い場合と、値が空文字列の場合が同じバイト列に化けない
+        // ことを確認する（score_cache_key の存在フラグの目的）。
+        let dtvi_missing = dtvi_with_header(&[]);
+        let dtvi_empty = dtvi_with_header(&[("source_size", "")]);
+        let key_missing = score_cache_key(b"lgd", 100, &dtvi_missing);
+        let key_empty = score_cache_key(b"lgd", 100, &dtvi_empty);
+        assert_ne!(
+            key_missing, key_empty,
+            "ヘッダに無い場合と空文字列の場合は別キーになるはず"
+        );
     }
 
     // --- clear_stale_logoframe: フォールバック時の残骸削除 ---
