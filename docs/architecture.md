@@ -277,7 +277,7 @@ $ ffmpeg -i IN.mp4 -c copy -use_editlist 0 -movflags +faststart OUT.mp4
 
 ### キャッシュ鍵の弱さ
 
-キャッシュディレクトリ名は入力の**絶対パスのハッシュのみ**から決まる（`workdir::cache_dir_for_input`、FNV-1a）。同じパスに別内容のファイルが後から置かれても（録画ファイルの上書き・再利用）区別できず、古い `.dtvi` / `trim.avs` / `input_prepared.mp4` を新しい入力に対して誤って再利用しうる。`auto` は `analyze`/`prepare` を毎回作り直すことでこの穴を避けているが（`src/auto.rs` の doc comment）、`cut --dtvi` を省略してキャッシュから自動解決する経路には対策が無い。size + mtime の突き合わせなどの対策は、要求されていない現時点では追加しないと判断している（理由は `src/auto.rs` の doc comment 参照）。ただし `detect_logo` の corr スコア列キャッシュ（issue #152）はこれに該当しない。`.dtvi` ヘッダの `source_size`/`source_mtime_ns`/`source_fingerprint` をキーに含むため、同じパスでも入力の実体が変われば当たらない。
+キャッシュディレクトリ名は入力の**絶対パスのハッシュのみ**から決まる（`workdir::cache_dir_for_input`、FNV-1a）。同じパスに別内容のファイルが後から置かれても（録画ファイルの上書き・再利用）区別できず、古い `.dtvi` / `trim.avs` / `input_prepared.mp4` を新しい入力に対して誤って再利用しうる。`auto` は `analyze`/`prepare` を毎回作り直すことでこの穴を避けているが（`src/auto.rs` の doc comment）、`cut --dtvi` を省略してキャッシュから自動解決する経路には対策が無い。size + mtime の突き合わせなどの対策は、要求されていない現時点では追加しないと判断している（理由は `src/auto.rs` の doc comment 参照）。ただし `detect_logo` の corr スコア列キャッシュはこれに該当しない。`.dtvi` ヘッダの `source_size`/`source_mtime_ns`/`source_fingerprint` をキーに含むため、同じパスでも入力の実体が変われば当たらない。
 
 ### `-CutMrgIn` / `-CutMrgOut` を CLI から渡す口
 
@@ -388,7 +388,7 @@ struct DecodeIdx(u32);    // デコード順（mp4 のサンプル番号 / .dtvi
 8. `--cm-output` 指定時は保持側と CM 側でフレーム数の合計 == 総フレーム数、`DecodeIdx` の集合が互いに素
 9. `analyze --logo` 指定時: ffmpeg から読み取ったロゴ矩形のフレーム数が `.dtvi` の `frame_count` と一致するか（不一致なら明示エラーで停止）。検査の実体は `src/logo/frames.rs::stream_luma_frames`。ロゴ検出は `cut` とは別の ffmpeg 供給経路を使うため、上記 4 とは別に必要な検査
 10. **自動推定（`--logo`/`--no-logo` 両方省略）でも罠3の防御は緩んでいない**。候補の推定（`logo/estimate.rs::estimate_candidates`）は `stream_keyframe_luma_frames` を使う。ロゴ辞書候補の採点（`logo/dict.rs::select_candidate`）も同じ関数を使う。この関数は意図的にフレーム数一致検査を持たない（キーフレームだけを読むため `.dtvi` の `frame_count` とは一致しない）。候補の推定は `classify_sample` が「標本の通し番号」で `.dtvi` 由来の配列を引くため、フレーム数がずれると静かに誤ったラベルを返しうる。そのため代わりに `verify_keyframe_count_matches_dtvi`（`src/analyze.rs`）で、ffmpeg が実際に流したキーフレーム数と `.dtvi` のキーフレーム数を突き合わせる。**辞書候補の採点（`dict::select_candidate`）にはこの突き合わせが無い。** `corr0`/`corr1` の平均を取るだけで通し番号を配列の添字に使わないため、フレーム数のずれが起きても「候補を1つ見送る」以上の実害が無い。**候補が決まった後の学習（`scan::run`）と検出（`detect_logo`）は、明示 `--logo` 指定時と同じ `stream_luma_frames` を通る**ため、上記9の検査を必ず経由する。推定用の供給関数が検出経路から直接呼ばれることはない。
-11. **`detect_logo` の corr スコア列キャッシュ（issue #152）もフレーム数一致検査を持つ**。`read_score_cache`（`src/analyze.rs`）は要素数不一致（`.dtvi` の `frame_count` = `expected_frame_count` と食い違う）やファイルサイズの破損を検知したら `None` を返す。呼び出し側はその場合、検査済みの `stream_luma_frames` によるフルデコードへ落ちる。
+11. **`detect_logo` の corr スコア列キャッシュもフレーム数一致検査を持つ**。`read_score_cache`（`src/analyze.rs`）は要素数不一致（`.dtvi` の `frame_count` = `expected_frame_count` と食い違う）やファイルサイズの破損を検知したら `None` を返す。呼び出し側はその場合、検査済みの `stream_luma_frames` によるフルデコードへ落ちる。
 
     キーは `.lgd` のバイト列 + `expected_frame_count` + `.dtvi` ヘッダの `source_size`/`source_mtime_ns`/`source_fingerprint`（入力ファイルの実体を識別する値）から作る。ロゴが変わる（再学習・別ロゴ）だけでなく、**同じパスに別内容の録画ファイルが上書きされた場合**もキャッシュは自動的に当たらなくなる。レビュー指摘・実測: 当初は `.lgd` + フレーム数だけだったため、上書き後も古いロゴ区間の logoframe を誤って書く実害があった。
 
