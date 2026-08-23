@@ -23,6 +23,8 @@ $ tachikaze auto IN.mp4 -o OUT.mp4
 
 `auto` は `prepare` → `analyze` → gate → `cut` → `remap-subs` を対話なしで実行します。gate が疑わしいと判定した場合は cut せずに終了します（`--ignore-gate` で無視可）。
 
+`analyze`/`auto` はロゴ検出を既定で有効にし、ロゴ矩形も入力から自動推定します。無効化するには `--no-logo` を指定してください（詳細は [docs/architecture.md](docs/architecture.md)「analyze」）。
+
 判断を挟みたい場合:
 
 ```console

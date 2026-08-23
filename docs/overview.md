@@ -41,7 +41,7 @@ mp4 に変換済みの録画ファイルを、再エンコードせずに CM カ
 - 音声パケットの区間選択とドリフト補正
 - **CM 側（除去した区間）の別ファイル出力**（検出が切りすぎていないかの目視確認用）
 - 自己検証（パケット数・表示順の連続性・同期サンプル）
-- ロゴ検出（`make-logo` で `.lgd` を作り、`analyze --logo` で join_logo_scp の `-inlogo` に渡す。Amatsukaze の相関方式を移植）
+- ロゴ検出（`make-logo` で `.lgd` を作り、`analyze --logo` で join_logo_scp の `-inlogo` に渡す。Amatsukaze の相関方式を移植）。`--logo`/`--no-logo` を省略した既定では入力自身からロゴ矩形を自動推定する
 
 **作らないもの**
 

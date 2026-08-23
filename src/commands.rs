@@ -75,6 +75,8 @@ fn run_auto(cache_dir: Option<PathBuf>, args: AutoArgs) -> anyhow::Result<ExitOu
         jl_file,
         jls_set,
         logo,
+        no_logo,
+        logo_dir,
     } = args;
 
     let config = auto::AutoConfig {
@@ -90,6 +92,8 @@ fn run_auto(cache_dir: Option<PathBuf>, args: AutoArgs) -> anyhow::Result<ExitOu
         jl_file,
         jls_set,
         logo,
+        no_logo,
+        logo_dir,
     };
 
     match auto::run(&config, &input)? {
@@ -374,6 +378,8 @@ fn run_analyze(cache_dir: Option<PathBuf>, args: AnalyzeArgs) -> anyhow::Result<
         jls_set,
         jl_file,
         logo,
+        no_logo,
+        logo_dir,
     } = args;
 
     let jls_set = jls_set
@@ -394,6 +400,12 @@ fn run_analyze(cache_dir: Option<PathBuf>, args: AnalyzeArgs) -> anyhow::Result<
         jls_set,
         jl_file,
         logo,
+        no_logo,
+        logo_dir,
+        // `analyze` を直接叩く経路では `input` が既にユーザー入力そのものなので
+        // 上書きは不要（`AnalyzeConfig::source_name_hint` の doc comment参照。
+        // `auto` 経由のときだけ `auto::build_analyze_config` が設定する）。
+        source_name_hint: None,
     };
 
     let result = analyze::run(&config)?;

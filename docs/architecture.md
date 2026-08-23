@@ -13,7 +13,7 @@
 | コマンド | 何をするか |
 |---|---|
 | `prepare` | elst 除去・字幕トラック除去・字幕抽出を1回の ffmpeg 呼び出しにまとめる（`cut` が拒否する構成の前処理） |
-| `analyze` | 外部3ツールを走らせて Trim リストを作る。`--report` で診断と gate 判定 |
+| `analyze` | 外部3ツールを走らせて Trim リストを作る。`--report` で診断と gate 判定。`--logo`/`--no-logo` 省略時はロゴ矩形を自動推定、`--no-logo` でロゴ無しに固定、`--logo-dir` で辞書の場所を変更 |
 | `cut` | Trim をキーフレーム境界へスナップし、mp4 をサンプル単位でロスレスカット |
 | `remap-subs` | 字幕サイドカーの時刻を cut 後タイムラインへ張り替える |
 | `auto` | `prepare`→`analyze`→gate→`cut`→`remap-subs` を対話なしで合成 |
@@ -37,7 +37,8 @@ elst(edit list) 除去・字幕トラック除去・字幕抽出を1回の ffmpe
 
 ```
 tachikaze analyze IN.mp4 [-o trim.avs|-] [--report] [--cache-dir DIR]
-                         [--jls-set KEY=VALUE]... [--jl-file FILE] [--logo FILE.lgd]
+                         [--jls-set KEY=VALUE]... [--jl-file FILE]
+                         [--logo FILE.lgd | --no-logo] [--logo-dir DIR]
 ```
 
 1. `dtvindex build`（外部プロセス）
@@ -58,6 +59,16 @@ tachikaze analyze IN.mp4 [-o trim.avs|-] [--report] [--cache-dir DIR]
 - 割合が閾値以上でも、精緻化で text が空になった場合は同様に渡さない。`logo_frames`（判定の数え上げ）と `text`（`build_text` の出力）は別経路のため、割合だけでは text が空のケースを見落とす（`src/analyze.rs::inlogo_decision`）
 - `-inlogo` を渡さないときは、キャッシュに残る古い logoframe.txt を削除する
 - `.dtvi` の `frame_count` と読み取ったフレーム数が食い違う場合は手順3を実行せず中断する（CLAUDE.md 罠3。この検査は省略不可）
+
+**`--logo`/`--no-logo` を両方省略したときの自動推定（既定）。** `--logo` を明示したとき・`--no-logo` を指定したときは上記のとおり（`join_logo_scp` は1回だけ）。それ以外（既定）は次の直列ループで決める（`src/analyze.rs::run_auto_logo_detection`）:
+
+1. まず `join_logo_scp` を `-inlogo` 無しで1回走らせ、「ロゴ無しの結果」として保持する
+2. ロゴ辞書（既定 `$XDG_DATA_HOME/tachikaze/logos`、`--logo-dir` で上書き）を見る。対象解像度と一致する候補があれば、学習をスキップしてそのまま検出を試す（`src/logo/dict.rs::select_candidate`）。検出に成功すればここで確定し、下記3・4は実行しない
+3. 辞書で決まらなければ、手順1の保持区間の補集合（CM区間、表示順フレーム番号）を求める。それと `.dtvi` のキーパケットの `frame_number` から、標本（キーフレーム）ごとの本編/CM分類器を作る（GOP=120固定の等間隔仮定は使わない、CLAUDE.md 罠3）
+4. 入力自身からロゴ矩形の候補列を推定する（`src/logo/estimate.rs::estimate_candidates`、AUC順の採用列）。先頭から最大5件を順に学習し（`src/logo/scan.rs::make-logo` と同じアルゴリズム）、検出まで試す。学習失敗（回帰係数 NaN 等）や検出失敗は次候補へ進み、成功した時点で打ち切る
+5. 成功した候補の `.lgd` だけをロゴ辞書へ保存する。全候補が尽きればロゴ無しとして扱う（1回目の結果をそのまま使い、`join_logo_scp` の2回目は走らせない）。見つかった場合だけ `join_logo_scp` を `-inlogo` 付きでもう1回走らせる。その結果を最終の `trim.avs` とする
+
+各段階の結果（辞書ヒット・候補列とAUC・何番目の候補で成功したか・学習の有効フレーム数・検出フレーム割合・`-inlogo` を渡したか）は stderr に出る。
 
 （必要なら trim.avs を人手で編集してから `cut` へ渡す）
 
@@ -98,7 +109,8 @@ tachikaze remap-subs IN.mp4 [--segment-map PATH] [--subs PATH] [-o OUT.ass|OUT.s
 ```
 tachikaze auto IN.mp4 -o OUT.mp4 [--cm-output CM.mp4] [--ignore-gate] [-f|--force]
                      [--analyze-only] [--no-subtitles] [--snap] [--verify]
-                     [--jl-file] [--jls-set] [--cache-dir] [--logo FILE.lgd]
+                     [--jl-file] [--jls-set] [--cache-dir]
+                     [--logo FILE.lgd | --no-logo] [--logo-dir DIR]
 ```
 
 `prepare` → `analyze` → gate 判定 → `cut` → `remap-subs` を対話なしで合成する（`src/auto.rs`）。アルゴリズムは持たず、各ステップは上記の関数・処理をそのまま呼ぶ（`commands::execute_cut` を `cut` サブコマンドと共有。詳細は `src/commands.rs` / `src/auto.rs` の doc comment）。
@@ -107,6 +119,7 @@ tachikaze auto IN.mp4 -o OUT.mp4 [--cm-output CM.mp4] [--ignore-gate] [-f|--forc
 - `--ignore-gate` で無視できるのは gate の判定だけで、自己検証や `.dtvi` 必須は変わらない
 - `--analyze-only` は `--ignore-gate` の有無に関わらず cut へ進まない。gate が疑わしいと判定していれば exit code は 3 のまま（無視の対象は「cut へ進むかどうか」で、停止コードそのものではない）
 - 1プロセスにつき入力は1本。複数ファイルはシェルのループに任せる。1入力1プロセスにすることで、exit code の意味が「その1本に対する答え」に一意になる（下記「exit code」）
+- `--logo`/`--no-logo`/`--logo-dir` は値をそのまま `analyze` へ渡すだけ（`auto` 独自のロジックは持たない）。挙動は上記「analyze」の「自動推定」節と同じ
 
     ```
     for f in *.mp4; do case "$f" in *_CMcut.mp4) continue;; esac; tachikaze auto "$f" -o "${f%.mp4}_CMcut.mp4"; done
@@ -124,7 +137,9 @@ tachikaze auto IN.mp4 -o OUT.mp4 [--cm-output CM.mp4] [--ignore-gate] [-f|--forc
 tachikaze make-logo IN.mp4 --rect x,y,w,h -o OUT.lgd [--threshold N]
 ```
 
-1. ロゴ検出に使う `.lgd`（Amatsukaze 形式ロゴデータ）を、入力 mp4 とロゴ矩形だけから作る（`.dtvi` も外部3ツールも使わない）。ロゴ位置は `--rect`（`x,y,w,h`、2の倍数に丸める）で手動指定する。位置を自動探索しないのは、ロゴの形・色が局や番組ごとに異なり、対象素材だけから汎用的に検出する既存手段が無いため（Amatsukaze 側にも自動探索は無い）
+1. ロゴ検出に使う `.lgd`（Amatsukaze 形式ロゴデータ）を、入力 mp4 とロゴ矩形だけから作る（`.dtvi` も外部3ツールも使わない）。`make-logo` 自体は今もロゴ位置を `--rect`（`x,y,w,h`、2の倍数に丸める）で受け取る低レベルなコマンドである。
+
+   **判断の履歴（2026-08 改訂）**: 当初は「局・番組ごとにロゴの形と色が異なり、対象素材だけから汎用的に検出する既存手段が無い」ため矩形を自動探索しないと決めていた。「Amatsukaze 側にも自動探索は無い」という事実は今も正しい。その後、定常段差のブロック中央値と本編/CM 在不在の AUC という局非依存の統計量が実測で成立し（`src/logo/estimate.rs`、詳細は [cm-detection.md](cm-detection.md)「ロゴ検出」）、判断を変えた。`analyze`/`auto` が `--logo`/`--no-logo` を両方省略したとき、内部でこの矩形推定をして `make-logo` と同じ学習アルゴリズムを呼ぶ（下記「analyze」の「自動推定」節）。`make-logo` コマンド自体（手動で矩形を指定する経路）は変えていない。
 2. 矩形の外周1ピクセルが単色（最小値・最大値の差が `--threshold`、既定12、以下）のフレームだけを学習に使い、画素ごとに最小二乗で回帰係数 `a`/`b` を求める（`src/logo/scan.rs`）。既定で入力全体を走らせる。CM区間だけを指定すると「ロゴが無い」ロゴデータができてしまうため
 3. 有効フレーム数（何フレーム中いくつ使ったか）を必ず stderr に出す。壊れたロゴデータを黙って書き出さないよう、有効フレームが0件または4件未満（`MIN_USABLE_FRAMES`）の場合と、係数が NaN/inf/`a==0` になった場合は失敗させる。件数そのものを別に検査するのは、少数のフレームでは回帰係数が NaN/inf にならず黙って有限値になりうるため
 
@@ -160,13 +175,14 @@ tachikaze make-logo IN.mp4 --rect x,y,w,h -o OUT.lgd [--threshold N]
 
 ## パス解決
 
-インストールして（`/usr/local/bin` などに置いて）使う場合を含め、パスの決め方は**実行ファイル / 読み取り専用データ / キャッシュ / 出力**の4分類ごとに変える。配置手順は [toolchain-macos.md](toolchain-macos.md)「ビルド後の配置とインストール」。
+インストールして（`/usr/local/bin` などに置いて）使う場合を含め、パスの決め方は**実行ファイル / 読み取り専用データ / キャッシュ / 蓄積データ / 出力**の5分類ごとに変える。配置手順は [toolchain-macos.md](toolchain-macos.md)「ビルド後の配置とインストール」。
 
 | 種類 | 探索順・既定 |
 |---|---|
 | 実行ファイル（`tachikaze` / 外部3ツール / `ffmpeg` / `ffprobe`） | `PATH` のみ（`src/tools.rs::resolve_tool`） |
 | 読み取り専用データ（JL コマンドファイル、既定 `JL_標準.txt`） | `--jl-file` → `<join_logo_scp の実体パス>/../../share/join_logo_scp/JL/` |
 | キャッシュ（再生成可能な中間物） | `--cache-dir` → 既定 `<ホームディレクトリ>/.cache/tachikaze/` |
+| 蓄積データ（ロゴ辞書、`.lgd`） | `--logo-dir`（`analyze`/`auto`）→ 既定 `$XDG_DATA_HOME/tachikaze/logos`。`XDG_DATA_HOME` が未設定または空なら `<ホームディレクトリ>/.local/share/tachikaze/logos` |
 | 出力 | 明示指定のみ（`cut`/`auto` の `-o` は必須） |
 
 `--jl-file` / `--cache-dir` / `--dtvi` を明示指定した場合は、いずれも上記の探索より最優先でそのまま使う。分類ごとの詳細:
@@ -183,12 +199,15 @@ tachikaze make-logo IN.mp4 --rect x,y,w,h -o OUT.lgd [--threshold N]
 - `input_prepared.mp4` — `prepare` が elst 除去・字幕除去後に書く前処理済み入力（`src/prepare.rs`、`workdir::prepared_input_path`）
 - `subs.ass` / `subs.srt` — `prepare` が mp4 内蔵字幕トラックから抽出した字幕サイドカー。`remap-subs` の入力（`workdir::subs_path`）
 
+**蓄積データ**（`src/logo/dict.rs`）。学習済み `.lgd` を貯める辞書ディレクトリ。既定は `$XDG_DATA_HOME/tachikaze/logos`。`XDG_DATA_HOME` が未設定または空文字列なら `<ホームディレクトリ>/.local/share/tachikaze/logos` になる（`dict::resolve_dict_dir`）。キャッシュとは別分類にした理由、環境変数を読む理由は下記「なぜこの形にしたか」参照。
+
 **出力**。`cut -o` / `auto -o`（本編、必須）と `--cm-output`（CM側、`auto` は指定時のみ）はすべて明示指定させる。例外は2つ。`remap-subs` を単体で使うときだけ、入力の隣に `*_CMcut.ass` / `*_CMcut.srt` を既定で置く（`src/commands.rs::default_remap_subs_output_path`）。`auto` の字幕サイドカーは `-o` と同じ stem・別拡張子で書く（`src/auto.rs::subs_sidecar_path`。本編出力と揃えることでプレイヤーが自動で字幕を読み込める）。
 
 なぜこの形にしたか:
 
 - **中間物をキャッシュに置いた理由**: `.dtvi` / `trim.avs` / `detail.jls` はいずれも `analyze` を再実行すれば作り直せる。外部3ツールはいずれも既存の出力先を実害なく上書きすることを実バイナリで確認済みなので、消えても復旧できるデータとしてキャッシュ扱いにした。既定で残すことで、`analyze` → `cut` を `--cache-dir` / `--dtvi` の手打ちなしで繋げられる。ディレクトリ名（`~/.cache/tachikaze`）自体は XDG Base Directory 仕様の既定と同じものを借りている
-- **XDG 由来の環境変数を読まないと決めた理由**: 置き場所を決める口を `--cache-dir`（キャッシュ）・`--jl-file`（JL）のように引数に一本化し、環境変数の値によって挙動が変わらないようにした。ディレクトリ名だけ XDG の既定（`~/.cache`）を借りているが、環境変数側は一切読まない（`src/workdir.rs::default_cache_root` の doc comment）
+- **ロゴ辞書をキャッシュと別分類にした理由**: `.lgd` は元の録画を消すと作り直せない。`--cache-dir`（再生成できる中間物の置き場所という規約）にはそぐわないため、蓄積データという別分類を立てた（`src/logo/dict.rs` モジュール doc comment）
+- **XDG 由来の環境変数を読まないと決めた理由（ロゴ辞書は例外）**: 置き場所を決める口を `--cache-dir`（キャッシュ）・`--jl-file`（JL）のように引数に一本化し、環境変数の値によって挙動が変わらないようにした。ディレクトリ名だけ XDG の既定（`~/.cache`）を借りているが、環境変数側は一切読まない（`src/workdir.rs::default_cache_root` の doc comment）。**唯一の例外がロゴ辞書**（`src/logo/dict.rs::resolve_dict_dir`）で、`$XDG_DATA_HOME` を実際に読む。理由は2つある。(1) 蓄積データという性質上、XDG のデータディレクトリ規約にそのまま従う方が利用者にとって自然である。`--cache-dir` が借りているのはディレクトリ名だけだが、辞書は規約そのものに従う。(2) 呼び出し側の明示的な上書き引数が環境変数より常に優先する。そのため `--cache-dir` 側の懸念（複数の口が同時に設定されたときどちらが効くか読まないと分からない）は生じない（詳細は `src/logo/dict.rs` モジュール doc comment）
 - **ホームディレクトリを `std::env::home_dir()` で取る理由**: `$HOME` 環境変数の読み取りではなく OS への問い合わせなので、`$HOME` が unset な環境でも既定値を作れる場合がある。実測（`src/workdir.rs::default_cache_root` の doc comment）: rustc 1.97.1 時点で非推奨警告は出ない。Unix では `$HOME` が unset でも `getpwuid` 経由でホームディレクトリを引ける。実際にホームが取れない（＝エラーになる）のは「呼び出しユーザーの passwd エントリすら無い」環境（コンテナで存在しない UID として動かす等）に限られる
 - **ホームディレクトリが特定できないときにエラーで止める理由**: 黙って一時ディレクトリ等へフォールバックすると、キャッシュが知らない場所に増える。さらに悪いことに、別プロセスが別の一時領域を引くと同じ入力に対して別のキャッシュディレクトリを掴み、`analyze` → `cut`（`--dtvi` 省略）の受け渡しが**エラーを出さずに**外れる。`--cache-dir` を促すエラーで明示的に止める方が安全と判断した
 - **外部ツール専用の配置ディレクトリを指定するオプションと「自分の実行ファイルの隣」を削った理由**: `PATH=/opt/jls/bin:$PATH tachikaze ...` のように `PATH` を前置すれば同じことができる。インストールしたくない場合は Docker イメージ（[docker.md](docker.md)）がある。口を1つに絞ることで、複数の口が同時に設定されたときどちらが効くか読まないと分からない状態を無くした
@@ -258,7 +277,7 @@ $ ffmpeg -i IN.mp4 -c copy -use_editlist 0 -movflags +faststart OUT.mp4
 
 ### キャッシュ鍵の弱さ
 
-キャッシュディレクトリ名は入力の**絶対パスのハッシュのみ**から決まる（`workdir::cache_dir_for_input`、FNV-1a）。同じパスに別内容のファイルが後から置かれても（録画ファイルの上書き・再利用）区別できず、古い `.dtvi` / `trim.avs` / `input_prepared.mp4` を新しい入力に対して誤って再利用しうる。`auto` は `analyze`/`prepare` を毎回作り直すことでこの穴を避けているが（`src/auto.rs` の doc comment）、`cut --dtvi` を省略してキャッシュから自動解決する経路には対策が無い。size + mtime の突き合わせなどの対策は、要求されていない現時点では追加しないと判断している（理由は `src/auto.rs` の doc comment 参照）。
+キャッシュディレクトリ名は入力の**絶対パスのハッシュのみ**から決まる（`workdir::cache_dir_for_input`、FNV-1a）。同じパスに別内容のファイルが後から置かれても（録画ファイルの上書き・再利用）区別できず、古い `.dtvi` / `trim.avs` / `input_prepared.mp4` を新しい入力に対して誤って再利用しうる。`auto` は `analyze`/`prepare` を毎回作り直すことでこの穴を避けているが（`src/auto.rs` の doc comment）、`cut --dtvi` を省略してキャッシュから自動解決する経路には対策が無い。size + mtime の突き合わせなどの対策は、要求されていない現時点では追加しないと判断している（理由は `src/auto.rs` の doc comment 参照）。ただし `detect_logo` の corr スコア列キャッシュはこれに該当しない。`.dtvi` ヘッダの `source_size`/`source_mtime_ns`/`source_fingerprint` をキーに含むため、同じパスでも入力の実体が変われば当たらない。
 
 ### `-CutMrgIn` / `-CutMrgOut` を CLI から渡す口
 
@@ -266,9 +285,31 @@ $ ffmpeg -i IN.mp4 -c copy -use_editlist 0 -movflags +faststart OUT.mp4
 
 やらないと決めた理由: 実測した1局では `trim.avs` に効果が確認できず、CLI にオプションを追加する実装コスト（`-set` ではないため `--jls-set` と別の口が要る）に見合う利得が無いと判断した。局によっては固定遅延が大きく効果が出る可能性は残るため、実際に精度不足が観測された局が出たら対応を検討する。
 
+### ロゴ矩形推定・AUC 採用のパラメータは4局からの較正
+
+既知の限界として残す。閾値ラダー・サイズ上限・AUC 採用閾値 0.9・CM 標本ガード 20 枚は、実ファイル5本＋追検証4本のいずれも同じ4局（BS日テレ / TOKYO MX / フジテレビ / テレビ朝日）から決めた値である（[measurements.md](measurements.md)「ロゴ矩形の自動推定」）。局が増えれば見直しが必要になる可能性がある。
+
+### 相関方式の検出限界と、AUC 採用が誤ったロゴでも trim を改善しうること
+
+TOKYO MX の ED 区間（90秒）は、ロゴ自体は出ているのに段差が番組全体平均の半分まで落ちて相関方式が検出できず、CM と誤判定される。矩形推定ではなく相関方式そのものの限界であり、矩形の余白を振っても解消しない（[jls-settings.md](jls-settings.md)「既知の失敗モード: ロゴ検出」）。
+
+一方でテレビ朝日は局ロゴを天気パネルや時計から分離できないが、代わりに時計を採用すると `trim.avs` が改善した（CM 約4.25分を追加除去）。**効くのは「局ロゴを当てること」ではなく「検出結果が本編/CM と相関すること」であり、AUC 採用がこれを自動で拾う**。フジテレビ（L字放送）では本物のロゴと L字帯・台風テロップの断片の AUC が僅差で並んだ例もあり、僅差の逆転はあり得る。ただし AUC が高い候補は定義上本編/CM と相関しており、誤採用しても trim が悪化しにくいことをテレビ朝日の実例で確認済み。検出フレーム割合の絶対閾値と `auto` の gate が残りの防御。
+
 ### 見逃し候補ヒューリスティックとロゴ
 
 `src/report/missed.rs` は `.jls` のラベルを見ず、ギャップ長の一致だけで判定するため、ロゴの有無でロジックは変わらない。実測2本（BS11・TOKYO MX2、[jls-settings.md](jls-settings.md)「ロゴありでの見逃し警告」）ではロゴあり/なしで見逃し候補の件数に変化が無かった（どちらも0件）。ただし検出済み CM ブロック長が揃わない番組でロゴありを試した実測が無いため、一般に誤警告が増えないとは言えない。加えて MX2 は元々このヒューリスティックが発火しない構成だった。`find_missed_candidates` は保持区間内部の `.jls` エントリと長さを突き合わせる実装のため、見逃しブロックが単一の長い `:L` エントリの内側にあると検出対象にならない。「両方0件」という結果は、ロゴの有無というより検出条件自体が MX2 では成立していなかった可能性がある。
+
+### ロゴ検出の階層化方式の収束判定・性能足切りは経験的な閾値である
+
+`detect_logo_scores_hier` の不動点化の収束判定
+（`REQUIRED_STABLE_ROUNDS`）は、実測に基づく経験的な閾値である。性能足切り
+（`HIER_FALLBACK_GOP_FRACTION_THRESHOLD`）も同様に経験的な閾値である。
+数学的な収束証明は無い。前者は実測で観測した「偽の安定」（2ラウンド）に
+安全側の余裕を持たせた値である。後者は乙女ゲー・ぼっちの実測から選んだ値
+である。将来別の入力でこれらの前提が崩れる例が見つかった場合は、値の見直し
+か、より保守的な方式（例: 常に全編フルデコード）への切り替えを検討する。
+詳細は `src/analyze.rs` の `REQUIRED_STABLE_ROUNDS`/
+`HIER_FALLBACK_GOP_FRACTION_THRESHOLD` の doc comment、自己検証12参照。
 
 ## 方針として作らないもの
 
@@ -320,10 +361,12 @@ $ ffmpeg -i IN.mp4 -c copy -use_editlist 0 -movflags +faststart OUT.mp4
 | `segmap.rs` | `cut` が書く区間マップ（snap 後の境界と出力タイムライン上の開始時刻）の構造体、JSON への書き出しと読み込み | 上記「cut」手順8 |
 | `subtitle.rs` | `remap-subs` 本体: ASS/SRT の Start/End を区間マップの区分的な線形写像で張り替える（シフト/破棄/クリップの分類、丸め方向） | 上記「remap-subs」 |
 | `logo/lgd.rs` | Amatsukaze 形式ロゴデータ `.lgd`（AviUtl 互換のベース部 + Amatsukaze 独自の float 部）の読み込み | [cm-detection.md](cm-detection.md) |
-| `logo/frames.rs` | ffmpeg を子プロセスとして起動し、ロゴ矩形の輝度平面をフレーム順にストリームで読む。読み取ったフレーム数と `.dtvi` の `frame_count` の一致検査 | [cm-detection.md](cm-detection.md) |
+| `logo/frames.rs` | ffmpeg を子プロセスとして起動し、ロゴ矩形の輝度平面をフレーム順にストリームで読む（`stream_luma_frames`、読み取ったフレーム数と `.dtvi` の `frame_count` の一致検査あり）。ロゴ矩形推定専用に、クロップせず全画面をキーフレームだけ読む関数（`stream_keyframe_luma_frames`、フレーム数一致検査なし）も持つ | [cm-detection.md](cm-detection.md) |
+| `logo/estimate.rs` | `estimate_candidates`: 入力自身からロゴ矩形の候補列を推定する。定常段差のブロック中央値で候補を作り（閾値ラダー・大構造除去・分裂併合）、本編/CM の在/不在 AUC で採点して採用列にする | [cm-detection.md](cm-detection.md)「ロゴ検出」、[measurements.md](measurements.md)「ロゴ矩形の自動推定」 |
 | `logo/score.rs` | ロゴマスク生成と相関スコア（`corr0`/`corr1`）。Amatsukaze `LogoScan.hpp` の相関方式を移植 | [cm-detection.md](cm-detection.md) |
 | `logo/scan.rs` | `make-logo` 本体: 外周1ピクセルが単色のフレームだけを使い、画素ごとに最小二乗で `.lgd` の係数 `a`/`b` を求める。`.lgd` の書き出し（ベース部はゼロ埋め） | 上記「make-logo」 |
 | `logo/interval.rs` | `corr0`/`corr1` の列からロゴ表示区間を判定し logoframe 形式で出力。Amatsukaze `LogoScan.hpp` の `LogoFrame::writeResult` を移植 | [cm-detection.md](cm-detection.md) |
+| `logo/dict.rs` | 学習済み `.lgd` を辞書ディレクトリ（既定 `$XDG_DATA_HOME/tachikaze/logos`、未設定時 `~/.local/share/tachikaze/logos`）に蓄積し、対象映像と解像度が一致する候補をスコア（Amatsukaze `LogoFrame::selectLogo` 相当）で自動選択する | [cm-detection.md](cm-detection.md)、上記「パス解決」 |
 
 **解析側（analyze）は mp4 の読み込みに依存しない。** `--report` が必要とするキーフレーム位置を `.dtvi` から取る設計にしてあるため。**この性質を崩さないこと**（キーフレーム位置を mp4 から取る実装に変えると解析とカットが結合する）。
 
@@ -355,4 +398,23 @@ struct DecodeIdx(u32);    // デコード順（mp4 のサンプル番号 / .dtvi
 6. 音声の丸め誤差の最大値をログ出力（`AudioDiffInfo` 相当）
 7. `--verify` 指定時は ffprobe のパケット単位 CRC32 で元ファイルとの一致を確認（[lossless-cut.md](lossless-cut.md)）
 8. `--cm-output` 指定時は保持側と CM 側でフレーム数の合計 == 総フレーム数、`DecodeIdx` の集合が互いに素
-9. `analyze --logo` 指定時: ffmpeg から読み取ったロゴ矩形のフレーム数が `.dtvi` の `frame_count` と一致するか（不一致なら明示エラーで停止）。検査の実体は `src/logo/frames.rs::stream_luma_frames`。ロゴ検出は `cut` とは別の ffmpeg 供給経路を使うため、上記 4 とは別に必要な検査
+9. `analyze --logo` 指定時: ffmpeg から読み取ったロゴ矩形のフレーム数が `.dtvi` の `frame_count` と一致するかを検査する（不一致なら明示エラーで停止）。既定の検出経路（`detect_logo_scores_hier`、下記12）はこの検査を `stream_luma_frames` 単体ではなく12(a)〜(f)の複数検査で行う。`stream_luma_frames` を直接経由するのは、12(f)の性能フォールバックが発動して全編フルデコードへ切り替わった場合に限る。ロゴ検出は `cut` とは別の ffmpeg 供給経路を使うため、上記4とは別に必要な検査である
+10. **自動推定（`--logo`/`--no-logo` 両方省略）でも罠3の防御は緩んでいない**。候補の推定（`logo/estimate.rs::estimate_candidates`）は `stream_keyframe_luma_frames` を使う。ロゴ辞書候補の採点（`logo/dict.rs::select_candidate`）も同じ関数を使う。この関数は意図的にフレーム数一致検査を持たない（キーフレームだけを読むため `.dtvi` の `frame_count` とは一致しない）。候補の推定は `classify_sample` が「標本の通し番号」で `.dtvi` 由来の配列を引くため、フレーム数がずれると静かに誤ったラベルを返しうる。そのため代わりに `verify_keyframe_count_matches_dtvi`（`src/analyze.rs`）で、ffmpeg が実際に流したキーフレーム数と `.dtvi` のキーフレーム数を突き合わせる。**辞書候補の採点（`dict::select_candidate`）にはこの突き合わせが無い。** `corr0`/`corr1` の平均を取るだけで通し番号を配列の添字に使わないため、フレーム数のずれが起きても「候補を1つ見送る」以上の実害が無い。候補が決まった後の学習（`scan::run`、`train_and_detect_candidate` 経由）は、明示 `--logo` 指定時と同じ `stream_luma_frames` を通るため、上記9の検査を必ず経由する。検出（`detect_logo`）は既定では上記9の注記どおり `detect_logo_scores_hier`（下記12）を通り、`stream_luma_frames` を直接経由するのは12(f)のフォールバック時だけである。推定用の供給関数が検出経路から直接呼ばれることはない。
+11. **`detect_logo` の corr スコア列キャッシュもフレーム数一致検査を持つ**。`read_score_cache`（`src/analyze.rs`）は要素数不一致（`.dtvi` の `frame_count` = `expected_frame_count` と食い違う）やファイルサイズの破損を検知したら `None` を返す。呼び出し側はその場合、検査済みの `stream_luma_frames` によるフルデコードへ落ちる。
+
+    キーは `.lgd` のバイト列 + `expected_frame_count` + `.dtvi` ヘッダの `source_size`/`source_mtime_ns`/`source_fingerprint`（入力ファイルの実体を識別する値）から作る。ロゴが変わる（再学習・別ロゴ）だけでなく、**同じパスに別内容の録画ファイルが上書きされた場合**もキャッシュは自動的に当たらなくなる。レビュー指摘・実測: 当初は `.lgd` + フレーム数だけだったため、上書き後も古いロゴ区間の logoframe を誤って書く実害があった。
+
+    キャッシュファイル自体にも magic・形式版・導出方法タグを持たせる（`SCORE_CACHE_FORMAT_VERSION`/`SCORE_CACHE_DERIVATION`）。いずれか不一致なら無視する。`scores` を作るアルゴリズムが変わった後に古いキャッシュを黙って再利用しないための検査である。
+12. **`detect_logo` の階層化方式は複数の検査と反復収束を持つ**。
+
+    (a) `detect_logo_scores_hier` 冒頭で `.dtvi` ヘッダの `frame_count`（`expected_frame_count`）を検査する（レビュー指摘、blocker3）。検査対象は `.dtvi` のフレーム表の実際の行数（`dtvi.frames.len()`）が `frame_count` と一致するかである。ヘッダだけ改竄された `.dtvi`（フレーム表は正しいまま）を渡すと、この検査が無ければ末尾GOPの長さが改竄値から計算される。その結果、エラー無しで短い/長い logoframe を書いてしまう（レビュアーの実証: `frame_count` を599→500に改竄しても旧版はエラーにならず500フレーム分の logoframe を書いた）。
+
+    (b) キーフレーム走査（`frames::stream_keyframe_cropped_luma_frames`）が実際に読めたキーフレーム数の検査。`dtvi_keyframe_frame_numbers` の要素数と一致しなければ明示エラーで停止する。上記10の辞書候補採点と違い、この経路は通し番号を配列添字に使うため一致検査が必須である。
+
+    (c) 部分デコード（`frames::decode_frame_range_luma_frames`）ごとの**着地オラクル**（`verify_landing_oracle`）。先頭フレームの corr がキーフレーム走査で得た同じキーフレームの corr と完全一致（`==`）しなければ停止する。当初の実装は `seek_seconds` の計算式が2回誤っていた。1回目（罠2）は対象キーフレームの pts より後ろの時刻を指定していたため、ffmpeg の既定のフレーム精度シークが対象キーフレーム自身を捨てて1フレーム後ろに着地した（実録画で発覚）。2回目（罠3）は `frame_number / fps` という式で pts を近似していたため、`.dtvi` の `start_time` が0でない場合のオフセットを見落とした。レビューで追加したE2Eフィクスチャ `sample.mp4` で発覚した（着地オラクル自体は対象矩形の画素が全編で不変なフィクスチャだったため検出できず、後述(e)の検査で判明した）。`seek_seconds_for_pts`（`src/logo/hier.rs`）が `.dtvi` のフレーム表に記録された実測 pts をそのまま使うよう修正して解消した。詳細は [measurements.md](measurements.md)「キーフレーム走査と部分デコードによるロゴ検出の階層化」参照。
+
+    (d) **不動点化**（レビュー指摘、blocker1）。組み立てた corr 列で `write_result` を走らせ、出力を安定させるまで精緻化対象GOPを広げて再組み立て・再実行を繰り返す（「境界探索が触ったフレームはすべて実測値」という不変条件）。当初の実装（出力された S/E 行の「範囲」欄が指すフレームを覆う GOP のうち未精緻化のものだけを次の対象に加える「到達範囲だけの不動点」）は実測（ぼっち・ざ・ろっく！）で1回で収束したが、全編フルデコードの結果と不一致だった。原因は、この方式が**自分自身のこれまでの探索が実際に届いた範囲しか観測できない**ことにある。`build_text` の境界精緻化がホールド補間のプラトー上をどこまで探索するかは事前に分からず、まだ精緻化していないGOPの先まで探索が及んでいても、到達範囲だけの不動点はそのGOPを次の対象に含める根拠を持たない。そこで、現在精緻化済みの全GOPの前後1GOPを毎回無条件に対象へ追加する「余白拡張」を導入した。余白拡張だけでは、出力が複数ラウンドにわたって同一のまま停滞する**偽の安定**を1回一致で収束と誤認しうる。実測では、ぼっち・ざ・ろっく！が2ラウンド連続で同一の誤った出力を示した後、6ラウンド目で正しい値に達した。そのため安定判定は「同一出力が `REQUIRED_STABLE_ROUNDS`（3）ラウンド連続」を要求する。この3という値は実測で観測した偽の安定が2ラウンドだったことに基づく経験的な閾値であり、数学的な収束証明はない。正しさの根拠は本ヒューリスティックそのものではなく、実録画での trim.avs・logoframe.txt バイト一致検証に置いている。3ラウンド固定を全入力に無条件適用すると、最初から安定していた入力（乙女ゲー等、不安定化を一度も観測しない入力）でも常に3ラウンド分の余分な精緻化が走り、全編フルデコードより遅くなる実測結果が出た。そのため一度も出力が変化していない入力には安定ラウンド要求を1に緩め、不安定化を一度でも観測した入力にのみ3を要求する適応的な収束判定にした。GOP数は有限で対象集合は単調増加のため、いずれの場合も必ず停止する。実測は [measurements.md](measurements.md)「不動点化による logoframe.txt 不一致の解消とその性能コスト」参照。
+
+    (e) 末尾GOPを含む部分デコードは `frames::decode_from_seek_until_eof_luma_frames` を使う。この関数は `.dtvi` ヘッダの `frame_count` を信用せず、メディアの終端まで実際に読む。読めた枚数が `expected_frame_count - 開始フレーム` と一致するか検査する（媒体側の真値での検査、blocker3）。この検査がレビューで追加したE2Eフィクスチャで(c)の罠3を発見した経緯そのものである（着地オラクルは対象矩形の画素が不変で見逃したが、この枚数検査は見逃さなかった）。
+
+    (f) **精緻化GOPの割合による性能フォールバック**（レビュー指摘後の追加対応）。(d)の不動点化は正しさを回復させたが、ロゴが薄い入力（ぼっち・ざ・ろっく！）では逆に全編フルデコードより遅くなる実測結果が出た。GOPの大半を結局精緻化するなら、GOPごとにシーク・ffmpeg起動を挟む部分デコードは、1回のシークで済む全編フルデコードより不利になる。そのため各ラウンドの部分デコードを始める前に、`hier::should_fall_back_to_full_decode` で累計の精緻化対象GOPの割合を確認する。`HIER_FALLBACK_GOP_FRACTION_THRESHOLD`（40%）以上に達していたら不動点化を放棄する。放棄後は `decode_logo_scores_full`（`detect_logo_scores_hier` 導入前の全編フルデコード実装をそのまま残したもの）へ切り替える。ロゴが薄い入力は初回の精緻化対象の選定（(b)のキーフレーム走査結果からの粗判定）だけでこの閾値に達することが多く、その場合は部分デコードを一度も行わずに切り替わる。閾値40%の根拠と実測は [measurements.md](measurements.md)「精緻化GOPの割合による性能フォールバック」参照。
