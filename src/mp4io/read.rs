@@ -505,11 +505,12 @@ mod tests {
                         buffer_size_db: 0u32.try_into().unwrap(),
                         max_bitrate: 0,
                         avg_bitrate: 0,
-                        dec_specific: DecoderSpecific {
+                        dec_specific: Some(DecoderSpecific {
                             profile: 2,
                             freq_index: 3,
                             chan_conf: 2,
-                        },
+                            raw: Vec::new(),
+                        }),
                     },
                     sl_config: SLConfig {},
                 },
