@@ -157,9 +157,9 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
 name = "mp4-atom"
-version = "0.15.0"
+version = "0.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f3d7433df407a636db7047600422af07145adf6ee25e0622745b0131516dbc3c"
+checksum = "adf4a16eebb3eb223ad0f2d16f37ad276736cec3a74538954e5ce0aec2268467"
 dependencies = [
  "derive_more",
  "num",
