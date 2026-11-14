@@ -21,16 +21,18 @@ Amatsukaze の出力ではない（Amatsukaze は AAC を出す）。Opus + 固�
 
 ## 音声コーデック別の検証状況
 
-**認識はすべての音声 Codec、実検証は作れるフィクスチャから。** 一覧（＝認識の allowlist）は
+**音声 Codec の識別はすべて行い、cut 対応は Codec ごとに確認する。** 一覧は
 [mp4-atom.md](mp4-atom.md)「音声トラックとして扱う Codec」。「E2E 済み」は
 `tests/fixtures/gen.sh` でフィクスチャを生成し、cut + パケット CRC32 一致 + 音声位置 /
 A/V pts 関係を確認したもの。「認識のみ・未検証」は `is_audio_codec` が音声と判定するが
-実カットの E2E をまだ通していないもので、**「対応済み」とは書かない**。
+実カットの E2E をまだ通していないもので、**「対応済み」とは書かない**。QuickTime `.mp3`
+sample entry（`Codec::Mp3`）は音声として識別するが、情報保持が未対応のため cut と prepare で拒否する。
 
 | Codec | 状況 | 備考 |
 |---|---|---|
 | `Opus` | **E2E 済み** | `sample.mp4`。通常 960 サンプル（20ms @48kHz）、先頭 3852 / 末尾 312 サンプル |
 | `Mp4a`（AAC） | **E2E 済み** | `sample_aac.mp4`。通常 1024 サンプル（約 21.3ms @48kHz）、先頭 3204 サンプル |
+| `Mp3`（QuickTime `.mp3` sample entry） | **cut / prepare では拒否** | sample entry の version と子 box を保持できない懸念があるため。再エンコードしない安全な回避策は未確認 |
 | `Flac` | **smoke E2E 済み** | `sample_flac.mp4`。通常 4608 サンプル（96ms @48kHz）、先頭 7812 サンプル。複数区間 cut + `--verify` CRC32 一致 |
 | `Ac3` / `Eac3` | 認識のみ・未検証 | ffmpeg で生成可能だが、実カットは未確認 |
 | `Samr` / `Ipcm` / `Fpcm` / `Sowt` / `Twos` / `Lpcm` / `In24` / `In32` / `Fl32` / `Fl64` / `S16l` | 認識のみ・未検証 | mp4 コンテナでのフィクスチャ生成が容易でないものを含む。認識はするが実カットは未確認 |
@@ -280,9 +282,9 @@ strip によって差は **Opus で +0.060233 s（60.2 ms）、AAC で +0.045400
   `skip 312/960 samples` が同一に出力される。Opus の pre-skip はコンテナの `elst`
   ではなく `stsd` 内の `dOps` ボックス（`pre_skip=312`、実測）にコーデックレベルで
   埋め込まれており、**elst の有無と無関係にどのプレーヤーでも適用される**。
-  `src/mp4io/write.rs`（1〜7行目のモジュール doc）に明記されているとおり
-  `stsd` には一切触れず `moov.clone()` でそのまま引き継ぐため、cut 後の出力でも
-  `dOps` は失われない。**Opus は elst を除去しても実際の priming 補正には影響しない。**
+  `src/mp4io/write.rs` は decode 済み `moov` を clone する。Opus の `dOps` は既知フィールドとして
+  Codec 構造に含まれて再 encode されるが、sample entry の元バイト列は保持されない。
+  **Opus は elst を除去しても実際の priming 補正には影響しない。**
 - **AAC**: elst なし（`sample_aac.mp4`）では `skip` に関するログが一切出ない。
   elst あり（`sample_elst_aac.mp4`）でのみ `demuxer injecting skip 1024 / discard 0`
   が出る。**AAC は priming を伝える手段が elst しかなく（`iTunSMPB` のような代替タグは
@@ -295,7 +297,7 @@ strip によって差は **Opus で +0.060233 s（60.2 ms）、AAC で +0.045400
 - AAC の priming が 1024 サンプル以外（2048 サンプル等、エンコーダ設定
   依存）になるケースは未計測。ここでの実測値は ffmpeg 純正 `aac` エンコーダ・128kbps 固定。
 - 実際に `cut` を通した出力で `dOps`/priming がどう伝播するかは、`cut` 自体を動かした
-  E2E ではなく `src/mp4io/write.rs` の doc comment（`stsd` 非改変）からの確認にとどまる。
+  E2E ではなく、decode 済み Codec の clone と `dOps` の再 encode を確認した段階にとどまる。
 - 継ぎ目（CM カット境界）ごとの影響ではなく、**ファイル先頭 1 か所だけ**の影響であることは
   elst の `media_time` の定義上ほぼ自明だが、複数区間 cut の実機テストでは確認していない。
 

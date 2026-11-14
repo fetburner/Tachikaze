@@ -21,9 +21,11 @@ FFmpeg へのリンク、C++ への FFI はいずれも不要。
 
 ## mp4-atom で FFI なしに完結する理由
 
-本ツールはコーデックを理解する必要がなく、**`stsd` を不透明なバイト列としてコピーしたいだけ**。`mp4-atom` は次を満たすため、mp4 のサンプル単位 read/write を純 Rust で書ける（C++ ライブラリや libav への FFI は要らない）:
+本ツールはコーデックを理解する必要がなく、理想は **`stsd` を不透明なバイト列としてコピーすること**。`mp4-atom` はサンプル表を扱う API を公開するため read/write を純 Rust で書ける。ただし sample entry の生バイト保持は未対応（[architecture.md](architecture.md)「stsd sample entry の再 encode による情報欠落」）。
 
-- `Codec::Opus`（`dOps`）/ `Codec::Mp4a`（AAC）を含む主要コーデックを網羅（認識する音声 Codec 全般を同じカット経路で扱う。対応一覧は [mp4-atom.md](mp4-atom.md)）
+- `Codec::Opus`（`dOps`）/ `Codec::Mp4a`（AAC）/ QuickTime `.mp3` sample entry の `Codec::Mp3` を認識（対応一覧は [mp4-atom.md](mp4-atom.md)）。
+- QuickTime `.mp3` sample entry は sample entry の情報保持が未対応のため、cut / prepare で拒否する（[architecture.md](architecture.md)「未対応の入力」）。
+- `mp4a` + `esds` の `Codec::Mp4a`（OTI `0x6B`）は拒否対象外。
 - `Any::Unknown(FourCC, Vec<u8>)` で未知アトムを不透明なバイト列として保持
 - `stsz` / `stsc` / `stco` / `stts` / `ctts` / `stss` をすべて公開
 
@@ -35,7 +37,7 @@ FFmpeg へのリンク、C++ への FFI はいずれも不要。
 
 `MediaConfig` が**閉じた列挙**で、`AvcConfig` / `HevcConfig` / `Vp9Config` / `AacConfig` / `TtxtConfig` しかない。実ファイルの Opus 音声トラックは `media_type()` が `Err(InvalidData("unsupported media type"))` を返す（読み取り自体は可能でサンプル数は正しく取れる）。
 
-**根本的な設計の不一致**: このクレートは「既知のコーデックを理解する」モデルだが、本ツールはコーデックを理解する必要がなく、`stsd` を不透明なバイト列としてコピーしたいだけ。
+**根本的な設計の不一致**: このクレートは「既知のコーデックを理解する」モデルだが、本ツールの理想的な要件はコーデックを理解せず `stsd` を不透明なバイト列としてコピーすること。
 
 ### C# — Windows 専用
 
@@ -75,7 +77,7 @@ SML# の売りは **C との直接 FFI**。しかし FFI を使わない設計�
 
 | クレート | 用途 |
 |---|---|
-| `mp4-atom` 0.14 | mp4 のアトム読み書き（**実ファイルで検証済み**、[mp4-atom.md](mp4-atom.md)） |
+| `mp4-atom` 0.16 | mp4 のアトム読み書き（**実ファイルで検証済み**、[mp4-atom.md](mp4-atom.md)） |
 | `clap` 4.6（`derive`） | サブコマンドと引数のパース |
 | `anyhow` 1.0 | エラーの伝播（`Context` で経路情報を足す） |
 | `serde` 1.0（`derive`） / `serde_json` 1.0 | `SegmentMap`（`src/segmap.rs`）の JSON 読み書き |

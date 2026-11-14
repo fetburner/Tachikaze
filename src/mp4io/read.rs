@@ -63,8 +63,10 @@ pub(crate) fn track_codec(trak: &Trak) -> Option<&Codec> {
 ///
 /// カット処理は「ソース上の DTS から最近傍パケットを引き当ててビットコピーする」
 /// だけでコーデックに依存しない（docs/lossless-cut.md「音声の扱い」）。そのため
-/// 特定コーデックに限定せず、`mp4-atom` 0.14 が `Codec` として認識する音声系すべてを
-/// 音声トラックとして受け入れる。対応一覧は docs/mp4-atom.md の音声 Codec 表。
+/// 特定コーデックに限定せず、`mp4-atom` 0.16 が `Codec` として認識する音声系を
+/// 音声トラックとして識別する。QuickTime `.mp3` sample entry (`Codec::Mp3`) も音声として
+/// 数えるが、書き戻しで情報を失う懸念があるため cut と prepare は拒否する
+/// （`support::check_no_unsupported_codecs`）。`mp4a` + `esds` の `Codec::Mp4a` は拒否対象外。
 ///
 /// `Codec` は `#[non_exhaustive]` なので、未知の variant や映像・字幕・`Unknown` は
 /// `_ => false` で音声に数えない。read.rs / support.rs / commands.rs で音声判定が
@@ -79,6 +81,7 @@ pub fn is_audio_codec(codec: &Codec) -> bool {
             | Codec::Ac3(_)
             | Codec::Eac3(_)
             | Codec::Samr(_)
+            | Codec::Mp3(_)
             // 非圧縮 / QuickTime 系 PCM
             | Codec::Ipcm(_)
             | Codec::Fpcm(_)
@@ -93,6 +96,13 @@ pub fn is_audio_codec(codec: &Codec) -> bool {
     )
 }
 
+/// H.264 の映像 sample entry（Avc1 / Avc3）かどうかを判定する。
+///
+/// `Avc3` は映像として識別するが、ロスレスカットでは未対応のため別途拒否する。
+pub fn is_video_codec(codec: &Codec) -> bool {
+    matches!(codec, Codec::Avc1(_) | Codec::Avc3(_))
+}
+
 /// トラックの `mdhd` から timescale を取り出す。
 fn track_info(trak: &Trak) -> TrackInfo {
     TrackInfo {
@@ -100,12 +110,12 @@ fn track_info(trak: &Trak) -> TrackInfo {
     }
 }
 
-/// `moov` から映像トラック（`Codec::Avc1`）を 1 本だけ見つける。
+/// `moov` から映像トラック（`Codec::Avc1` / `Codec::Avc3`）を 1 本だけ見つける。
 ///
 /// 複数本存在する場合は最初に見つかったものを返す（対象素材は映像 1 本を想定）。
 pub fn find_video_track(moov: &Moov) -> Option<(&Trak, TrackInfo)> {
     moov.trak.iter().find_map(|trak| match track_codec(trak) {
-        Some(Codec::Avc1(_)) => Some((trak, track_info(trak))),
+        Some(codec) if is_video_codec(codec) => Some((trak, track_info(trak))),
         _ => None,
     })
 }
@@ -450,6 +460,29 @@ mod tests {
         assert!(find_audio_track(&moov).is_none());
     }
 
+    #[test]
+    fn find_video_track_recognizes_avc3() {
+        let moov = Moov {
+            trak: vec![Trak {
+                mdia: mp4_atom::Mdia {
+                    minf: mp4_atom::Minf {
+                        stbl: mp4_atom::Stbl {
+                            stsd: mp4_atom::Stsd {
+                                codecs: vec![Codec::Avc3(mp4_atom::Avc3::default())],
+                            },
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(find_video_track(&moov).is_some());
+    }
+
     // --- 音声 Codec 判定の一般化 ---
 
     /// サンプルエントリ共通の `Audio` ヘッダ（値は判定に影響しないダミー）。
@@ -474,10 +507,10 @@ mod tests {
         };
     }
 
-    /// `mp4-atom` 0.14 が認識する音声系 Codec を 1 つずつ構築して返す。
+    /// `mp4-atom` 0.16 が認識する音声系 Codec を 1 つずつ構築して返す。
     ///
-    /// 対象一覧（圧縮 6 種 + 非圧縮/QT 系 10 種）と 1:1 で対応させ、
-    /// 一覧の増減にテストが追従するようにしている。
+    /// 対象一覧（圧縮 7 種 + 非圧縮/QT 系 10 種）と 1:1 で対応させる。Mp3 も分類上は
+    /// 音声として認識するが、`support::check_no_unsupported_codecs` が cut / prepare で拒否する。
     fn all_audio_codecs() -> Vec<Codec> {
         use mp4_atom::esds::{DecoderConfig, DecoderSpecific, EsDescriptor, SLConfig};
         use mp4_atom::*;
@@ -565,6 +598,9 @@ mod tests {
             ac3,
             eac3,
             samr,
+            Codec::Mp3(Mp3 {
+                audio: dummy_audio(),
+            }),
             Codec::Ipcm(pcm!(Ipcm)),
             Codec::Fpcm(pcm!(Fpcm)),
             Codec::Sowt(pcm!(Sowt)),
@@ -581,8 +617,9 @@ mod tests {
     #[test]
     fn all_audio_codecs_are_recognized_as_audio() {
         let codecs = all_audio_codecs();
-        // 対象一覧（圧縮 6 + 非圧縮/QT 10）と本数が一致していること。
-        assert_eq!(codecs.len(), 16);
+        // 対象一覧（圧縮 7 + 非圧縮/QT 10）と本数が一致していること。Mp3 は音声として
+        // 認識する一方、書き戻しによる情報欠落を避けるため cut / prepare では拒否する。
+        assert_eq!(codecs.len(), 17);
         for codec in &codecs {
             assert!(is_audio_codec(codec), "{codec:?} は音声と判定されるべき");
         }
@@ -593,7 +630,10 @@ mod tests {
         use mp4_atom::{Avc1, FourCC, Tx3g};
         assert!(!is_audio_codec(&Codec::Avc1(Avc1::default())));
         assert!(!is_audio_codec(&Codec::Tx3g(Tx3g::default())));
-        assert!(!is_audio_codec(&Codec::Unknown(FourCC::new(b"xxxx"))));
+        assert!(!is_audio_codec(&Codec::Unknown(
+            FourCC::new(b"xxxx"),
+            vec![]
+        )));
     }
 
     #[test]
