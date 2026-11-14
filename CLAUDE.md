@@ -93,7 +93,12 @@ $ gh issue create --template sub-issue --title '[E11-1] ...' --parent 56 --label
 
 ## 前提
 
-- 映像は H.264、音声は `mp4-atom` が認識する音声 Codec 全般（代表例 Opus / AAC=`Mp4a`。判定は `src/mp4io/read.rs::is_audio_codec`、対応一覧と検証状況は [docs/mp4-atom.md](docs/mp4-atom.md)）。GOP は 120 フレーム固定でシーンチェンジ由来の IDR なし
+- 映像は H.264（avc1）。avc3 は `cut` / `prepare` で拒否する（[docs/architecture.md](docs/architecture.md)「未対応の入力」）。
+- 音声トラックは `mp4-atom` が認識する音声 Codec 全般を識別する。代表例は Opus / AAC=`Mp4a`。
+  判定は `src/mp4io/read.rs::is_audio_codec`。対応一覧と検証状況は [docs/mp4-atom.md](docs/mp4-atom.md)。
+- QuickTime `.mp3` sample entry（`Codec::Mp3`）は音声として識別し、sample entry の情報保持のため `cut` / `prepare` で拒否する。
+- `mp4a` + `esds` の `Codec::Mp4a`（OTI `0x6B`）は拒否対象外。詳細は [docs/architecture.md](docs/architecture.md)「未対応の入力」。
+- GOP は 120 フレーム固定で、シーンチェンジ由来の IDR はない
 - キーフレーム境界に丸めるため**カット境界あたり平均 2.1〜2.5 秒の CM が残る**。これは許容する方針で決定済み
 - 開発・実行は macOS arm64。Amatsukaze 本体は移植しない（Windows API を 500 箇所以上使用）
 - ロゴ辞書（`.lgd`）の既定置き場所は `~/.local/share/tachikaze/logos`。`--cache-dir` とは別系統（[docs/architecture.md](docs/architecture.md)「パス解決」）

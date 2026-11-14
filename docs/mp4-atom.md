@@ -8,9 +8,10 @@ mp4 の読み書きコードを書くときはこの文書を読む。**検証�
 
 ## なぜこのクレートか
 
-本ツールはコーデックを理解する必要がない。**`stsd` を不透明なバイト列としてコピーしたいだけ**。`mp4-atom` はこの要件に合う:
+本ツールはコーデックを理解する必要がない。理想は **`stsd` を不透明なバイト列としてコピーすること**。`mp4-atom` はサンプル表の読み書きに必要な構造を公開するが、sample entry の生バイト保持は未対応（[architecture.md](architecture.md)「stsd sample entry の再 encode による情報欠落」）:
 
-- `Codec` 列挙が映像・音声・字幕を網羅し、`#[non_exhaustive]`（0.14 時点）。映像は `Avc1` / `Hev1` / `Hvc1` / `Vp08` / `Vp09` / `Av01` / `Uncv`。音声は `Opus` / `Mp4a` / `Flac` / `Ac3` / `Eac3` / `Samr` / `Ipcm` / `Fpcm` / `Sowt` / `Twos` / `Lpcm` / `In24` / `In32` / `Fl32` / `Fl64` / `S16l`。字幕は `Tx3g` / `Wvtt`
+- `Codec` 列挙が映像・音声・字幕を網羅し、`#[non_exhaustive]`（0.16 時点）。映像は `Avc1` / `Avc3` / `Jpeg` / `Hev1` / `Hvc1` / `Vp08` / `Vp09` / `Av01` / `Uncv`。音声は `Opus` / `Mp4a` / `Mp3` / `Flac` / `Ac3` / `Eac3` / `Samr` / `Ipcm` / `Fpcm` / `Sowt` / `Twos` / `Lpcm` / `In24` / `In32` / `Fl32` / `Fl64` / `S16l`。字幕は `Tx3g` / `Wvtt`。メタデータは `Mett` / `Metx` / `Urim` / `Camm` / `Evte` / `Mebx`
+- 未知の sample entry は `Codec::Unknown(FourCC, Vec<u8>)` で本体を保持するが、0.16 では encode 時にエラーになる
 - `Any::Unknown(FourCC, Vec<u8>)` で未知アトムを不透明バイト列として保持
 - `stsz` / `stsc` / `stco` / `co64` / `stts` / `ctts` / `stss` をすべて公開
 
@@ -18,14 +19,18 @@ mp4 の読み書きコードを書くときはこの文書を読む。**検証�
 
 音声トラックの識別は `src/mp4io/read.rs::is_audio_codec` に集約している。カット処理は
 「ソース上の DTS から最近傍パケットを引き当ててビットコピーする」だけでコーデックに
-依存しないため、`mp4-atom` が `Codec` として認識する音声系すべてを音声トラックとして
-受け入れる。映像・字幕・`Unknown(FourCC)` は音声に数えない。対応一覧（＝この関数の
+依存しないため、`mp4-atom` が `Codec` として認識する音声系を音声トラックとして識別する。
+映像・字幕・`Unknown(FourCC, Vec<u8>)` は音声に数えない。対応一覧（＝この関数の
 allowlist）:
 
 | 分類 | Codec |
 |---|---|
-| 圧縮 | `Opus`, `Mp4a`（AAC）, `Flac`, `Ac3`, `Eac3`, `Samr` |
+| 圧縮 | `Opus`, `Mp4a`（AAC）, `Mp3`（QuickTime `.mp3` sample entry）, `Flac`, `Ac3`, `Eac3`, `Samr` |
 | 非圧縮 / QuickTime 系 | `Ipcm`, `Fpcm`, `Sowt`, `Twos`, `Lpcm`, `In24`, `In32`, `Fl32`, `Fl64`, `S16l` |
+
+QuickTime `.mp3` sample entry の `Codec::Mp3` は音声として識別するが、sample entry の
+version や子 box の情報欠落を避けるため `cut` と `prepare` では拒否する。
+`mp4a` + `esds` の `Codec::Mp4a` は拒否対象外（[architecture.md](architecture.md)「未対応の入力」）。
 
 E2E で実検証済みか、認識のみ（未検証）かの区別は [measurements.md](measurements.md)
 「音声コーデック別の検証状況」を参照。`Codec` は `#[non_exhaustive]` なので、将来
@@ -35,7 +40,7 @@ E2E で実検証済みか、認識のみ（未検証）かの区別は [measurem
 
 | 項目 | 結果 |
 |---|---|
-| 音声 Codec の認識 | ✓ `is_audio_codec` で一括判定（Opus は `dOps`、AAC は `esds` を保持したまま clone） |
+| 音声 Codec の認識 | ✓ `is_audio_codec` で一括判定（Opus の `dOps`、AAC の `esds` は既知フィールドとして decode し、書き出し時に再 encode） |
 | サンプル表の復元 | ✓ 98,972 / 165,098 サンプル、同期サンプル 825 個（ffprobe と一致） |
 | サンプル部分集合の書き出し | ✓ 有効な mp4 が生成され ffmpeg がエラーなくデコード |
 | パケットのビット一致 | ✓ 映像 240/240、音声 402/402 で相違なし |
@@ -98,7 +103,7 @@ let moov = loop {
 
 ## 書き出し
 
-**`stsd` には一切触らない。`moov` を `clone()` してサンプルテーブルだけ差し替える。**
+`stsd` の Codec 構造は直接編集せず、`moov` を `clone()` してサンプルテーブルを差し替える。書き出し時には sample entry を再 encode するため、元のバイト列は保持されない（[architecture.md](architecture.md)「stsd sample entry の再 encode による情報欠落」）。
 
 レイアウトは `ftyp` → `mdat` → `moov` の順にする。`moov` を最後に置けば `stco` のオフセットが確定してから書けるので、サイズの先読み（鶏と卵）を回避できる。faststart が必要なら後段で `ffmpeg -movflags +faststart` を通す。
 

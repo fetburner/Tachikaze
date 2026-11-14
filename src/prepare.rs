@@ -7,13 +7,15 @@
 //!
 //! # 複数トラックの扱い(黙って1本目だけを残さない)
 //!
-//! `run()` が実際に ffmpeg へ渡すコマンドは `-map 0:v:0 -map 0:a:0` 固定であり、
+//! `run()` は `read_moov` の直後に `check_no_unsupported_codecs` を呼び、`avc3` と
+//! QuickTime `.mp3` sample entry を拒否する。
+//! 続けてトラック数を確認する。ffmpeg へ渡すコマンドは `-map 0:v:0 -map 0:a:0` 固定であり、
 //! 映像2本以上・音声2本以上の入力(二重音声放送など)でも黙って1本目だけを
 //! 残してしまう。これは `mp4io::support::check_track_counts` が `cut` に対して
 //! 拒否しているのと同じ構成を、`prepare` が黙って通過させてしまうことを意味する
 //! (`prepare` の目的は「`cut` が受け付けられる形にする」ことであり、`cut` 自体が
-//! 拒否する構成を黙って作ってはいけない)。そのため [`run`] は `read_moov` の
-//! 直後に [`reject_multiple_video_or_audio_tracks`] を呼び、映像・音声のどちらかが
+//! 拒否する構成を黙って作ってはいけない)。そのため [`run`] は続けて
+//! [`reject_multiple_video_or_audio_tracks`] を呼び、映像・音声のどちらかが
 //! 2本以上あれば ffmpeg を呼ぶ前に明示エラーで停止する。
 //!
 //! 字幕トラックは音声・映像とは深刻度が異なる(無くても本編再生に支障が無い)ため、
@@ -106,7 +108,7 @@ use anyhow::{Context, Result};
 use mp4_atom::{Codec, Moov};
 
 use crate::errctx::PathContext;
-use crate::mp4io::read::{is_audio_codec, track_codec};
+use crate::mp4io::read::{is_audio_codec, is_video_codec, track_codec};
 use crate::{external, tools, workdir};
 
 /// 字幕トラックのコーデックから判定した、抽出に使う字幕形式。
@@ -185,7 +187,7 @@ fn subtitle_format_in(moov: &Moov) -> Option<SubtitleFormat> {
     moov.trak.iter().find_map(|trak| {
         let codec = track_codec(trak)?;
         match codec {
-            Codec::Avc1(_) => None,
+            codec if is_video_codec(codec) => None,
             codec if is_audio_codec(codec) => None,
             Codec::Tx3g(_) => Some(SubtitleFormat::Tx3g),
             Codec::Wvtt(_) => Some(SubtitleFormat::Wvtt),
@@ -197,7 +199,7 @@ fn subtitle_format_in(moov: &Moov) -> Option<SubtitleFormat> {
 /// 映像・音声・それ以外(字幕など)のトラック数をそれぞれ数える。
 ///
 /// `mp4io::support::check_track_counts` と同じ分類基準(`stsd` 先頭コーデックが
-/// `Avc1` なら映像、`is_audio_codec` なら音声、それ以外はすべて「その他」)を使う。
+/// `is_video_codec` なら映像、`is_audio_codec` なら音声、それ以外はすべて「その他」)を使う。
 /// あちらは「エラーにする」ためのチェック、こちらは `prepare` 固有の判断(映像/音声
 /// 2本以上は拒否、字幕相当は警告に留める)に使うため、判定条件だけを共有し関数は
 /// 分けている(`has_edit_list` と同じ理由)。
@@ -207,7 +209,7 @@ fn track_counts(moov: &Moov) -> (usize, usize, usize) {
     let mut other = 0usize;
     for trak in &moov.trak {
         match track_codec(trak) {
-            Some(Codec::Avc1(_)) => video += 1,
+            Some(codec) if is_video_codec(codec) => video += 1,
             Some(codec) if is_audio_codec(codec) => audio += 1,
             _ => other += 1,
         }
@@ -278,6 +280,9 @@ pub fn run(
     external_subs: Option<&Path>,
 ) -> Result<PrepareOutcome> {
     let moov = crate::mp4io::read::read_moov(input).path_ctx("入力 mp4 の読み込み", input)?;
+
+    // cut と同じ未対応 Codec は、ffmpeg を呼ぶかどうかに関わらず拒否する。
+    crate::mp4io::support::check_no_unsupported_codecs(&moov)?;
 
     // 映像/音声が2本以上ある入力は、ffmpeg を呼ぶかどうかに関わらずここで明示エラーに
     // する(モジュール doc comment「複数トラックの扱い」参照)。needs_strip が false
@@ -431,8 +436,8 @@ pub fn run(
 mod tests {
     use super::*;
     use mp4_atom::{
-        Avc1, Dops, Edts, Elst, ElstEntry, Mdia, Minf, Opus, PlainText, Stbl, Stsd, Trak, Tx3g,
-        VttC, Wvtt,
+        Avc1, Avc3, Dops, Edts, Elst, ElstEntry, Mdia, Minf, Opus, PlainText, Stbl, Stsd, Trak,
+        Tx3g, VttC, Wvtt,
     };
 
     fn trak_with_codec(codec: Codec) -> Trak {
@@ -496,6 +501,40 @@ mod tests {
             ..Default::default()
         };
         assert!(reject_multiple_video_or_audio_tracks(&moov).is_ok());
+    }
+
+    #[test]
+    fn track_counts_recognizes_avc3_as_video_not_subtitle() {
+        let moov = Moov {
+            trak: vec![trak_with_codec(Codec::Avc3(Avc3::default())), audio_trak()],
+            ..Default::default()
+        };
+        assert_eq!(track_counts(&moov), (1, 1, 0));
+        assert_eq!(inspect_moov(&moov).subtitle, None);
+    }
+
+    #[test]
+    fn mp3_is_audio_not_subtitle_before_rejection() {
+        let moov = Moov {
+            trak: vec![
+                video_trak(),
+                trak_with_codec(Codec::Mp3(mp4_atom::Mp3 {
+                    audio: mp4_atom::Audio {
+                        data_reference_index: 1,
+                        channel_count: 2,
+                        sample_size: 16,
+                        sample_rate: 48_000u16.into(),
+                    },
+                })),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(track_counts(&moov), (1, 1, 0));
+        let err = crate::mp4io::support::check_no_unsupported_codecs(&moov).unwrap_err();
+        assert!(err
+            .reason
+            .contains("QuickTime `.mp3` sample entry (`Codec::Mp3`) は未対応です"));
+        assert_eq!(inspect_moov(&moov).subtitle, None);
     }
 
     #[test]
@@ -609,7 +648,7 @@ mod tests {
             trak: vec![
                 video_trak(),
                 audio_trak(),
-                trak_with_codec(Codec::Unknown(mp4_atom::FourCC::new(b"stpp"))),
+                trak_with_codec(Codec::Unknown(mp4_atom::FourCC::new(b"stpp"), vec![])),
             ],
             ..Default::default()
         };

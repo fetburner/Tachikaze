@@ -84,7 +84,7 @@ tachikaze cut IN.mp4 --trim trim.avs|- -o OUT.mp4 [--dtvi work.mp4.dtvi] [--cach
 2. Trim をキーフレーム境界へスナップ（既定 outward）
 3. 映像: デコード順に (E-S) サンプルを選択
 4. 音声: 区間ごとに、区間先頭サンプルのソース上の DTS から最近傍の音声パケットを引き当てる
-5. mp4-atom で書き出し（stsd は clone、サンプル表のみ再構築）
+5. mp4-atom で書き出し（decode 済みの stsd を clone し、サンプル表のみ再構築。元のバイト列の保持は未対応。詳細は下記「stsd sample entry の再 encode による情報欠落」）
 6. 自己検証（下記「自己検証」）
 7. `--cm-output` 指定時は保持区間の補集合について手順3〜6を繰り返す（補集合の両端も同期サンプル上に来るので追加のスナップは不要）。保持側と CM 側でフレーム数の合計 == 総フレーム数、集合が互いに素であることを assert
 8. 自己検証を通り最終出力へ rename できた後、保持側の区間マップ（snap 後の境界と出力タイムライン上の開始時刻）を `work.mp4.segmap.json` へ書く。`--segment-map PATH` で任意の場所にも書ける。`--cm-output` 指定時も保持側だけに出す
@@ -218,7 +218,11 @@ tachikaze make-logo IN.mp4 --rect x,y,w,h -o OUT.lgd [--threshold N]
 
 ## 未対応の入力（`mp4io/support.rs` が明示エラーで落とす）
 
-いずれも「静かに壊れる」より「止まる」を選んでいる。音声コーデック自体は `mp4-atom` が認識する音声 Codec 全般（Opus / AAC など）を同じ経路で扱う。ここに残すのはコーデックと無関係に未対応と判断した構成。
+いずれも「静かに壊れる」より「止まる」を選んでいる。QuickTime `.mp3` sample entry（`Codec::Mp3`）は情報欠落を避けるため cut と prepare で拒否する。ffmpeg が `mp4a` + `esds`（OTI `0x6B`）で格納する音声は `Codec::Mp4a` なので、この拒否対象ではない。ここには未対応の入力構成と Codec 固有の制約を記す。
+
+**`avc3` 映像**（`check_no_unsupported_codecs`）。**未検証**: サンプル内の SPS/PPS が変化しうる形式のため、パケットを抜き出すとロスレスカットの前提が崩れる可能性がある。`cut` と `prepare` の両方で明示エラーにする。安全な `avc1` への変換手順は確認できていないため、再エンコードしない安全な回避策は未確認。
+
+**QuickTime `.mp3` sample entry**（同関数、`Codec::Mp3`）。**未検証**: sound description v1/v2 や子 box を `mp4-atom` の書き戻しで保持できないため、音声 Codec として数えたうえで `cut` と `prepare` の両方で拒否する。再エンコードしない安全な回避策は未確認。生の `stsd` を保持する対応は下記「stsd sample entry の再 encode による情報欠落」に記した方針に従う。
 
 **`elst`（edit list）あり**（`check_no_edit_list`）。`moov.clone()` で引き継いだ `elst` は、`segment_duration` がカット後のトラック長を超え、`media_time` が新しい先頭の正当なフレームを数フレーム分スキップする。「エラーは出ないが結果が壊れる」の実例を実験で確認済み。回避策:
 
@@ -254,6 +258,14 @@ $ ffmpeg -i IN.mp4 -c copy -use_editlist 0 -movflags +faststart OUT.mp4
 ### 字幕のトラック対応
 
 `cut` にトラックとして持たせる方式（方式B）は未対応のまま（上記「未対応の入力」参照）。`prepare` のサイドカー方式（方式A）で実用上の字幕保持は満たしているため、方式Bを実装する優先度は無い。
+
+### `stsd` sample entry の再 encode による情報欠落
+
+`mp4-atom` は `stsd` の sample entry を encode 時に正規化し、未知の子 box を捨てる。`btrt` の欠落や子 box の順序変更、`esds` の長さ表現の変更、QuickTime sound description v1/v2 から v0 への変換が起こりうる。前バージョンでも同じ挙動だった。
+
+そのため、常に v2 の `Lpcm` や `chan` / `clap` を持つ entry は、cut で気付かず情報を失いうる。QuickTime `.mp3` sample entry は PR #174 で cut と prepare の拒否対象にしたため、現状の経路では情報欠落は起きない。対策の方針は決定済みで、出力 `stsd` に元のバイト列をそのままコピーする。
+
+0.16 の `Codec::Unknown` は parse 時に本体を保持するが、encode 時はエラーになる。Unknown のトラックは `check_supported` が事前に拒否するため、現状の cut 呼び出し経路ではその encode エラーに到達しない。
 
 ### 継ぎ目の MDCT 過渡（クリックノイズ）
 

@@ -5,8 +5,10 @@
 //! 壊れる」可能性がある未検証パスであり、`--ignore-gate` のような続行フラグは
 //! 用意しない(誤った出力を作れる経路を残さないため)。
 //!
-//! 検出する5条件は docs/architecture.md の「未対応の入力」に対応する:
+//! 検出条件は docs/architecture.md の「未対応の入力」に対応する:
 //!
+//! - `avc3` — サンプル内の SPS/PPS が変わりうるため、`stsd` の生バイトを保持してもカットは未対応
+//! - QuickTime `.mp3` sample entry — sample entry の再 encode で情報を失いうる
 //! - `elst`(edit list)の存在 — サンプルを削った後にタイムラインが整合する
 //!   とは限らない
 //! - `stsd` の複数エントリ — `sample_description_index` を1固定にしている
@@ -40,7 +42,7 @@
 use mp4_atom::{Codec, Moov};
 
 use crate::dtvi::Dtvi;
-use crate::mp4io::read::{is_audio_codec, track_codec};
+use crate::mp4io::read::{is_audio_codec, is_video_codec, track_codec};
 
 /// 対応していない入力構成を検出したときに返すエラー。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,10 +90,38 @@ impl std::error::Error for UnsupportedInput {}
 /// 選んでいる。analyze パイプラインでは chapter_exe が解析時に必ず `.dtvi` を
 /// 生成するため(docs/pipeline.md)、実運用でこの分岐に入ることは想定していない。
 pub fn check_supported(moov: &Moov, dtvi: Option<&Dtvi>) -> Result<(), UnsupportedInput> {
+    check_no_unsupported_codecs(moov)?;
     check_track_counts(moov)?;
     check_no_edit_list(moov)?;
     check_single_stsd_entry(moov)?;
     check_closed_gop(dtvi)?;
+    Ok(())
+}
+
+/// `avc3` と QuickTime `.mp3` sample entry を拒否する。`avc3` はサンプル内 SPS/PPS が
+/// 変わりうるため、`stsd` の生バイト列を保持してもカットの安全性は確認できない。
+/// `.mp3` sample entry は version / 子 box を保持できない懸念がある。
+/// `cut` と `prepare` はこの共通判定を通し、同じ理由・メッセージを使う。
+pub(crate) fn check_no_unsupported_codecs(moov: &Moov) -> Result<(), UnsupportedInput> {
+    for trak in &moov.trak {
+        match track_codec(trak) {
+            Some(Codec::Avc3(_)) => {
+                return Err(UnsupportedInput::with_suggestion(
+                    "avc3 は未対応です。サンプル内の SPS/PPS が変わりうるため、ロスレスカットの前提が\
+                     崩れる可能性があります。処理を中止しました。",
+                    "再エンコードしない安全な回避策は未確認です。",
+                ));
+            }
+            Some(Codec::Mp3(_)) => {
+                return Err(UnsupportedInput::with_suggestion(
+                    "QuickTime `.mp3` sample entry (`Codec::Mp3`) は未対応です。mp4-atom の書き戻しで version や\
+                     子 box が失われるため、処理を中止しました。",
+                    "再エンコードしない安全な回避策は未確認です。stsd の元バイト列保持対応後に再試行してください。",
+                ));
+            }
+            _ => {}
+        }
+    }
     Ok(())
 }
 
@@ -104,7 +134,7 @@ fn check_track_counts(moov: &Moov) -> Result<(), UnsupportedInput> {
 
     for trak in &moov.trak {
         match track_codec(trak) {
-            Some(Codec::Avc1(_)) => video_count += 1,
+            Some(codec) if is_video_codec(codec) => video_count += 1,
             Some(codec) if is_audio_codec(codec) => audio_count += 1,
             _ => other_count += 1,
         }
@@ -213,7 +243,8 @@ mod tests {
     use crate::order::{DecodeIdx, DisplayIdx};
     use mp4_atom::esds::{DecoderConfig, DecoderSpecific, EsDescriptor, SLConfig};
     use mp4_atom::{
-        Audio, Avc1, Dops, Edts, Elst, ElstEntry, Esds, Mdia, Minf, Mp4a, Opus, Stbl, Stsd, Trak,
+        Audio, Avc1, Avc3, Dops, Edts, Elst, ElstEntry, Esds, Mdia, Minf, Mp4a, Opus, Stbl, Stsd,
+        Trak,
     };
     use std::collections::HashMap;
     use std::path::Path;
@@ -445,6 +476,36 @@ mod tests {
 
         let err = check_supported(&moov, Some(&closed_gop_dtvi())).unwrap_err();
         assert!(err.reason.contains("映像トラック"));
+    }
+
+    #[test]
+    fn rejects_avc3_with_explicit_unsupported_reason() {
+        let mut moov = valid_moov();
+        moov.trak[0] = trak_with_codecs(vec![Codec::Avc3(Avc3::default())]);
+
+        assert!(check_track_counts(&moov).is_ok());
+        let err = check_supported(&moov, Some(&closed_gop_dtvi())).unwrap_err();
+        assert!(err.reason.contains("avc3 は未対応です"));
+        assert!(err.reason.contains("SPS/PPS"));
+    }
+
+    #[test]
+    fn rejects_mp3_as_audio_with_clear_reason() {
+        let mut moov = valid_moov();
+        moov.trak[1] = trak_with_codecs(vec![Codec::Mp3(mp4_atom::Mp3 {
+            audio: audio_header(),
+        })]);
+
+        assert!(check_track_counts(&moov).is_ok());
+        let err = check_supported(&moov, Some(&closed_gop_dtvi())).unwrap_err();
+        assert!(err
+            .reason
+            .contains("QuickTime `.mp3` sample entry (`Codec::Mp3`) は未対応です"));
+        assert!(err.reason.contains("sample entry"));
+        assert!(err
+            .suggestion
+            .as_deref()
+            .is_some_and(|s| s.contains("再エンコードしない安全な回避策は未確認")));
     }
 
     #[test]

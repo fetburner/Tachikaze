@@ -1303,10 +1303,13 @@ mod tests {
             .trak
             .iter()
             .position(|t| {
-                matches!(
-                    t.mdia.minf.stbl.stsd.codecs.first(),
-                    Some(mp4_atom::Codec::Avc1(_))
-                )
+                t.mdia
+                    .minf
+                    .stbl
+                    .stsd
+                    .codecs
+                    .first()
+                    .is_some_and(crate::mp4io::read::is_video_codec)
             })
             .expect("映像トラックのインデックスが見つかること");
         let audio_track_index = moov

@@ -180,7 +180,7 @@ fn run_make_logo(args: MakeLogoArgs) -> anyhow::Result<()> {
 }
 
 /// `moov` の映像トラックから映像サイズを取り出す。`find_video_track` は `stsd` の
-/// 先頭コーデックが `Avc1` であることを既に確認しているため、ここでの `Avc1` 以外の
+/// 先頭コーデックが `Avc1` / `Avc3` であることを既に確認しているため、ここでのそれ以外の
 /// 分岐は理論上到達しない（対象素材は映像 H.264 前提、CLAUDE.md「前提」）が、
 /// パニックにはせず明示エラーにする。
 fn video_size_from_trak(trak: &Trak) -> anyhow::Result<VideoSize> {
@@ -189,7 +189,11 @@ fn video_size_from_trak(trak: &Trak) -> anyhow::Result<VideoSize> {
             width: avc1.visual.width as u32,
             height: avc1.visual.height as u32,
         }),
-        _ => bail!("映像トラックの Avc1 サンプルエントリが見つかりません"),
+        Some(Codec::Avc3(avc3)) => Ok(VideoSize {
+            width: avc3.visual.width as u32,
+            height: avc3.visual.height as u32,
+        }),
+        _ => bail!("映像トラックの Avc1/Avc3 サンプルエントリが見つかりません"),
     }
 }
 
@@ -1139,7 +1143,7 @@ enum TrackKind {
 fn track_index(moov: &Moov, kind: TrackKind) -> Option<usize> {
     moov.trak.iter().position(
         |trak| match (kind, trak.mdia.minf.stbl.stsd.codecs.first()) {
-            (TrackKind::Video, Some(Codec::Avc1(_))) => true,
+            (TrackKind::Video, Some(codec)) => mp4io::read::is_video_codec(codec),
             (TrackKind::Audio, Some(codec)) => mp4io::read::is_audio_codec(codec),
             _ => false,
         },

@@ -1,10 +1,11 @@
 //! `ftyp` → `mdat` → `moov` の順でロスレスな mp4 を書き出す。
 //!
-//! `stsd` には一切触れない。`moov` を `clone()` し、トラックごとのサンプル表
+//! `moov` を `clone()` し、トラックごとのサンプル表
 //! (`stsz`/`stts`/`ctts`/`stss`/`stsc`/`stco`)だけを keep リストに合わせて
-//! 差し替える。コーデック固有の知識は不要で、サンプルはただのバイト列として
-//! 元ファイルから読み出して `mdat` に詰め直すだけでよい
-//! (検証済みコード: docs/mp4-atom.md「書き出し」)。
+//! 差し替える。Codec 構造は直接編集しないが、書き出し時に sample entry を再 encode するため
+//! 元の `stsd` バイト列は保持されない（docs/architecture.md「stsd sample entry の再 encode による情報欠落」）。
+//! コーデック固有の知識は不要で、サンプルはただのバイト列として元ファイルから読み出して
+//! `mdat` に詰め直す（検証済みコード: docs/mp4-atom.md「書き出し」）。
 //!
 //! レイアウトは `ftyp` → `mdat` → `moov` の順。`moov` を最後に置くことで、
 //! `mdat` に書き終えた時点でオフセットが確定してから `stco` を書ける
@@ -731,10 +732,14 @@ mod tests {
             .trak
             .iter()
             .map(|trak| {
-                let codec_is_video = matches!(
-                    trak.mdia.minf.stbl.stsd.codecs.first(),
-                    Some(mp4_atom::Codec::Avc1(_))
-                );
+                let codec_is_video = trak
+                    .mdia
+                    .minf
+                    .stbl
+                    .stsd
+                    .codecs
+                    .first()
+                    .is_some_and(crate::mp4io::read::is_video_codec);
                 if codec_is_video {
                     let n = samples(&trak.mdia.minf.stbl, fixture_file_len())
                         .expect("samples")
