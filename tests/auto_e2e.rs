@@ -277,7 +277,8 @@ fn auto_ignore_gate_overrides_gate_stop_but_gate_alone_stops_without_it() {
 
     for (label, ignore_gate) in [("without-ignore-gate", false), ("with-ignore-gate", true)] {
         let tmp_dir = make_tmp_dir(&format!("gate-{label}"));
-        let input = tmp_dir.join("IN.mp4");
+        // 空白と `'` を含む名前にして、案内のコマンド例の引用符付けも通す。
+        let input = tmp_dir.join("IN rec's.mp4");
         std::fs::copy(common::fixture_path(), &input).expect("フィクスチャをコピーできること");
 
         let bin_dir = tmp_dir.join("tools").join("bin");
@@ -357,6 +358,52 @@ fn auto_ignore_gate_overrides_gate_stop_but_gate_alone_stops_without_it() {
             assert!(
                 stderr.contains("tachikaze cut"),
                 "直して cut するコマンド例が出ていない: {stderr}"
+            );
+            // review の例と cut の例を、引用符つきのトークン（中の `'\''` も含む）のまま
+            // 比べる。引数の順序は review が `入力 --cache-dir DIR -o OUT`、cut が
+            // `入力 --trim T --dtvi D -o OUT`。
+            let quote = |p: &Path| format!("'{}'", p.display().to_string().replace('\'', r"'\''"));
+            let review_line = stderr
+                .lines()
+                .find(|l| l.contains("tachikaze review "))
+                .expect("review のコマンド例の行が無い");
+            let review_rest = review_line
+                .split("tachikaze review ")
+                .nth(1)
+                .expect("review の引数を取り出せること");
+            let review_arg = review_rest
+                .split(" --cache-dir ")
+                .next()
+                .expect("review の入力を取り出せること");
+            let review_out = review_rest
+                .split(" -o ")
+                .nth(1)
+                .map(|s| s.trim_end_matches(")\""))
+                .expect("review の -o を取り出せること");
+            let cut_line = stderr
+                .lines()
+                .find(|l| l.contains("tachikaze cut "))
+                .expect("cut のコマンド例の行が無い");
+            let cut_arg = cut_line
+                .split("tachikaze cut ")
+                .nth(1)
+                .and_then(|rest| rest.split(" --trim ").next())
+                .expect("cut の入力を取り出せること");
+            let cut_out = cut_line
+                .split(" -o ")
+                .nth(1)
+                .expect("cut の -o を取り出せること");
+            assert_eq!(
+                review_arg, cut_arg,
+                "review と cut の入力が一致しない: {stderr}"
+            );
+            assert_eq!(
+                review_out, cut_out,
+                "review と cut の -o が一致しない: {stderr}"
+            );
+            assert!(
+                review_line.contains(&format!(" --cache-dir {}", quote(&cache_root))),
+                "auto が使った --cache-dir を review の行に渡していない: {stderr}"
             );
             assert!(
                 stderr.contains("exit code 3"),
