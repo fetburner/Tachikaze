@@ -7,11 +7,12 @@
 mod common;
 
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 
 use common::{make_tmp_dir, skip_if_fixture_missing_at};
-use tachikaze::{dtvi, workdir};
+use tachikaze::{dtvi, ffprobe, workdir};
 
 /// `review` を子プロセスで起動する。`env_path` を与えると `PATH` をそれで置き換える
 /// （ツールが見つからない経路をテストするため）。
@@ -224,6 +225,221 @@ fn review_output_option_is_embedded_as_absolute_path() {
         html.contains(&format!("\"output\":{expected}")),
         "output が {expected} になっていない"
     );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// `.dtvi` のフレーム表で、表示順フレーム番号 `frame` の行の flags（最終列）からキーフラグを外す。
+/// 行は1列目で探す（文字列の置換で狙い撃ちしない）。
+fn clear_key_flag(dtvi_path: &Path, frame: u32) {
+    let text = fs::read_to_string(dtvi_path).expect("dtvi の読み込み");
+    let mut in_frames = false;
+    let mut hits = 0;
+    let mut lines: Vec<String> = Vec::new();
+    for line in text.lines() {
+        if line == "FRAMES" {
+            in_frames = true;
+            lines.push(line.to_string());
+            continue;
+        }
+        let mut cols: Vec<String> = line.split('\t').map(str::to_string).collect();
+        if in_frames && cols.first().map(String::as_str) == Some(&frame.to_string()) {
+            let flags: u8 = cols
+                .last()
+                .expect("flags 列")
+                .parse()
+                .expect("flags は10進の整数");
+            let cleared = flags & !dtvi::FLAG_KEY_PACKET;
+            *cols.last_mut().expect("flags 列") = cleared.to_string();
+            hits += 1;
+            lines.push(cols.join("\t"));
+        } else {
+            lines.push(line.to_string());
+        }
+    }
+    assert_eq!(hits, 1, "フレーム {frame} の行が1つだけあるはず");
+    let mut out = lines.join("\n");
+    out.push('\n');
+    fs::write(dtvi_path, out).expect("dtvi の書き戻し");
+}
+
+/// 完了条件: サムネイルの枚数が `.dtvi` のキーフレーム数と食い違うと、`index.html` を書かずに止まる。
+/// 前回の `review/` はそのまま残り、一時ディレクトリも残さない。
+#[test]
+#[ignore = "要 ffmpeg とフィクスチャ（bash tests/fixtures/gen.sh）"]
+fn review_with_thumbnail_count_mismatch_stops_and_keeps_previous_screen() {
+    let fixture = common::logo_fixture_path();
+    if skip_if_fixture_missing_at(&fixture) {
+        return;
+    }
+    let root = make_tmp_dir("review-e2e-thumb-mismatch");
+    let cache = root.join("cache");
+    seed_cache(&cache, &fixture, &common::logo_dtvi_path(), "Trim(0,598)");
+
+    let first = run_review(&cache, &fixture, None);
+    assert!(
+        first.status.success(),
+        "1回目の review が失敗: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let dtvi_path = workdir::cached_dtvi_path(Some(&cache), &fixture).expect("dtvi のパス");
+    let review_dir = workdir::cached_review_dir(Some(&cache), &fixture).expect("review のパス");
+    let index = review_dir.join("index.html");
+    let before = fs::read(&index).expect("1回目の index.html");
+
+    // キーフレームを1つ減らす。ffmpeg は書き出すので、サムネイルは5枚・キーフレームは4個になる。
+    clear_key_flag(&dtvi_path, 480);
+    let second = run_review(&cache, &fixture, None);
+    let stderr = String::from_utf8_lossy(&second.stderr);
+    assert!(!second.status.success(), "枚数の不一致で失敗するはず");
+    assert!(stderr.contains("書き出されたサムネイルが 5 枚"), "{stderr}");
+    assert!(stderr.contains("キーフレームは 4 枚"), "{stderr}");
+
+    let after = fs::read(&index).expect("前回の index.html が残っているはず");
+    assert!(after == before, "前回の index.html が書き換えられている");
+
+    let leftovers: Vec<_> = fs::read_dir(review_dir.parent().expect("親"))
+        .expect("キャッシュ一覧")
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().starts_with("review.tmp"))
+        .collect();
+    assert!(leftovers.is_empty(), "一時ディレクトリを残さないこと");
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// `src/review.html` の `command()` と同じ規則で、`DATA.keep`（表示順フレーム番号の半開区間）から
+/// trim 文字列を作る。隣接する区間（前の end と次の start が等しい）は1つにまとめ、
+/// 各区間 `[s, e)` を `Trim(s,e-1)` にして `" ++ "` で連結する。`src/review.html` の `command()` / `blocks()` と同じ規則。
+fn trim_from_keep(keep: &[(u64, u64)]) -> String {
+    let mut merged: Vec<(u64, u64)> = Vec::new();
+    for &(start, end) in keep {
+        match merged.last_mut() {
+            Some(last) if last.1 == start => last.1 = end,
+            _ => merged.push((start, end)),
+        }
+    }
+    merged
+        .iter()
+        .map(|&(start, end)| format!("Trim({start},{})", end - 1))
+        .collect::<Vec<_>>()
+        .join(" ++ ")
+}
+
+/// `cut` を子プロセスで実行する。`trim_text` は標準入力から読ませる（`--trim -`）。
+fn cut_with_stdin_trim(cache: &Path, input: &Path, trim_text: &str, output: &Path) -> Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_tachikaze"))
+        .arg("--cache-dir")
+        .arg(cache)
+        .arg("cut")
+        .arg(input)
+        .args(["--trim", "-", "-o"])
+        .arg(output)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("tachikaze cut の起動に失敗した");
+    // 画面のコマンドは `<<<` で渡すので、末尾に改行を付ける。
+    let mut stdin = child.stdin.take().expect("標準入力");
+    stdin
+        .write_all(format!("{trim_text}\n").as_bytes())
+        .expect("標準入力への書き込み");
+    drop(stdin);
+    child.wait_with_output().expect("cut の終了待ち")
+}
+
+/// 完了条件: 画面の初期状態から出るコマンドで `cut` した結果が、同じ `trim.avs` を `cut` に渡した
+/// 結果とパケット単位で一致する。キーフレーム境界に乗らない trim を使い、スナップが実際に起きることを確かめる。
+#[test]
+#[ignore = "要 ffmpeg とフィクスチャ（bash tests/fixtures/gen.sh）"]
+fn review_copied_command_cuts_same_packets_as_trim_file() {
+    let fixture = common::logo_fixture_path();
+    if skip_if_fixture_missing_at(&fixture) {
+        return;
+    }
+    let root = make_tmp_dir("review-e2e-command");
+    let cache = root.join("cache");
+    seed_cache(
+        &cache,
+        &fixture,
+        &common::logo_dtvi_path(),
+        // キーフレームは 0,120,240,360,480。総フレーム数は 599。
+        "Trim(10,200) ++ Trim(450,598)",
+    );
+
+    let output = run_review(&cache, &fixture, None);
+    assert!(
+        output.status.success(),
+        "review が失敗: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let index = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+    let html = fs::read_to_string(&index).expect("index.html の読み込み");
+    let start = html.find("const DATA = ").expect("DATA の開始") + "const DATA = ".len();
+    let end = start + html[start..].find(";</script>").expect("DATA の終端");
+    let data: serde_json::Value =
+        serde_json::from_str(&html[start..end]).expect("DATA の JSON パース");
+    let keep: Vec<(u64, u64)> = data["keep"]
+        .as_array()
+        .expect("keep は配列")
+        .iter()
+        .map(|pair| {
+            (
+                pair[0].as_u64().expect("start"),
+                pair[1].as_u64().expect("end"),
+            )
+        })
+        .collect();
+    let from_screen = trim_from_keep(&keep);
+
+    // 上の規則は画面の JS と同じ書き方でなければ意味がない。JS 側の式が変わったら気づくようにする。
+    let review_js = include_str!("../src/review.html");
+    assert!(
+        review_js.contains("Trim(${frameAt(a)},${frameAt(b) - 1})"),
+        "src/review.html の command() の書き方が変わった"
+    );
+    assert_eq!(
+        from_screen, "Trim(0,239) ++ Trim(360,598)",
+        "スナップが起きていない（元の trim と同じでは検査にならない）"
+    );
+
+    let cache_trim = workdir::cached_trim_path(Some(&cache), &fixture).expect("trim のパス");
+    let out_screen = root.join("from_review.mp4");
+    let out_trim = root.join("from_trim.mp4");
+    let by_screen = cut_with_stdin_trim(&cache, &fixture, &from_screen, &out_screen);
+    assert!(
+        by_screen.status.success(),
+        "画面のコマンド相当の cut が失敗: {}",
+        String::from_utf8_lossy(&by_screen.stderr)
+    );
+    let by_file = Command::new(env!("CARGO_BIN_EXE_tachikaze"))
+        .arg("--cache-dir")
+        .arg(&cache)
+        .arg("cut")
+        .arg(&fixture)
+        .arg("--trim")
+        .arg(&cache_trim)
+        .arg("-o")
+        .arg(&out_trim)
+        .output()
+        .expect("tachikaze cut の起動に失敗した");
+    assert!(
+        by_file.status.success(),
+        "trim.avs を渡した cut が失敗: {}",
+        String::from_utf8_lossy(&by_file.stderr)
+    );
+
+    // md5 は使わない（SPS/PPS の再挿入でずれる）。ffprobe のパケット単位の CRC32 で比べる。
+    for stream in ["v:0", "a:0"] {
+        let entries = "packet=stream_index,pts,dts,duration,flags,data_hash";
+        let a = ffprobe::csv_rows(Path::new("ffprobe"), &out_screen, stream, entries)
+            .expect("画面由来の出力の ffprobe");
+        let b = ffprobe::csv_rows(Path::new("ffprobe"), &out_trim, stream, entries)
+            .expect("trim.avs 由来の出力の ffprobe");
+        assert!(!a.is_empty(), "{stream} のパケットが空");
+        assert_eq!(a, b, "{stream} のパケットが一致しない");
+    }
 
     let _ = fs::remove_dir_all(&root);
 }

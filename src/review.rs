@@ -621,4 +621,76 @@ mod tests {
         )
         .expect("一致すれば通ること");
     }
+
+    /// `check_thumbnails` の検査用に、テスト名ごとに一意な一時ディレクトリへ空の JPEG 名を置く。
+    /// 同じプロセス内で並列に走るので、`label` はテストごとに変える。
+    fn thumbs_dir_with(label: &str, names: &[&str]) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "tachikaze-review-thumbs-{label}-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("一時ディレクトリの作成");
+        for name in names {
+            fs::write(dir.join(name), b"").expect("サムネイルの作成");
+        }
+        dir
+    }
+
+    /// 枚数が足りないとき、書き出した枚数と期待する枚数の両方を示して止まる。
+    #[test]
+    fn check_thumbnails_rejects_too_few_and_reports_both_counts() {
+        let dir = thumbs_dir_with(
+            "too-few",
+            &["00001.jpg", "00002.jpg", "00003.jpg", "00004.jpg"],
+        );
+        let result = check_thumbnails(&dir, 5);
+        let _ = fs::remove_dir_all(&dir);
+        let msg = result.expect_err("枚数不足は止まること").to_string();
+        assert!(msg.contains("4 枚"), "書き出した枚数が無い: {msg}");
+        assert!(msg.contains("5 枚"), "期待する枚数が無い: {msg}");
+    }
+
+    /// 枚数は合っていても連番に穴があれば、欠けている番号を示して止まる。
+    #[test]
+    fn check_thumbnails_rejects_gap_and_names_missing_file() {
+        let dir = thumbs_dir_with("gap", &["00001.jpg", "00002.jpg", "00004.jpg"]);
+        let result = check_thumbnails(&dir, 3);
+        let _ = fs::remove_dir_all(&dir);
+        let msg = result.expect_err("連番の穴は止まること").to_string();
+        assert!(msg.contains("00003.jpg"), "欠けた番号が無い: {msg}");
+    }
+
+    /// 枚数が多すぎるときも止まる（フレーム番号との対応が取れないため）。
+    #[test]
+    fn check_thumbnails_rejects_too_many() {
+        let names = [
+            "00001.jpg",
+            "00002.jpg",
+            "00003.jpg",
+            "00004.jpg",
+            "00005.jpg",
+            "00006.jpg",
+        ];
+        let dir = thumbs_dir_with("too-many", &names);
+        let result = check_thumbnails(&dir, 5);
+        let _ = fs::remove_dir_all(&dir);
+        assert!(result.is_err(), "過剰な枚数は止まること");
+    }
+
+    /// 枚数と連番が揃っていれば通る。
+    #[test]
+    fn check_thumbnails_accepts_exact_match() {
+        let names = [
+            "00001.jpg",
+            "00002.jpg",
+            "00003.jpg",
+            "00004.jpg",
+            "00005.jpg",
+        ];
+        let dir = thumbs_dir_with("exact", &names);
+        let result = check_thumbnails(&dir, 5);
+        let _ = fs::remove_dir_all(&dir);
+        result.expect("一致すれば通ること");
+    }
 }
