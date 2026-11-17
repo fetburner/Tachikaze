@@ -44,6 +44,8 @@ const SEGMENT_MAP_FILE_NAME: &str = "work.mp4.segmap.json";
 /// （`join_logo_scp -inlogo` に渡す。E14-8、#97）。検出割合が閾値未満の場合は
 /// 書かない（`src/analyze.rs` の doc comment参照）。
 const LOGOFRAME_FILE_NAME: &str = "logoframe.txt";
+/// `review` が確認画面を書き出すキャッシュ内のディレクトリ名（`index.html` と `thumbs/`）。
+const REVIEW_DIR_NAME: &str = "review";
 /// `prepare` が作る、elst 除去・字幕トラック除去後のメディアのファイル名。
 const INPUT_PREPARED_FILE_NAME: &str = "input_prepared.mp4";
 /// `prepare` が作る字幕サイドカーのベース名。拡張子（`ass` / `srt`）は
@@ -327,8 +329,8 @@ fn cache_dir_for_input(cache_dir: Option<&Path>, input: &Path) -> Result<PathBuf
 /// `cut --dtvi` 省略時に使う、入力ごとのキャッシュディレクトリ内の `.dtvi` の
 /// パスを返す。
 ///
-/// この関数を含む以下4関数（[`cached_segment_map_path`] / [`prepared_input_path`] /
-/// [`subs_path`]）はいずれも [`cache_dir_for_input`] 1か所にキャッシュパス規則を
+/// この関数を含む `cached_*` と [`prepared_input_path`] / [`subs_path`] の各関数は
+/// いずれも [`cache_dir_for_input`] 1か所にキャッシュパス規則を
 /// 集約する。呼び出し側ごとにパス規則がずれると、無関係な入力の対応ファイルを
 /// 指してしまいかねないため。ディレクトリの作成はいずれも行わない
 /// （ファイルの存在確認・作成は呼び出し側の責務とする。`.dtvi` が無いのに
@@ -343,6 +345,28 @@ pub fn cached_dtvi_path(cache_dir: Option<&Path>, input: &Path) -> Result<PathBu
 /// 作成は行わない（書き込み側で必要なら作る）。
 pub fn cached_segment_map_path(cache_dir: Option<&Path>, input: &Path) -> Result<PathBuf> {
     Ok(cache_dir_for_input(cache_dir, input)?.join(SEGMENT_MAP_FILE_NAME))
+}
+
+/// `review` が読む `trim.avs` のキャッシュパスを返す。パス規則は [`cached_dtvi_path`] 参照。
+pub fn cached_trim_path(cache_dir: Option<&Path>, input: &Path) -> Result<PathBuf> {
+    Ok(cache_dir_for_input(cache_dir, input)?.join(TRIM_FILE_NAME))
+}
+
+/// `review` が読む `detail.jls` のキャッシュパスを返す。パス規則は [`cached_dtvi_path`] 参照。
+pub fn cached_detail_jls_path(cache_dir: Option<&Path>, input: &Path) -> Result<PathBuf> {
+    Ok(cache_dir_for_input(cache_dir, input)?.join(DETAIL_JLS_FILE_NAME))
+}
+
+/// `review` が読む（無ければ黙って無視する）logoframe テキストのキャッシュパスを返す。
+/// パス規則は [`cached_dtvi_path`] 参照。
+pub fn cached_logoframe_path(cache_dir: Option<&Path>, input: &Path) -> Result<PathBuf> {
+    Ok(cache_dir_for_input(cache_dir, input)?.join(LOGOFRAME_FILE_NAME))
+}
+
+/// `review` が確認画面（`index.html` とサムネイル）を書き出すキャッシュディレクトリを返す。
+/// パス規則は [`cached_dtvi_path`] 参照。ディレクトリの作成は行わない。
+pub fn cached_review_dir(cache_dir: Option<&Path>, input: &Path) -> Result<PathBuf> {
+    Ok(cache_dir_for_input(cache_dir, input)?.join(REVIEW_DIR_NAME))
 }
 
 /// `prepare` が elst 除去・字幕トラック除去後のメディアを書き出すキャッシュパスを返す。

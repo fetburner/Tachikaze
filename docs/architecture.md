@@ -18,6 +18,7 @@
 | `remap-subs` | 字幕サイドカーの時刻を cut 後タイムラインへ張り替える |
 | `auto` | `prepare`→`analyze`→gate→`cut`→`remap-subs` を対話なしで合成 |
 | `make-logo` | 入力とロゴ矩形から `.lgd`（ロゴデータ）を作る |
+| `review` | `analyze` のキャッシュから、CM 検出結果を確認・修正する HTML（キーフレームのサムネイル付き）を作る。`analyze` も `prepare` も走らせない |
 
 各コマンドの入力は1本。繰り返しはシェルのループに任せる（下記「auto」参照）。手順番号はコマンドごとに 1 から振り、他所からは「cut の手順6」のように参照する。
 
@@ -142,6 +143,21 @@ tachikaze make-logo IN.mp4 --rect x,y,w,h -o OUT.lgd [--threshold N]
    **判断の履歴（2026-08 改訂）**: 当初は「局・番組ごとにロゴの形と色が異なり、対象素材だけから汎用的に検出する既存手段が無い」ため矩形を自動探索しないと決めていた。「Amatsukaze 側にも自動探索は無い」という事実は今も正しい。その後、定常段差のブロック中央値と本編/CM 在不在の AUC という局非依存の統計量が実測で成立し（`src/logo/estimate.rs`、詳細は [cm-detection.md](cm-detection.md)「ロゴ検出」）、判断を変えた。`analyze`/`auto` が `--logo`/`--no-logo` を両方省略したとき、内部でこの矩形推定をして `make-logo` と同じ学習アルゴリズムを呼ぶ（下記「analyze」の「自動推定」節）。`make-logo` コマンド自体（手動で矩形を指定する経路）は変えていない。
 2. 矩形の外周1ピクセルが単色（最小値・最大値の差が `--threshold`、既定12、以下）のフレームだけを学習に使い、画素ごとに最小二乗で回帰係数 `a`/`b` を求める（`src/logo/scan.rs`）。既定で入力全体を走らせる。CM区間だけを指定すると「ロゴが無い」ロゴデータができてしまうため
 3. 有効フレーム数（何フレーム中いくつ使ったか）を必ず stderr に出す。壊れたロゴデータを黙って書き出さないよう、有効フレームが0件または4件未満（`MIN_USABLE_FRAMES`）の場合と、係数が NaN/inf/`a==0` になった場合は失敗させる。件数そのものを別に検査するのは、少数のフレームでは回帰係数が NaN/inf にならず黙って有限値になりうるため
+
+### review
+
+```
+tachikaze review IN.mp4 [--cache-dir DIR]
+```
+
+`analyze` のキャッシュ（`trim.avs` / `work.mp4.dtvi` / `detail.jls`、任意で `logoframe.txt`）を読み、確認画面を作る（`src/review.rs`）。mp4 は読まない。フレームの情報はすべて `.dtvi` から取る。必須の入力が無ければ、`analyze` の実行例を添えて exit code 1 で止まる。`analyze` は走らせない。
+
+- 出力はキャッシュ内の `review/index.html` と `review/thumbs/00001.jpg` 以降（キーフレーム順、1始まり5桁、幅160px）。書き出しは一時ディレクトリに行い、検査を通ってから `review/` へ置き換える。古い `review/` は残さない
+- 標準出力は `index.html` の絶対パス1行だけ。診断は標準エラーに出す。ブラウザは自動で開かない
+- 画面が出す `cut` のコマンドは `Trim(...)` 形式だけを使い、`cut IN.mp4 --trim -` に標準入力で渡す。`--cache-dir` を指定していればそれも付く。`cut` 側には手を入れていない
+- 区間はすべて表示順フレーム番号の半開区間 `[start, end)`。`keep` は `trim.avs` を outward にスナップした結果。`missed` は見逃し候補をスナップせずに半開区間へ直したもの。`over` は切りすぎ候補で、理由は `logo` か `grid`
+- サムネイルの枚数が `.dtvi` のキーパケット数と一致しなければ停止する（下記「自己検証」13）。フレーム番号との対応は「何枚目か」だけで決まるため
+- 未検証: 実録画での目視確認（サムネイルと動画の位置が合うこと、画面のコマンドの出力が `cut --trim trim.avs` と一致すること）はまだ行っていない
 
 ### exit code
 
@@ -380,6 +396,7 @@ TOKYO MX の ED 区間（90秒）は、ロゴ自体は出ているのに段差�
 | `audio.rs` | 音声パケットの選択（区間のソース時刻から引き当て） | [lossless-cut.md](lossless-cut.md) |
 | `verify.rs` | 自己検証 | 下記「自己検証」 |
 | `segmap.rs` | `cut` が書く区間マップ（snap 後の境界と出力タイムライン上の開始時刻）の構造体、JSON への書き出しと読み込み | 上記「cut」手順8 |
+| `review.rs` | `review` 本体: キャッシュから確認画面（`index.html` とサムネイル）を作る。データの組み立て（純粋関数）と ffmpeg・ファイル書き出しを分ける。画面のテンプレートは `src/review.html` | 上記「review」 |
 | `subtitle.rs` | `remap-subs` 本体: ASS/SRT の Start/End を区間マップの区分的な線形写像で張り替える（シフト/破棄/クリップの分類、丸め方向） | 上記「remap-subs」 |
 | `logo/lgd.rs` | Amatsukaze 形式ロゴデータ `.lgd`（AviUtl 互換のベース部 + Amatsukaze 独自の float 部）の読み込み | [cm-detection.md](cm-detection.md) |
 | `logo/frames.rs` | ffmpeg を子プロセスとして起動し、ロゴ矩形の輝度平面をフレーム順にストリームで読む（`stream_luma_frames`、読み取ったフレーム数と `.dtvi` の `frame_count` の一致検査あり）。ロゴ矩形推定専用に、クロップせず全画面をキーフレームだけ読む関数（`stream_keyframe_luma_frames`、フレーム数一致検査なし）も持つ | [cm-detection.md](cm-detection.md) |
@@ -439,3 +456,4 @@ struct DecodeIdx(u32);    // デコード順（mp4 のサンプル番号 / .dtvi
     (e) 末尾GOPを含む部分デコードは `frames::decode_from_seek_until_eof_luma_frames` を使う。この関数は `.dtvi` ヘッダの `frame_count` を信用せず、メディアの終端まで実際に読む。読めた枚数が `expected_frame_count - 開始フレーム` と一致するか検査する（媒体側の真値での検査、blocker3）。この検査がレビューで追加したE2Eフィクスチャで(c)の罠3を発見した経緯そのものである（着地オラクルは対象矩形の画素が不変で見逃したが、この枚数検査は見逃さなかった）。
 
     (f) **精緻化GOPの割合による性能フォールバック**（レビュー指摘後の追加対応）。(d)の不動点化は正しさを回復させたが、ロゴが薄い入力（ぼっち・ざ・ろっく！）では逆に全編フルデコードより遅くなる実測結果が出た。GOPの大半を結局精緻化するなら、GOPごとにシーク・ffmpeg起動を挟む部分デコードは、1回のシークで済む全編フルデコードより不利になる。そのため各ラウンドの部分デコードを始める前に、`hier::should_fall_back_to_full_decode` で累計の精緻化対象GOPの割合を確認する。`HIER_FALLBACK_GOP_FRACTION_THRESHOLD`（40%）以上に達していたら不動点化を放棄する。放棄後は `decode_logo_scores_full`（`detect_logo_scores_hier` 導入前の全編フルデコード実装をそのまま残したもの）へ切り替える。ロゴが薄い入力は初回の精緻化対象の選定（(b)のキーフレーム走査結果からの粗判定）だけでこの閾値に達することが多く、その場合は部分デコードを一度も行わずに切り替わる。閾値40%の根拠と実測は [measurements.md](measurements.md)「精緻化GOPの割合による性能フォールバック」参照。
+13. `review` のサムネイル枚数検査（`src/review.rs` の `check_thumbnails`）。ffmpeg が書き出した JPEG の枚数が `.dtvi` のキーパケット数と一致し、`00001.jpg` から連番で揃っているかを確かめる。1枚でもずれると以降のサムネイルが別の位置の映像になり、エラーは出ない（罠3と同種）。不一致なら両方の数を出して停止し、`review/` は作らない。

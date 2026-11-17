@@ -65,6 +65,13 @@ pub enum Commands {
     /// 全体（既定で全フレーム）を走らせて学習する。CM 区間だけを指定すると
     /// 「ロゴが無い」ロゴデータができてしまうため、区間を絞る引数は用意していない。
     MakeLogo(MakeLogoArgs),
+    /// `analyze` のキャッシュから、CM 検出結果を確認・修正する HTML（確認画面）を作る。
+    ///
+    /// キャッシュの `trim.avs` / `.dtvi` / `detail.jls`（と任意の logoframe）を読むだけで、
+    /// `analyze` も `prepare` も走らせない。キャッシュ内の `review/index.html` と
+    /// `review/thumbs/` を書き出し、その絶対パスを標準出力に1行だけ出す（ブラウザは開かない）。
+    /// 画面が出す `cut` のコマンドは `Trim(...)` 形式だけを使う（`cut --trim -`）。
+    Review(ReviewArgs),
 }
 
 #[derive(Debug, Args)]
@@ -271,6 +278,13 @@ pub enum Snap {
 }
 
 /// `make-logo` サブコマンドの引数。
+/// `review` サブコマンドの引数。
+#[derive(Debug, Args)]
+pub struct ReviewArgs {
+    /// 対象の入力（`cut` に渡すのと同じパス）。
+    pub input: PathBuf,
+}
+
 #[derive(Debug, Args)]
 pub struct MakeLogoArgs {
     pub input: PathBuf,

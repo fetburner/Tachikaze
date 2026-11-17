@@ -13,6 +13,7 @@ use mp4_atom::{Codec, Moov, Trak};
 
 use crate::cli::{
     AnalyzeArgs, AutoArgs, Cli, Commands, CutArgs, MakeLogoArgs, PrepareArgs, RemapSubsArgs,
+    ReviewArgs,
 };
 use crate::dtvi::Dtvi;
 use crate::errctx::PathContext;
@@ -20,8 +21,8 @@ use crate::logo::frames::VideoSize;
 use crate::mp4io::read::SampleInfo;
 use crate::order::{DecodeIdx, DisplayIdx, OrderMap};
 use crate::{
-    analyze, audio, auto, cli, dtvi, gate, logo, mp4io, plan, prepare, report, segmap, subtitle,
-    tools, trim, verify, workdir,
+    analyze, audio, auto, cli, dtvi, gate, logo, mp4io, plan, prepare, report, review, segmap,
+    subtitle, tools, trim, verify, workdir,
 };
 
 /// `main.rs` が終了コードを決めるための、サブコマンド実行結果。
@@ -54,7 +55,19 @@ pub fn run(cli: Cli) -> anyhow::Result<ExitOutcome> {
         // make-logo はキャッシュを持たない(入力 mp4 と ffmpeg だけで完結させる方針、
         // issue #95「解くべき問題」)ため、`--cache-dir` は受け取っても使わない。
         Commands::MakeLogo(args) => run_make_logo(args).map(|()| ExitOutcome::Success),
+        Commands::Review(args) => run_review(cache_dir, args).map(|()| ExitOutcome::Success),
     }
+}
+
+/// `review` サブコマンドの実行。確認画面の組み立ては [`review::run`] に任せ、ここでは
+/// 生成された `index.html` の絶対パスを標準出力に1行だけ出す（診断は stderr）。
+fn run_review(cache_dir: Option<PathBuf>, args: ReviewArgs) -> anyhow::Result<()> {
+    let index = review::run(&review::ReviewConfig {
+        input: args.input,
+        cache_dir,
+    })?;
+    println!("{}", index.display());
+    Ok(())
 }
 
 /// `auto` サブコマンドの実行。処理本体は [`auto::run`] に集約してあり（`commands.rs`

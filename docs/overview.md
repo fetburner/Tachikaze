@@ -13,6 +13,7 @@ mp4 に変換済みの録画ファイルを、再エンコードせずに CM カ
 | やりたいこと | 読む文書 |
 |---|---|
 | 手元の mp4 を一連で CM カットする | `tachikaze auto`（`prepare`→`analyze`→gate→`cut`→`remap-subs` を対話なしで合成、説明は [architecture.md](architecture.md)「コマンド構成」） |
+| 検出結果をブラウザで確認・修正する | `tachikaze review`（キャッシュからサムネイル付きの確認画面を作る。説明は [architecture.md](architecture.md)「review」） |
 | コマンドの引数・キャッシュの場所・未対応の入力を知る | [architecture.md](architecture.md)（前半が利用者向け） |
 | CM 検出が外れる・当たらない原因を調べる | [jls-settings.md](jls-settings.md) |
 | 外部ツールを macOS でビルドする | [toolchain-macos.md](toolchain-macos.md) |
