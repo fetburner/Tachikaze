@@ -64,6 +64,7 @@ pub fn run(cli: Cli) -> anyhow::Result<ExitOutcome> {
 fn run_review(cache_dir: Option<PathBuf>, args: ReviewArgs) -> anyhow::Result<()> {
     let index = review::run(&review::ReviewConfig {
         input: args.input,
+        output: args.output,
         cache_dir,
     })?;
     println!("{}", index.display());

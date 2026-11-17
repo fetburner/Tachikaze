@@ -210,6 +210,8 @@ pub fn render_html(template: &str, data: &Value) -> Result<String> {
 /// `review` の入力（ユーザーが渡した mp4 と `--cache-dir`）。
 pub struct ReviewConfig {
     pub input: PathBuf,
+    /// `-o`。`None` なら [`output_path`] の既定。
+    pub output: Option<PathBuf>,
     pub cache_dir: Option<PathBuf>,
 }
 
@@ -282,7 +284,11 @@ pub fn run(config: &ReviewConfig) -> Result<PathBuf> {
         None
     };
 
-    let output = output_path(&input)?;
+    // 画面のコマンドはどのディレクトリで実行されるか分からないので、相対パスは絶対パスにする。
+    let output = match &config.output {
+        Some(path) => std::path::absolute(path).path_ctx("-o の絶対パス解決", path)?,
+        None => output_path(&input)?,
+    };
     let cache_dir_abs = cache
         .map(|dir| std::path::absolute(dir).path_ctx("--cache-dir の絶対パス解決", dir))
         .transpose()?;

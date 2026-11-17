@@ -282,6 +282,11 @@ pub enum Snap {
 pub struct ReviewArgs {
     /// 対象の入力（`cut` に渡すのと同じパス）。
     pub input: PathBuf,
+    /// 画面が出す `cut` コマンドの出力先。未指定なら入力と同じディレクトリの
+    /// `<stem>_CMcut.mp4`（`prepare` 後の入力ではキャッシュ内になるため、録画の隣に
+    /// 出したいときに指定する）。
+    #[arg(short, long)]
+    pub output: Option<PathBuf>,
 }
 
 /// `make-logo` サブコマンドの引数。

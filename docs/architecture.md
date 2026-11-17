@@ -147,12 +147,13 @@ tachikaze make-logo IN.mp4 --rect x,y,w,h -o OUT.lgd [--threshold N]
 ### review
 
 ```
-tachikaze review IN.mp4 [--cache-dir DIR]
+tachikaze review IN.mp4 [-o OUT.mp4] [--cache-dir DIR]
 ```
 
 `analyze` のキャッシュ（`trim.avs` / `work.mp4.dtvi` / `detail.jls`、任意で `logoframe.txt`）を読み、確認画面を作る（`src/review.rs`）。mp4 は読まない。フレームの情報はすべて `.dtvi` から取る。必須の入力が無ければ、`analyze` の実行例を添えて exit code 1 で止まる。`analyze` は走らせない。
 
 - 出力はキャッシュ内の `review/index.html` と `review/thumbs/00001.jpg` 以降（キーフレーム順、1始まり5桁、幅160px）。書き出しは一時ディレクトリに行い、検査を通ってから `review/` へ置き換える。古い `review/` は残さない
+- 画面が出す `cut` コマンドの `-o` は、`-o OUT.mp4` を指定すればその絶対パスになり、省略すれば入力と同じディレクトリの `<stem>_CMcut.mp4` になる。`prepare` 後の入力を渡すと既定ではキャッシュ内の `input_prepared_CMcut.mp4` になるため、録画の隣に出したいときは `-o` を指定する
 - 標準出力は `index.html` の絶対パス1行だけ。診断は標準エラーに出す。ブラウザは自動で開かない
 - 画面が出す `cut` のコマンドは `Trim(...)` 形式だけを使い、`cut IN.mp4 --trim -` に標準入力で渡す。`--cache-dir` を指定していればそれも付く。`cut` 側には手を入れていない
 - 区間はすべて表示順フレーム番号の半開区間 `[start, end)`。`keep` は `trim.avs` を outward にスナップした結果。`missed` は見逃し候補をスナップせずに半開区間へ直したもの。`over` は切りすぎ候補で、理由は `logo` か `grid`

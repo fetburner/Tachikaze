@@ -142,3 +142,47 @@ fn review_writes_thumbnails_matching_keyframes_and_prints_index_path() {
 
     let _ = fs::remove_dir_all(&root);
 }
+
+/// `-o` に相対パスを渡すと、画面に埋める `output` は実行時のカレントディレクトリ基準の
+/// 絶対パスになる（画面のコマンドはどこで実行されるか分からないため）。
+#[test]
+#[ignore = "要 ffmpeg とフィクスチャ（bash tests/fixtures/gen.sh）"]
+fn review_output_option_is_embedded_as_absolute_path() {
+    let fixture = common::logo_fixture_path();
+    if skip_if_fixture_missing_at(&fixture) {
+        return;
+    }
+    let root = make_tmp_dir("review-e2e-output");
+    let cache = root.join("cache");
+    seed_cache(&cache, &fixture, &common::logo_dtvi_path(), "Trim(0,598)");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_tachikaze"))
+        .current_dir(&root)
+        .arg("--cache-dir")
+        .arg(&cache)
+        .args(["review", "-o", "録画 1_CMcut.mp4"])
+        .arg(&fixture)
+        .output()
+        .expect("tachikaze review の起動に失敗した");
+    assert!(
+        output.status.success(),
+        "review が失敗: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let index = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+    let html = fs::read_to_string(&index).expect("index.html の読み込み");
+    let expected = serde_json::to_string(
+        &fs::canonicalize(&root)
+            .expect("root の正規化")
+            .join("録画 1_CMcut.mp4")
+            .display()
+            .to_string(),
+    )
+    .expect("JSON 文字列");
+    assert!(
+        html.contains(&format!("\"output\":{expected}")),
+        "output が {expected} になっていない"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
