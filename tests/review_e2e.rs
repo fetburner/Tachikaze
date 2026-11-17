@@ -287,7 +287,8 @@ fn review_with_thumbnail_count_mismatch_stops_and_keeps_previous_screen() {
     let index = review_dir.join("index.html");
     let before = fs::read(&index).expect("1回目の index.html");
 
-    // キーフレームを1つ減らす。ffmpeg は書き出すので、サムネイルは5枚・キーフレームは4個になる。
+    // mp4 自体のキーフレームは5個のままなので、ffmpeg はサムネイルを5枚書き出す。
+    // ずれるのは `.dtvi` 側で、そのキーフレームは4個になる。
     clear_key_flag(&dtvi_path, 480);
     let second = run_review(&cache, &fixture, None);
     let stderr = String::from_utf8_lossy(&second.stderr);
@@ -308,9 +309,9 @@ fn review_with_thumbnail_count_mismatch_stops_and_keeps_previous_screen() {
     let _ = fs::remove_dir_all(&root);
 }
 
-/// `src/review.html` の `command()` と同じ規則で、`DATA.keep`（表示順フレーム番号の半開区間）から
-/// trim 文字列を作る。隣接する区間（前の end と次の start が等しい）は1つにまとめ、
-/// 各区間 `[s, e)` を `Trim(s,e-1)` にして `" ++ "` で連結する。`src/review.html` の `command()` / `blocks()` と同じ規則。
+/// `DATA.keep`（表示順フレーム番号の半開区間）から trim 文字列を作る。
+/// 隣接する区間（前の end と次の start が等しい）は1つにまとめ、各区間 `[s, e)` を
+/// `Trim(s,e-1)` にして `" ++ "` で連結する。`src/review.html` の `command()` / `blocks()` と同じ規則。
 fn trim_from_keep(keep: &[(u64, u64)]) -> String {
     let mut merged: Vec<(u64, u64)> = Vec::new();
     for &(start, end) in keep {
@@ -438,6 +439,11 @@ fn review_copied_command_cuts_same_packets_as_trim_file() {
         let b = ffprobe::csv_rows(Path::new("ffprobe"), &out_trim, stream, entries)
             .expect("trim.avs 由来の出力の ffprobe");
         assert!(!a.is_empty(), "{stream} のパケットが空");
+        // 時刻と長さだけの比較に落ちないよう、CRC32 が各行に入っていることを確かめる。
+        assert!(
+            a.iter().all(|row| row.contains("CRC32:")),
+            "{stream} に CRC32 が無い行がある（data_hash の指定が落ちている）: {a:?}"
+        );
         assert_eq!(a, b, "{stream} のパケットが一致しない");
     }
 
