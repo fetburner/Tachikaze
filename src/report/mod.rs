@@ -22,8 +22,13 @@
 //! `--report` が指定されたときにだけ、呼び出し側（analyze 側の配線）が
 //! [`format_report`] の戻り値を表示する。これにより「`--report` なしのときは
 //! 余計な標準出力を出さない」という条件を自然に満たす。
+//!
+//! サブモジュール:
+//! - [`missed`]: 見逃し候補（CM が残っている疑い）の警告
+//! - [`overcut`]: 切りすぎ候補（本編がカットされている疑い）。mp4 は読まない
 
 pub mod missed;
+pub mod overcut;
 
 use crate::cli::Snap;
 use crate::dtvi::Dtvi;

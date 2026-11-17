@@ -74,6 +74,8 @@
 //! 超えて戻る入力では逆イテレータ範囲が反転して UB になる（本実装はその
 //! ケースで安全に `it` で止まる）。
 
+use std::fmt;
+
 /// 1フレームの `(corr0, corr1)` から生スコアを求める（[`write_result`] 手順1と
 /// 同じ式）。`corr0` のマイナスと `corr1` のプラスはノイズなので捨てる。
 ///
@@ -390,9 +392,194 @@ fn build_text(result: &[Judgement], score: &[f32]) -> String {
     text
 }
 
+/// [`parse_text`] のエラー。書式に合わない行、または `S` と `E` が対になって
+/// いない行を指す。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogoTextParseError {
+    /// 元テキスト中の行番号（1始まり）
+    pub line_no: usize,
+    /// 問題のあった行の内容
+    pub line: String,
+}
+
+impl fmt::Display for LogoTextParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "logoframe テキストの {} 行目をパースできません: {:?}",
+            self.line_no, self.line
+        )
+    }
+}
+
+impl std::error::Error for LogoTextParseError {}
+
+/// logoframe の1行（`<best> S|E 0 ALL <範囲左> <範囲右>`）を
+/// `(最良位置, S なら true / E なら false)` に読む。書式に合わなければ `None`。
+fn parse_row(line: &str) -> Option<(u32, bool)> {
+    let fields: Vec<&str> = line.split_whitespace().collect();
+    let [best, marker, "0", "ALL", left, right] = fields.as_slice() else {
+        return None;
+    };
+    let is_start = match *marker {
+        "S" => true,
+        "E" => false,
+        _ => return None,
+    };
+    let best = best.parse::<u32>().ok()?;
+    left.parse::<u32>().ok()?;
+    right.parse::<u32>().ok()?;
+    Some((best, is_start))
+}
+
+/// [`build_text`] が書いた logoframe テキストを、ロゴ表示区間の列に戻す。
+///
+/// 返す区間は表示順フレーム番号の半開区間 `[start, end)`。`S` 行の最良位置を
+/// 開始にし、対になる `E` 行の最良位置を**含む**終端として `+1` して終端にする
+/// （`E` 行はロゴ表示の最終フレームを書く。[`build_text`] の `e_end - 1`）。
+/// 範囲の左右の列（精緻化の探索範囲）は区間には使わない。
+///
+/// 空文字列（ロゴ区間なし）は空の列を返す。次の場合はエラーにする（黙って読み飛ば
+/// すと、ロゴ区間が欠けたまま「ロゴなし」として扱われるため）:
+/// - 書式に合わない行
+/// - 対になる `S` の無い `E`、`E` の無いまま次の `S` が来た場合、末尾の `E` の無い `S`
+/// - 終端が開始以下になる行
+pub fn parse_text(text: &str) -> Result<Vec<(u32, u32)>, LogoTextParseError> {
+    let mut intervals = Vec::new();
+    // 対になる `E` を待っている `S` と、その行のエラー情報。
+    let mut open: Option<(u32, LogoTextParseError)> = None;
+
+    for (idx, line) in text.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let error = LogoTextParseError {
+            line_no: idx + 1,
+            line: line.to_string(),
+        };
+        let Some((best, is_start)) = parse_row(trimmed) else {
+            return Err(error);
+        };
+
+        match (is_start, open.take()) {
+            (true, None) => open = Some((best, error)),
+            // 対になる `E` の無い `S` が残っている。その `S` の行を指す。
+            (true, Some((_, pending))) => return Err(pending),
+            (false, Some((start, _))) => {
+                let Some(end) = best.checked_add(1).filter(|&e| e > start) else {
+                    return Err(error);
+                };
+                intervals.push((start, end));
+            }
+            (false, None) => return Err(error),
+        }
+    }
+
+    if let Some((_, pending)) = open {
+        return Err(pending);
+    }
+    Ok(intervals)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---------------------------------------------------------------
+    // parse_text（build_text の逆変換、切りすぎ候補が使う）
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn parse_text_round_trips_write_result_intervals() {
+        // honpen_cm_honpen_gives_two_intervals と同じ入力。
+        // 本編 [0,1000) と [1450,2450) が元の区間。
+        let mut raw = vec![1.0f32; 1000];
+        raw.extend(vec![-1.0f32; 450]);
+        raw.extend(vec![1.0f32; 1000]);
+        let scores: Vec<(f32, f32)> = raw
+            .iter()
+            .map(|&v| if v >= 0.0 { (v, 0.0) } else { (0.0, v) })
+            .collect();
+
+        let text = write_result(&scores, 30.0).text;
+
+        assert_eq!(
+            parse_text(&text).expect("should parse"),
+            vec![(0, 1000), (1450, 2450)]
+        );
+    }
+
+    #[test]
+    fn parse_text_reads_the_one_line_fixture_as_half_open() {
+        // one_line_matches_logoframe_format_exactly と同じ出力。
+        // E 行の 6 はロゴ表示の最終フレーム（含む）なので、終端は 7。
+        let text = "     3 S 0 ALL      3      3\n     6 E 0 ALL      6      6\n";
+
+        assert_eq!(parse_text(text).expect("should parse"), vec![(3, 7)]);
+    }
+
+    #[test]
+    fn parse_text_of_empty_string_is_empty() {
+        assert_eq!(parse_text("").expect("should parse"), Vec::new());
+    }
+
+    #[test]
+    fn parse_text_rejects_malformed_line() {
+        let text = "     3 S 0 ALL      3      3\nnot a logoframe line\n";
+
+        let err = parse_text(text).expect_err("should fail");
+
+        assert_eq!(err.line_no, 2);
+        assert_eq!(err.line, "not a logoframe line");
+    }
+
+    #[test]
+    fn parse_text_rejects_wrong_fixed_columns() {
+        // `0` と `ALL` の位置が違う行は書式違い。
+        let text = "     3 S 1 ALL      3      3\n     6 E 0 ALL      6      6\n";
+
+        let err = parse_text(text).expect_err("should fail");
+
+        assert_eq!(err.line_no, 1);
+    }
+
+    #[test]
+    fn parse_text_rejects_end_without_start() {
+        let text = "     6 E 0 ALL      6      6\n";
+
+        let err = parse_text(text).expect_err("should fail");
+
+        assert_eq!(err.line_no, 1);
+    }
+
+    #[test]
+    fn parse_text_rejects_start_without_end() {
+        let text = "     3 S 0 ALL      3      3\n";
+
+        let err = parse_text(text).expect_err("should fail");
+
+        assert_eq!(err.line_no, 1);
+    }
+
+    #[test]
+    fn parse_text_rejects_start_followed_by_start() {
+        // 1つ目の S に対応する E が無いので、1つ目の S の行を指す。
+        let text = "     3 S 0 ALL      3      3\n     9 S 0 ALL      9      9\n     6 E 0 ALL      6      6\n";
+
+        let err = parse_text(text).expect_err("should fail");
+
+        assert_eq!(err.line_no, 1);
+    }
+
+    #[test]
+    fn parse_text_rejects_end_not_after_start() {
+        let text = "     6 S 0 ALL      6      6\n     5 E 0 ALL      5      5\n";
+
+        let err = parse_text(text).expect_err("should fail");
+
+        assert_eq!(err.line_no, 2);
+    }
 
     // ---------------------------------------------------------------
     // raw_score / instant_label（ロゴ検出の階層化方式が使う共有ロジック、
