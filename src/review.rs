@@ -30,6 +30,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Value};
 
+use crate::analyze::dtvi_frame_count;
 use crate::cli::Snap;
 use crate::dtvi::{self, Dtvi, DtviFrame};
 use crate::errctx::PathContext;
@@ -93,6 +94,24 @@ fn check_boundary(value: u32, keyframes: &[u32], total: u32) -> Result<()> {
         "review: 保持区間の境界 {value} がキーフレームでも総フレーム数（{total}）でもありません。\
          `trim.avs` と `.dtvi` が同じ録画のものか確認してください"
     )
+}
+
+/// ヘッダの `frame_count` とフレーム表の行数が一致するかを検査する。
+///
+/// フレーム表が途中で切れていると、行数を総フレーム数とみなす `review` は、後ろの区間を
+/// 黙って欠いた確認画面を作るか、原因の分からない重なりエラーで止まる。`analyze` の
+/// 階層化ロゴ検出（手順0）と同じ検査を `review` の前にも行う。
+fn check_frame_count(dtvi: &Dtvi, dtvi_path: &Path, analyze_cmd: &str) -> Result<()> {
+    let header = dtvi_frame_count(dtvi)?;
+    let rows = dtvi.frames.len() as u64;
+    if header != rows {
+        bail!(
+            "review: .dtvi のヘッダの frame_count（{header}）とフレーム表の行数（{rows}）が一致しません: {}\n\
+             .dtvi が途中で切れている可能性があります。次を実行して作り直してください:\n  {analyze_cmd}",
+            dtvi_path.display()
+        );
+    }
+    Ok(())
 }
 
 /// 確認画面に埋める JSON を組み立てる（純粋な関数）。
@@ -261,6 +280,11 @@ pub fn run(config: &ReviewConfig) -> Result<PathBuf> {
         .map_err(|err| anyhow!("trim ファイルのパースに失敗しました: {err}"))?;
     let dtvi = dtvi::parse(&read(&dtvi_path)?)
         .map_err(|err| anyhow!("`.dtvi` のパースに失敗しました: {err}"))?;
+    check_frame_count(
+        &dtvi,
+        &dtvi_path,
+        &workdir::analyze_command(cache, &config.input),
+    )?;
     let jls_entries = jls::parse(&read(&jls_path)?)
         .map_err(|err| anyhow!("`detail.jls` のパースに失敗しました: {err}"))?;
     let logo = if logo_path.is_file() {
@@ -416,6 +440,7 @@ mod tests {
         let header = HashMap::from([
             ("time_base_num".to_string(), "1".to_string()),
             ("time_base_den".to_string(), "30000".to_string()),
+            ("frame_count".to_string(), total.to_string()),
         ]);
         Dtvi {
             format_version: 1,
@@ -566,5 +591,34 @@ mod tests {
     #[test]
     fn real_template_has_exactly_one_placeholder() {
         assert_eq!(TEMPLATE.matches(PLACEHOLDER).count(), 1);
+    }
+
+    /// フレーム表だけ切れた `.dtvi`（ヘッダは599、行は40）が止まり、両方の値が出ること。
+    #[test]
+    fn frame_count_mismatch_is_rejected_with_both_values() {
+        let mut dtvi = dtvi_with_keyframes(40, 120);
+        dtvi.header
+            .insert("frame_count".to_string(), "599".to_string());
+        let err = check_frame_count(
+            &dtvi,
+            Path::new("/cache/work.mp4.dtvi"),
+            "tachikaze analyze",
+        )
+        .expect_err("食い違いは止まること");
+        let msg = err.to_string();
+        assert!(msg.contains("599") && msg.contains("40"), "{msg}");
+        assert!(msg.contains("/cache/work.mp4.dtvi"), "{msg}");
+        assert!(msg.contains("tachikaze analyze"), "{msg}");
+    }
+
+    #[test]
+    fn frame_count_match_is_accepted() {
+        let dtvi = dtvi_with_keyframes(40, 120);
+        check_frame_count(
+            &dtvi,
+            Path::new("/cache/work.mp4.dtvi"),
+            "tachikaze analyze",
+        )
+        .expect("一致すれば通ること");
     }
 }

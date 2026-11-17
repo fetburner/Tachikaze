@@ -72,7 +72,7 @@ fn review_without_ffmpeg_fails_with_tool_error() {
     let root = make_tmp_dir("review-e2e-no-ffmpeg");
     let cache = root.join("cache");
     let input = dummy_input(&root);
-    seed_cache(&cache, &input, &common::dtvi_path(), "Trim(0,39)");
+    seed_cache(&cache, &input, &common::logo_dtvi_path(), "Trim(0,598)");
 
     let output = run_review(&cache, &input, Some(""));
     assert_eq!(output.status.code(), Some(1), "exit code 1 のはず");
