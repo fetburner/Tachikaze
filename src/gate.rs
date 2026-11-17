@@ -56,7 +56,7 @@ use crate::trim::TrimList;
 /// 誤差0（確度が高いと書かれた実例）と誤差14（怪しいと書かれた実例）の2点だけで、
 /// 閾値を決めるための分布はまだ見ていない。そのため値を数えるだけに留め、
 /// 「止める」判定には使わない。実運用でこの件数の分布を見てから調整すること。
-const CM_BLOCK_GRID_ERROR_THRESHOLD_FRAMES: i32 = 5;
+pub(crate) const CM_BLOCK_GRID_ERROR_THRESHOLD_FRAMES: i32 = 5;
 
 /// gate の判定結果。全指標の値と、そのうち「止める」判定に使ったものを持つ。
 ///

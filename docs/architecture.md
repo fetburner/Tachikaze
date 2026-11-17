@@ -311,6 +311,20 @@ TOKYO MX の ED 区間（90秒）は、ロゴ自体は出ているのに段差�
 
 `src/report/missed.rs` は `.jls` のラベルを見ず、ギャップ長の一致だけで判定するため、ロゴの有無でロジックは変わらない。実測2本（BS11・TOKYO MX2、[jls-settings.md](jls-settings.md)「ロゴありでの見逃し警告」）ではロゴあり/なしで見逃し候補の件数に変化が無かった（どちらも0件）。ただし検出済み CM ブロック長が揃わない番組でロゴありを試した実測が無いため、一般に誤警告が増えないとは言えない。加えて MX2 は元々このヒューリスティックが発火しない構成だった。`find_missed_candidates` は保持区間内部の `.jls` エントリと長さを突き合わせる実装のため、見逃しブロックが単一の長い `:L` エントリの内側にあると検出対象にならない。「両方0件」という結果は、ロゴの有無というより検出条件自体が MX2 では成立していなかった可能性がある。
 
+### 切りすぎ候補の閾値は未検証
+
+`src/report/overcut.rs` の切りすぎ候補は、閾値を2つとも実測で決めていない。1つは
+カット区間内のロゴ表示の下限（`LOGO_MIN_SEC`、5秒）、もう1つは CM ブロックの15秒格子誤差の
+閾値（gate の `CM_BLOCK_GRID_ERROR_THRESHOLD_FRAMES`、5フレーム）である。どちらも分布を
+見てから調整する。gate の「止める」判定には入れていない。根拠のない閾値で止めると
+`--ignore-gate` の常用を招くため。
+
+先頭と末尾のカット区間（前後の番組）も判定の対象に含めている。前後の番組にロゴが出る録画
+では、本編に問題がなくても印が付きうる。偽陽性は画面の印が増えるだけなので許容している。
+
+ロゴ検出が無い録画では `Logo` の判定をしていない。候補が0件でも「問題なし」ではない。
+呼び出し側は、ロゴ区間が `None` だったかどうかを区別して表示すること。
+
 ### ロゴ検出の階層化方式の収束判定・性能足切りは経験的な閾値である
 
 `detect_logo_scores_hier` の不動点化の収束判定
@@ -363,6 +377,7 @@ TOKYO MX の ED 区間（90秒）は、ロゴ自体は出ているのに段差�
 | `gate.rs` | `analyze` の成果物（`TrimList`/`JlsEntry`/`Dtvi`）だけから検出結果が機械的に疑わしいか判定する（mp4 は読まない） | 上記「analyze」手順4・「auto」 |
 | `report/mod.rs` | `--report` の出力 | [measurements.md](measurements.md) |
 | `report/missed.rs` | 見逃し候補の警告 | [jls-settings.md](jls-settings.md) |
+| `report/overcut.rs` | 切りすぎ候補（カットされる区間にロゴが出ている、または格子から外れた CM と重なる）の判定。mp4 は読まず、ロゴ区間は logoframe テキストのパース結果を受け取る | 下記「切りすぎ候補の閾値は未検証」、[jls-settings.md](jls-settings.md) |
 | `mp4io/read.rs` | サンプル表の読み込み | [mp4-atom.md](mp4-atom.md) |
 | `mp4io/order_map.rs` | 表示順↔デコード順の写像、合成時刻の算出 | [pipeline.md](pipeline.md) |
 | `mp4io/support.rs` | 未対応構成の判定（上記「未対応の入力」を早期に落とす） | 上記「未対応の入力」 |
@@ -377,7 +392,7 @@ TOKYO MX の ED 区間（90秒）は、ロゴ自体は出ているのに段差�
 | `logo/estimate.rs` | `estimate_candidates`: 入力自身からロゴ矩形の候補列を推定する。定常段差のブロック中央値で候補を作り（閾値ラダー・大構造除去・分裂併合）、本編/CM の在/不在 AUC で採点して採用列にする | [cm-detection.md](cm-detection.md)「ロゴ検出」、[measurements.md](measurements.md)「ロゴ矩形の自動推定」 |
 | `logo/score.rs` | ロゴマスク生成と相関スコア（`corr0`/`corr1`）。Amatsukaze `LogoScan.hpp` の相関方式を移植 | [cm-detection.md](cm-detection.md) |
 | `logo/scan.rs` | `make-logo` 本体: 外周1ピクセルが単色のフレームだけを使い、画素ごとに最小二乗で `.lgd` の係数 `a`/`b` を求める。`.lgd` の書き出し（ベース部はゼロ埋め） | 上記「make-logo」 |
-| `logo/interval.rs` | `corr0`/`corr1` の列からロゴ表示区間を判定し logoframe 形式で出力。Amatsukaze `LogoScan.hpp` の `LogoFrame::writeResult` を移植 | [cm-detection.md](cm-detection.md) |
+| `logo/interval.rs` | `corr0`/`corr1` の列からロゴ表示区間を判定し logoframe 形式で出力。`parse_text` で logoframe テキストを半開区間の列に戻す。Amatsukaze `LogoScan.hpp` の `LogoFrame::writeResult` を移植 | [cm-detection.md](cm-detection.md) |
 | `logo/dict.rs` | 学習済み `.lgd` を辞書ディレクトリ（既定 `$XDG_DATA_HOME/tachikaze/logos`、未設定時 `~/.local/share/tachikaze/logos`）に蓄積し、対象映像と解像度が一致する候補をスコア（Amatsukaze `LogoFrame::selectLogo` 相当）で自動選択する | [cm-detection.md](cm-detection.md)、上記「パス解決」 |
 
 **解析側（analyze）は mp4 の読み込みに依存しない。** `--report` が必要とするキーフレーム位置を `.dtvi` から取る設計にしてあるため。**この性質を崩さないこと**（キーフレーム位置を mp4 から取る実装に変えると解析とカットが結合する）。
