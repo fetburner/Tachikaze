@@ -65,6 +65,43 @@ fn review_without_analyze_cache_suggests_analyze_and_exits_1() {
     let _ = fs::remove_dir_all(&root);
 }
 
+/// 既定で走る（ffmpeg 不要）: フレーム表が切れた `.dtvi`（ヘッダ599・行40）では、
+/// 重なりエラーより先に `frame_count` の不一致で止まり、`review/` と一時ディレクトリを残さない。
+/// 検査が snap より後ろに動くと、この `stderr` は「重な」を含んで落ちる。
+#[test]
+fn review_with_truncated_dtvi_reports_frame_count_mismatch_before_overlap() {
+    let root = make_tmp_dir("review-e2e-truncated");
+    let cache = root.join("cache");
+    let input = dummy_input(&root);
+    seed_cache(
+        &cache,
+        &input,
+        &common::dtvi_path(),
+        "Trim(10,109) ++ Trim(370,469)",
+    );
+
+    let output = run_review(&cache, &input, Some(""));
+    assert_eq!(output.status.code(), Some(1), "exit code 1 のはず");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("frame_count"), "{stderr}");
+    assert!(stderr.contains("（599）"), "{stderr}");
+    assert!(stderr.contains("（40）"), "{stderr}");
+    assert!(
+        !stderr.contains("重な"),
+        "重なりエラーより先に出ること: {stderr}"
+    );
+    let review_dir = workdir::cached_review_dir(Some(&cache), &input).expect("review のパス");
+    assert!(!review_dir.exists(), "失敗時に review/ を作らないこと");
+    let leftovers: Vec<_> = fs::read_dir(review_dir.parent().expect("親"))
+        .expect("キャッシュ一覧")
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().starts_with("review.tmp"))
+        .collect();
+    assert!(leftovers.is_empty(), "一時ディレクトリを残さないこと");
+
+    let _ = fs::remove_dir_all(&root);
+}
+
 /// キャッシュは揃っているのに ffmpeg が見つからないとき、ツール解決の失敗として止まる。
 /// `PATH` を空にして条件を自分で作る（ffmpeg の有無に依存しない）。
 #[test]

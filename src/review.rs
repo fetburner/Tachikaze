@@ -606,7 +606,7 @@ mod tests {
         )
         .expect_err("食い違いは止まること");
         let msg = err.to_string();
-        assert!(msg.contains("599") && msg.contains("40"), "{msg}");
+        assert!(msg.contains("（599）") && msg.contains("（40）"), "{msg}");
         assert!(msg.contains("/cache/work.mp4.dtvi"), "{msg}");
         assert!(msg.contains("tachikaze analyze"), "{msg}");
     }
