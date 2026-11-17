@@ -277,7 +277,8 @@ fn auto_ignore_gate_overrides_gate_stop_but_gate_alone_stops_without_it() {
 
     for (label, ignore_gate) in [("without-ignore-gate", false), ("with-ignore-gate", true)] {
         let tmp_dir = make_tmp_dir(&format!("gate-{label}"));
-        let input = tmp_dir.join("IN.mp4");
+        // 空白と `'` を含む名前にして、案内のコマンド例の引用符付けも通す。
+        let input = tmp_dir.join("IN rec's.mp4");
         std::fs::copy(common::fixture_path(), &input).expect("フィクスチャをコピーできること");
 
         let bin_dir = tmp_dir.join("tools").join("bin");
@@ -357,6 +358,36 @@ fn auto_ignore_gate_overrides_gate_stop_but_gate_alone_stops_without_it() {
             assert!(
                 stderr.contains("tachikaze cut"),
                 "直して cut するコマンド例が出ていない: {stderr}"
+            );
+            // review と cut の例は同じ入力（prepare 後のパス）を指す。引用符の中身を
+            // 比べ、どちらか片方だけ元の入力を指す食い違いを検出する。
+            // 引用符つきの入力トークン（`'...'`、中の `'\''` も含む）をそのまま比べる。
+            let review_line = stderr
+                .lines()
+                .find(|l| l.contains("tachikaze review "))
+                .expect("review のコマンド例の行が無い");
+            let review_arg = review_line
+                .split("tachikaze review ")
+                .nth(1)
+                .and_then(|rest| rest.split(" --cache-dir ").next())
+                .map(|s| s.trim_end_matches("\")"))
+                .expect("review の入力を取り出せること");
+            let cut_line = stderr
+                .lines()
+                .find(|l| l.contains("tachikaze cut "))
+                .expect("cut のコマンド例の行が無い");
+            let cut_arg = cut_line
+                .split("tachikaze cut ")
+                .nth(1)
+                .and_then(|rest| rest.split(" --trim ").next())
+                .expect("cut の入力を取り出せること");
+            assert_eq!(
+                review_arg, cut_arg,
+                "review と cut の入力が一致しない: {stderr}"
+            );
+            assert!(
+                stderr.contains("--cache-dir"),
+                "auto が使った --cache-dir を review の例に渡していない: {stderr}"
             );
             assert!(
                 stderr.contains("exit code 3"),

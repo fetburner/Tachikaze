@@ -281,14 +281,14 @@ fn process_one(
     let cut_hint = || {
         let cm_flag = cm_out_path
             .as_ref()
-            .map(|p| format!(" --cm-output {}", p.display()))
+            .map(|p| format!(" --cm-output {}", shell_quote(p)))
             .unwrap_or_default();
         format!(
             "tachikaze cut {} --trim {} --dtvi {} -o {}{cm_flag}",
-            media_path.display(),
-            trim_path.display(),
-            dtvi_path.display(),
-            out_path.display(),
+            shell_quote(&media_path),
+            shell_quote(&trim_path),
+            shell_quote(&dtvi_path),
+            shell_quote(&out_path),
         )
     };
 
@@ -298,6 +298,7 @@ fn process_one(
         );
         eprintln!("  trim: {}", trim_path.display());
         eprintln!("  dtvi: {}", dtvi_path.display());
+        print_review_hint(&media_path, config.cache_dir.as_deref());
         eprintln!("  続きは次のコマンドで cut できます:");
         eprintln!("    {}", cut_hint());
         return Ok(if verdict.stop {
@@ -315,9 +316,8 @@ fn process_one(
         } else {
             eprintln!("[auto] gate が疑わしいと判定したため、cut を実行せず停止します。");
             eprintln!("  trim: {}", trim_path.display());
-            eprintln!(
-                "  内容を確認し、必要なら trim.avs を直してから次のコマンドで cut してください:"
-            );
+            print_review_hint(&media_path, config.cache_dir.as_deref());
+            eprintln!("  trim.avs を直接直す場合は、直してから次のコマンドで cut してください:");
             eprintln!("    {}", cut_hint());
             return Ok(InputStatus::GateStopped);
         }
@@ -524,6 +524,56 @@ fn input_has_subtitle_track(input: &Path) -> bool {
 /// そちらに揃える）。
 fn subs_sidecar_path(out_path: &Path, extension: &str) -> PathBuf {
     out_path.with_extension(extension)
+}
+
+/// パスをシェルの単一引用符で1語にする（中の `'` は `'\''` に置換）。録画ファイル名の
+/// 空白・括弧・引用符を含んでも、案内のコマンド例をそのまま貼れるようにする。
+fn shell_quote(path: &Path) -> String {
+    format!("'{}'", path.display().to_string().replace('\'', r"'\''"))
+}
+
+/// gate 停止・`--analyze-only` の案内に出す `review` のコマンド例（文字列だけを返す）。
+/// 入力は `cut` の例と同じ `prepare` 後のパスにする（元の入力を渡すと elst 除去前の
+/// 位置を見てしまう）。`--cache-dir` は `auto` が使ったものをそのまま渡す。
+fn review_hint(input: &Path, cache_dir: Option<&Path>) -> String {
+    let cache = cache_dir
+        .map(|dir| format!(" --cache-dir {}", shell_quote(dir)))
+        .unwrap_or_default();
+    format!("tachikaze review {}{cache}", shell_quote(input))
+}
+
+/// `review` の案内を標準エラーへ出す。`open` は macOS の例であり、`review` は
+/// 確認画面の `index.html` のパスを標準出力に出すだけである。
+fn print_review_hint(input: &Path, cache_dir: Option<&Path>) {
+    eprintln!(
+        "  ブラウザで確認・修正するには（open は macOS の例。review は index.html のパスを標準出力に出します）:"
+    );
+    eprintln!("    open \"$({})\"", review_hint(input, cache_dir));
+}
+
+#[cfg(test)]
+mod hint_tests {
+    use super::*;
+
+    #[test]
+    fn shell_quote_escapes_single_quote_and_keeps_spaces() {
+        assert_eq!(
+            shell_quote(Path::new("/rec/a b's.mp4")),
+            r"'/rec/a b'\''s.mp4'"
+        );
+    }
+
+    #[test]
+    fn review_hint_uses_input_and_cache_dir_as_given() {
+        assert_eq!(
+            review_hint(Path::new("/rec/IN 1.mp4"), None),
+            "tachikaze review '/rec/IN 1.mp4'"
+        );
+        assert_eq!(
+            review_hint(Path::new("/rec/IN.mp4"), Some(Path::new("/my cache"))),
+            "tachikaze review '/rec/IN.mp4' --cache-dir '/my cache'"
+        );
+    }
 }
 
 /// 完了時に、何がどこに残るか（ディスク使用量）をログへ出す
