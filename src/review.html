@@ -1,0 +1,348 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tachikaze review</title>
+<style>
+/* 動画編集ツールなので暗色1テーマに固定している（意図的）。外部のCSS・フォント・JSは読まない。 */
+:root{
+  color-scheme:dark;
+  --bg:#14181f; --panel:#1c222c; --line:#2d3644;
+  --text:#e3e8ef; --muted:#8c98a8;
+  --keep:#4db2dc; --cut:#b2545c; --warn:#e2a93b; --over:#ef6fa5; --logo:#c9d2de;
+  --sans:"Hiragino Sans","Noto Sans JP",system-ui,sans-serif;
+  --mono:ui-monospace,Menlo,monospace;
+}
+[hidden]{display:none!important}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font-family:var(--sans);font-size:14px;line-height:1.5;
+  padding-block:16px;padding-left:max(16px,env(safe-area-inset-left,0px));padding-right:max(16px,env(safe-area-inset-right,0px))}
+.app{max-width:1180px;margin:0 auto;display:flex;flex-direction:column;gap:12px}
+header{display:flex;flex-wrap:wrap;gap:4px 16px;align-items:baseline}
+h1{font-size:16px;font-weight:600;margin:0;font-family:var(--mono);overflow-wrap:anywhere}
+.sub{color:var(--muted);font-size:13px}
+.note{color:var(--muted);font-size:12px;border:1px dashed var(--line);border-radius:4px;padding:6px 10px}
+.top{display:grid;grid-template-columns:minmax(0,1fr) 300px;gap:12px}
+@media(max-width:760px){.top{grid-template-columns:minmax(0,1fr)}}
+.monitor{position:relative;aspect-ratio:16/9;max-width:100%;border-radius:4px;overflow:hidden;background:#000}
+.monitor video{position:absolute;inset:0;width:100%;height:100%;background:#000}
+.monitor .tc{position:absolute;left:10px;top:8px;font-family:var(--mono);font-size:13px;background:#000a;padding:2px 8px;border-radius:3px;font-variant-numeric:tabular-nums;pointer-events:none}
+.badge{position:absolute;right:10px;top:8px;font-size:12px;font-weight:600;padding:2px 10px;border-radius:99px;color:#0c1016;pointer-events:none}
+.badge.keep{background:var(--keep)} .badge.cut{background:var(--cut);color:#fff}
+.segs{background:var(--panel);border:1px solid var(--line);border-radius:4px;display:flex;flex-direction:column;min-height:0;max-height:420px}
+.segs h2,.export h2{font-size:12px;font-weight:600;color:var(--muted);letter-spacing:.06em;margin:0;padding:8px 12px;border-bottom:1px solid var(--line)}
+.seglist{overflow-y:auto;flex:1}
+.seg{display:grid;grid-template-columns:44px 1fr 1fr 48px;gap:6px;width:100%;padding:6px 12px;background:none;border:0;border-bottom:1px solid var(--line);
+  color:var(--text);font-family:var(--mono);font-size:12px;text-align:left;cursor:pointer;font-variant-numeric:tabular-nums}
+.seg:hover{background:#ffffff0a} .seg.cur{background:#4db2dc22}
+.seg span:not(.k):not(.c){color:var(--muted)}
+.seg span:last-of-type{text-align:right}
+.seg .k,.seg .c{font-family:var(--sans)} .seg .k{color:var(--keep)} .seg .c{color:var(--cut)}
+.seg em{grid-column:1/-1;font-style:normal;font-family:var(--sans);color:var(--over)} .seg em.m{color:var(--warn)}
+.total{padding:8px 12px;font-size:12px;color:var(--muted);font-variant-numeric:tabular-nums}
+.overview{position:relative;cursor:pointer;padding-top:2px}
+.row{position:relative;background:var(--panel);border-radius:2px}
+.row.logo{height:4px;margin-bottom:3px} .row.logo i{background:var(--logo)}
+.row.auto{height:8px;margin-bottom:4px} .row.now{height:26px}
+.row i{position:absolute;top:0;bottom:0}
+.row.auto i{background:var(--muted)} .row.auto i.missed{background:var(--warn)} .row.auto i.over{background:var(--over)}
+.row.now i{background:var(--keep)}
+.row.now{background:repeating-linear-gradient(135deg,#b2545c55 0 6px,#b2545c22 6px 12px)}
+.head{position:absolute;top:0;bottom:0;width:2px;background:#fff;pointer-events:none}
+.legend{display:flex;flex-wrap:wrap;gap:4px 16px;font-size:12px;color:var(--muted);margin-top:6px}
+.legend span::before{content:"";display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:6px;background:var(--c)}
+.strip{position:relative;display:flex;gap:2px;overflow-x:auto;padding:4px 0 8px}
+.th{flex:none;width:88px;padding:0;border:2px solid transparent;border-radius:3px;background:none;color:var(--muted);cursor:pointer;
+  font-family:var(--mono);font-size:10px;font-variant-numeric:tabular-nums}
+.th img{display:block;width:100%;height:48px;object-fit:cover;border-radius:1px;border-bottom:4px solid var(--keep);background:var(--panel)}
+.th.cut img{border-bottom-color:var(--cut)}
+.th.missed{border-top-color:var(--warn)} .th.over{border-top-color:var(--over)}
+.th.cur{border-color:#fff;color:var(--text)}
+.ctl{display:flex;flex-wrap:wrap;gap:6px}
+.ctl button,.export button{background:var(--panel);color:var(--text);border:1px solid var(--line);border-radius:4px;padding:6px 10px;font:inherit;font-size:13px;cursor:pointer}
+.ctl button:hover,.export button:hover{border-color:var(--muted)}
+.ctl .gap{flex:1}
+kbd{font-family:var(--mono);font-size:11px;color:var(--muted);border:1px solid var(--line);border-radius:3px;padding:0 4px;margin-left:4px}
+:focus-visible{outline:2px solid var(--keep);outline-offset:1px}
+.export{background:var(--panel);border:1px solid var(--line);border-radius:4px}
+.export .body{padding:10px 12px;display:flex;flex-direction:column;gap:8px}
+textarea{width:100%;background:var(--bg);color:var(--text);border:1px solid var(--line);border-radius:4px;padding:8px;font-family:var(--mono);font-size:12px;resize:vertical;overflow-wrap:anywhere}
+.export .bar{display:flex;flex-wrap:wrap;gap:8px;align-items:center;color:var(--muted);font-size:12px}
+</style>
+</head>
+<body>
+
+<div class="app">
+  <header>
+    <h1 id="name"></h1>
+    <span class="sub" id="status"></span>
+  </header>
+  <div class="note">残すかカットするかは、キーフレーム間（約4秒）ごとに決めます。カットはキーフレーム境界に丸められます。</div>
+
+  <div class="top">
+    <div class="monitor">
+      <video id="video" controls preload="metadata"></video>
+      <span class="badge" id="badge"></span>
+      <span class="tc" id="tc"></span>
+    </div>
+    <div class="segs">
+      <h2>区間</h2>
+      <div class="seglist" id="seglist"></div>
+      <div class="total" id="total"></div>
+    </div>
+  </div>
+
+  <div>
+    <div class="overview" id="overview">
+      <div class="row logo" id="rowLogo"></div>
+      <div class="row auto" id="rowAuto"></div>
+      <div class="row now" id="rowNow"></div>
+      <div class="head" id="head"></div>
+    </div>
+    <div class="legend">
+      <span id="legLogo" style="--c:var(--logo)">ロゴが表示されている区間</span>
+      <span id="logoNote" hidden>この録画ではロゴを検出できなかったため、ロゴによる切りすぎ候補は出ません</span>
+      <span style="--c:var(--muted)">自動検出が残した区間</span>
+      <span style="--c:var(--over)">切りすぎ候補（カットされるのにロゴが出ている区間など）</span>
+      <span style="--c:var(--warn)">見逃し候補（CM の長さと一致する未カット区間）</span>
+      <span style="--c:var(--keep)">いま残す区間</span>
+      <span style="--c:var(--cut)">いまカットする区間</span>
+    </div>
+  </div>
+
+  <div class="strip" id="strip"></div>
+
+  <div class="ctl">
+    <button type="button" id="bPlay">再生 / 停止<kbd>Space</kbd></button>
+    <button type="button" id="bPrev">前のキーフレーム<kbd>←</kbd></button>
+    <button type="button" id="bNext">次のキーフレーム<kbd>→</kbd></button>
+    <button type="button" id="bPrevB">前の境界<kbd>Shift ←</kbd></button>
+    <button type="button" id="bNextB">次の境界<kbd>Shift →</kbd></button>
+    <button type="button" id="bFlag">次の要確認箇所<kbd>N</kbd></button>
+    <span class="gap"></span>
+    <button type="button" id="bIn">ここから残す<kbd>I</kbd></button>
+    <button type="button" id="bOut">ここまで残す<kbd>O</kbd></button>
+    <button type="button" id="bTog">現在のキーフレーム間を切り替え<kbd>T</kbd></button>
+    <button type="button" id="bDel">区間を削除<kbd>Backspace</kbd></button>
+    <button type="button" id="bUndo">元に戻す<kbd>⌘Z</kbd></button>
+    <button type="button" id="bReset">自動検出に戻す</button>
+  </div>
+
+  <div class="export">
+    <h2>書き出し</h2>
+    <div class="body">
+      <textarea id="cmd" rows="3" readonly aria-label="カットを実行するコマンド"></textarea>
+      <div class="bar"><button type="button" id="bCopy">コマンドをコピー<kbd>E</kbd></button><span id="copied">ターミナルに貼り付けて実行すると、この区間でカットされます。</span></div>
+    </div>
+  </div>
+</div>
+
+<script>const DATA = __REVIEW_DATA__;</script>
+<script>
+const $ = id => document.getElementById(id);
+const video = $('video');
+const K = DATA.keyframes;
+const N = K.length;
+const TOTAL = DATA.total_frames;
+const FRAMES = K.map(k => k.frame);
+const TIMES = K.map(k => k.time);
+const REASON = { logo: 'ロゴが出ています。本編かもしれません', grid: '長さが15秒単位からずれています' };
+const MISSED_TEXT = 'CM の長さと一致する部分があります';
+
+// 表示順フレーム番号からキーフレーム添字へ（二分探索）。frames は昇順。
+const firstGreater = (arr, x) => { let lo = 0, hi = arr.length; while (lo < hi) { const m = (lo + hi) >> 1; if (arr[m] <= x) lo = m + 1; else hi = m; } return lo; };
+const firstAtLeast = (arr, x) => { let lo = 0, hi = arr.length; while (lo < hi) { const m = (lo + hi) >> 1; if (arr[m] < x) lo = m + 1; else hi = m; } return lo; };
+const floorIdx = (arr, x) => Math.max(0, firstGreater(arr, x) - 1);
+
+const frameAt = i => i < N ? FRAMES[i] : TOTAL;
+const timeAt = i => { if (i < N) return TIMES[i]; const d = video.duration; return isFinite(d) ? d : TIMES[N - 1]; };
+const fmt = sec => {
+  const t = Math.max(0, Math.floor(sec)), p = n => String(n).padStart(2, '0');
+  const h = Math.floor(t / 3600), m = Math.floor(t % 3600 / 60), s = t % 60;
+  return h ? `${h}:${p(m)}:${p(s)}` : `${p(m)}:${p(s)}`;
+};
+const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; e.textContent = text; return e; };
+// シェルの単一引用符で囲む。パス中の ' は '\'' に置換する。
+const q = s => "'" + String(s).replace(/'/g, "'\\''") + "'";
+
+// 初期状態: DATA.keep をキーフレーム添字の区間にする
+const fresh = () => {
+  const k = new Uint8Array(N);
+  DATA.keep.forEach(([s, e]) => k.fill(1, firstAtLeast(FRAMES, s), firstAtLeast(FRAMES, e)));
+  return k;
+};
+let keep = fresh(), cur = 0, history = [];
+
+// 見逃し候補・切りすぎ候補を添字の区間 [a, b) に直す。キーフレーム境界に揃っていなくてもよい。
+const idxRange = (s, e) => {
+  const a = floorIdx(FRAMES, s);
+  return [a, Math.min(N, Math.max(a + 1, firstAtLeast(FRAMES, e)))];
+};
+const cands = [
+  ...DATA.missed.map(([s, e]) => ({ kind: 'missed', s, e, reasons: [], range: idxRange(s, e) })),
+  ...DATA.over.map(o => ({ kind: 'over', s: o.range[0], e: o.range[1], reasons: o.reasons, range: idxRange(o.range[0], o.range[1]) })),
+].map(c => ({ ...c, a: c.range[0], b: c.range[1] }));
+// 見逃しは残ったまま、切りすぎはカットのまま、が未修正。
+const isOpen = c => {
+  const part = keep.slice(c.a, c.b);
+  return c.kind === 'missed' ? part.some(x => x === 1) : part.some(x => x === 0);
+};
+const openCands = () => cands.filter(isOpen);
+
+const blocks = () => {
+  const r = [];
+  for (let i = 0; i < N;) { let e = i; while (e < N && keep[e] === keep[i]) e++; r.push([i, e, keep[i]]); i = e; }
+  return r;
+};
+const edit = fn => { history.push(keep.slice()); fn(); render(); };
+const runStart = i => { while (i > 0 && keep[i - 1]) i--; return i; };
+const runEnd = i => { while (i < N && keep[i]) i++; return i; };
+
+// ---- 静的な部品 ----
+const name = DATA.input.split(/[\\/]/).pop();
+document.title = name;
+$('name').textContent = name;
+video.src = DATA.video;
+
+const bar = (parent, s, e, cls) => {
+  const x = document.createElement('i');
+  x.style.left = s / TOTAL * 100 + '%';
+  x.style.width = (e - s) / TOTAL * 100 + '%';
+  if (cls) x.className = cls;
+  parent.append(x);
+};
+const hasLogo = DATA.logo != null;
+if (hasLogo) DATA.logo.forEach(([s, e]) => bar($('rowLogo'), s, e));
+else { $('rowLogo').hidden = true; $('legLogo').hidden = true; $('logoNote').hidden = false; }
+
+const strip = $('strip');
+const thumbs = K.map((k, i) => {
+  const b = document.createElement('button');
+  b.type = 'button'; b.className = 'th';
+  const img = document.createElement('img');
+  img.src = k.thumb; img.loading = 'lazy'; img.alt = '';
+  b.append(img, el('span', '', fmt(k.time)));
+  b.onclick = () => seek(i);
+  return b;
+});
+strip.append(...thumbs);
+
+// ---- 描画 ----
+function render() {
+  const blks = blocks();
+  const open = openCands();
+
+  const auto = $('rowAuto');
+  auto.replaceChildren();
+  DATA.keep.forEach(([s, e]) => bar(auto, s, e));
+  open.forEach(c => bar(auto, c.s, c.e, c.kind));
+
+  const now = $('rowNow');
+  now.replaceChildren();
+  blks.forEach(([a, b, k]) => { if (k) bar(now, frameAt(a), frameAt(b)); });
+
+  const mark = new Array(N).fill('');
+  open.forEach(c => { for (let i = c.a; i < c.b; i++) mark[i] = mark[i] || c.kind; });
+  thumbs.forEach((b, i) => {
+    b.className = 'th' + (keep[i] ? '' : ' cut') + (mark[i] ? ' ' + mark[i] : '') + (i === cur ? ' cur' : '');
+  });
+
+  $('seglist').replaceChildren(...blks.map(([a, b, k]) => {
+    const row = document.createElement('button');
+    row.type = 'button';
+    row.className = 'seg' + (cur >= a && cur < b ? ' cur' : '');
+    const start = timeAt(a), end = timeAt(b);
+    row.append(el('span', k ? 'k' : 'c', k ? '残す' : 'カット'), el('span', '', fmt(start)), el('span', '', fmt(end)), el('span', '', fmt(end - start)));
+    const msgs = open
+      .filter(c => c.kind === (k ? 'missed' : 'over') && c.a < b && a < c.b)
+      .map(c => k ? [MISSED_TEXT] : c.reasons.map(r => REASON[r] || r))
+      .flat();
+    if (msgs.length) row.append(el('em', k ? 'm' : '', '要確認: ' + msgs.join(' ／ ')));
+    row.onclick = () => seek(a);
+    return row;
+  }));
+
+  const kept = blks.filter(b => b[2]).reduce((s, [a, b]) => s + timeAt(b) - timeAt(a), 0);
+  const all = timeAt(N);
+  $('total').textContent = `残す ${fmt(kept)}　カット ${fmt(all - kept)}　全体 ${fmt(all)}`;
+  const nMissed = open.filter(c => c.kind === 'missed').length, nOver = open.filter(c => c.kind === 'over').length;
+  $('status').textContent = `要確認の残り: 切りすぎ候補 ${nOver} 件・見逃し候補 ${nMissed} 件`;
+  $('cmd').value = command();
+  renderHead();
+}
+function renderHead() {
+  $('head').style.left = frameAt(cur) / TOTAL * 100 + '%';
+  $('tc').textContent = `${fmt(TIMES[cur])}  フレーム ${FRAMES[cur]}`;
+  const b = $('badge');
+  b.textContent = keep[cur] ? '残す' : 'カット';
+  b.className = 'badge ' + (keep[cur] ? 'keep' : 'cut');
+  const t = thumbs[cur];
+  strip.scrollLeft = t.offsetLeft - strip.clientWidth / 2 + t.offsetWidth / 2;
+}
+// 残す区間をシェルのコマンドにする。Trim は両端を含むので、次の区間の先頭 frame の 1 つ手前で終える。
+function command() {
+  const segs = blocks().filter(b => b[2]);
+  if (!segs.length) return '残す区間がありません。';
+  const trims = segs.map(([a, b]) => `Trim(${frameAt(a)},${frameAt(b) - 1})`).join(' ++ ');
+  const cache = DATA.cache_dir == null ? '' : ` --cache-dir ${q(DATA.cache_dir)}`;
+  return `tachikaze cut ${q(DATA.input)}${cache} --trim - -o ${q(DATA.output)} <<< ${q(trims)}`;
+}
+
+// ---- 操作 ----
+function select(i) { cur = Math.max(0, Math.min(N - 1, i)); render(); }
+function seek(i) { select(i); video.currentTime = TIMES[cur]; }
+// 再生中は現在位置に合わせて選択を追従させる（seek 直後の 1 回ずれを避けるため、位置が変わったときだけ描画する）
+video.addEventListener('timeupdate', () => {
+  const i = floorIdx(TIMES, video.currentTime);
+  if (i !== cur) select(i);
+});
+video.addEventListener('durationchange', render);
+
+const ops = {
+  play() { if (video.paused) video.play().catch(() => {}); else video.pause(); },
+  prev: () => seek(cur - 1), next: () => seek(cur + 1),
+  boundary(d) { let i = cur + d; while (i > 0 && i < N && keep[i] === keep[i - 1]) i += d; seek(i); },
+  // I: 再生位置を区間の開始にする。区間の中なら手前を削り、カット中なら次の区間をここまで伸ばす
+  setIn: () => edit(() => { if (keep[cur]) keep.fill(0, runStart(cur), cur); else { let n = cur; while (n < N && !keep[n]) n++; keep.fill(1, cur, n); } }),
+  // O: 再生位置を区間の終了にする（再生位置のキーフレーム自体は含まない）
+  setOut: () => edit(() => {
+    if (keep[cur]) { if (cur > 0 && keep[cur - 1]) keep.fill(0, cur, runEnd(cur)); }
+    else { let p = cur; while (p > 0 && !keep[p - 1]) p--; keep.fill(1, p, cur); }
+  }),
+  toggle: () => { edit(() => { keep[cur] ^= 1; }); seek(cur + 1); },
+  del: () => edit(() => { if (keep[cur]) keep.fill(0, runStart(cur), runEnd(cur)); }),
+  flag() {
+    const f = openCands().map(c => c.a).sort((x, y) => x - y);
+    if (f.length) seek(f.find(s => s > cur) ?? f[0]);
+  },
+  undo() { if (history.length) { keep = history.pop(); render(); } },
+  reset: () => edit(() => { keep = fresh(); }),
+  async copy() {
+    const ta = $('cmd'); ta.select();
+    try { await navigator.clipboard.writeText(ta.value); $('copied').textContent = 'コピーしました。ターミナルに貼り付けて実行してください。'; }
+    catch { $('copied').textContent = 'コマンドを選択しました。⌘C でコピーしてください。'; }
+  },
+};
+const bind = { bPlay: ops.play, bPrev: ops.prev, bNext: ops.next, bPrevB: () => ops.boundary(-1), bNextB: () => ops.boundary(1),
+  bFlag: ops.flag, bIn: ops.setIn, bOut: ops.setOut, bTog: ops.toggle, bDel: ops.del, bUndo: ops.undo, bReset: ops.reset, bCopy: ops.copy };
+for (const id in bind) $(id).onclick = bind[id];
+$('overview').onclick = e => {
+  const r = $('overview').getBoundingClientRect();
+  seek(floorIdx(FRAMES, (e.clientX - r.left) / r.width * TOTAL));
+};
+document.addEventListener('keydown', e => {
+  if (e.target.tagName === 'TEXTAREA') return;
+  const k = e.key.toLowerCase();
+  const f = (e.metaKey || e.ctrlKey) ? (k === 'z' ? ops.undo : null)
+    : k === ' ' ? ops.play
+    : k === 'arrowleft' ? (e.shiftKey ? () => ops.boundary(-1) : ops.prev)
+    : k === 'arrowright' ? (e.shiftKey ? () => ops.boundary(1) : ops.next)
+    : { n: ops.flag, i: ops.setIn, o: ops.setOut, t: ops.toggle, backspace: ops.del, e: ops.copy }[k];
+  if (f) { e.preventDefault(); f(); }
+});
+
+render();
+</script>
+</body>
+</html>
