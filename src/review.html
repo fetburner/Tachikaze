@@ -5,71 +5,66 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Tachikaze review</title>
 <style>
-/* 動画編集ツールなので暗色1テーマに固定している（意図的）。外部のCSS・フォント・JSは読まない。 */
+/* 動画編集ソフトに倣った中立グレーの暗色1テーマに固定している（映像の色を背景の色味で歪めないため）。
+   外部のCSS・フォント・JSは読まない。 */
 :root{
   color-scheme:dark;
-  --bg:#14181f; --panel:#1c222c; --line:#2d3644;
-  --text:#e3e8ef; --muted:#8c98a8;
-  --keep:#4db2dc; --cut:#b2545c; --warn:#e2a93b; --over:#ef6fa5; --logo:#c9d2de;
-  --sans:"Hiragino Sans","Noto Sans JP",system-ui,sans-serif;
-  --mono:ui-monospace,Menlo,monospace;
+  --bg:#1e1e1e; --panel:#262626; --raised:#333; --line:#3a3a3a;
+  --text:#dcdcdc; --muted:#9a9a9a;
+  --keep:#5f9f4f; --keep-text:#82c46f; --cut:#454545; --warn:#d9b13b; --over:#d2524b; --logo:#b8b8b8;
 }
 [hidden]{display:none!important}
 *{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--text);font-family:var(--sans);font-size:14px;line-height:1.5;
-  padding-block:16px;padding-left:max(16px,env(safe-area-inset-left,0px));padding-right:max(16px,env(safe-area-inset-right,0px))}
-.app{max-width:1180px;margin:0 auto;display:flex;flex-direction:column;gap:12px}
-header{display:flex;flex-wrap:wrap;gap:4px 16px;align-items:baseline}
-h1{font-size:16px;font-weight:600;margin:0;font-family:var(--mono);overflow-wrap:anywhere}
-.sub{color:var(--muted);font-size:13px}
-.note{color:var(--muted);font-size:12px;border:1px dashed var(--line);border-radius:4px;padding:6px 10px}
-.top{display:grid;grid-template-columns:minmax(0,1fr) 300px;gap:12px}
+body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,"Hiragino Sans",sans-serif;font-size:13px;line-height:1.5;
+  font-variant-numeric:tabular-nums;
+  padding-block:12px;padding-left:max(16px,env(safe-area-inset-left,0px));padding-right:max(16px,env(safe-area-inset-right,0px))}
+.app{max-width:1180px;margin:0 auto;display:flex;flex-direction:column;gap:10px}
+header{display:flex;flex-wrap:wrap;gap:2px 16px;align-items:baseline}
+h1{font-size:15px;font-weight:600;margin:0;overflow-wrap:anywhere}
+.sub{color:var(--warn)}
+.note{color:var(--muted);margin:0}
+.top{display:grid;grid-template-columns:minmax(0,1fr) 300px;gap:10px}
 @media(max-width:760px){.top{grid-template-columns:minmax(0,1fr)}}
-.monitor{position:relative;aspect-ratio:16/9;max-width:100%;border-radius:4px;overflow:hidden;background:#000}
-.monitor video{position:absolute;inset:0;width:100%;height:100%;background:#000}
-.monitor .tc{position:absolute;left:10px;top:8px;font-family:var(--mono);font-size:13px;background:#000a;padding:2px 8px;border-radius:3px;font-variant-numeric:tabular-nums;pointer-events:none}
-.badge{position:absolute;right:10px;top:8px;font-size:12px;font-weight:600;padding:2px 10px;border-radius:99px;color:#0c1016;pointer-events:none}
-.badge.keep{background:var(--keep)} .badge.cut{background:var(--cut);color:#fff}
-.segs{background:var(--panel);border:1px solid var(--line);border-radius:4px;display:flex;flex-direction:column;min-height:0;max-height:420px}
-.segs h2,.export h2{font-size:12px;font-weight:600;color:var(--muted);letter-spacing:.06em;margin:0;padding:8px 12px;border-bottom:1px solid var(--line)}
+.monitor video{display:block;width:100%;aspect-ratio:16/9;background:#000}
+.info{display:flex;justify-content:space-between;gap:8px;padding:4px 2px;color:var(--muted)}
+.info #tc{color:var(--text)}
+.badge.keep{color:var(--keep-text)} .badge.cut{color:var(--muted)}
+.segs,.export{background:var(--panel);border:1px solid var(--line);border-radius:2px}
+.segs{display:flex;flex-direction:column;min-height:0;max-height:420px}
+h2{font-size:13px;font-weight:600;margin:0;padding:6px 10px;border-bottom:1px solid var(--line)}
 .seglist{overflow-y:auto;flex:1}
-.seg{display:grid;grid-template-columns:44px 1fr 1fr 48px;gap:6px;width:100%;padding:6px 12px;background:none;border:0;border-bottom:1px solid var(--line);
-  color:var(--text);font-family:var(--mono);font-size:12px;text-align:left;cursor:pointer;font-variant-numeric:tabular-nums}
-.seg:hover{background:#ffffff0a} .seg.cur{background:#4db2dc22}
-.seg span:not(.k):not(.c){color:var(--muted)}
+.seg{display:grid;grid-template-columns:44px 1fr 1fr 48px;gap:6px;width:100%;padding:5px 10px;background:none;border:0;border-bottom:1px solid var(--line);
+  color:var(--muted);font:inherit;text-align:left;cursor:pointer}
+.seg:hover{background:var(--raised)} .seg.cur{background:var(--raised);color:var(--text)}
 .seg span:last-of-type{text-align:right}
-.seg .k,.seg .c{font-family:var(--sans)} .seg .k{color:var(--keep)} .seg .c{color:var(--cut)}
-.seg em{grid-column:1/-1;font-style:normal;font-family:var(--sans);color:var(--over)} .seg em.m{color:var(--warn)}
-.total{padding:8px 12px;font-size:12px;color:var(--muted);font-variant-numeric:tabular-nums}
-.overview{position:relative;cursor:pointer;padding-top:2px}
-.row{position:relative;background:var(--panel);border-radius:2px}
-.row.logo{height:4px;margin-bottom:3px} .row.logo i{background:var(--logo)}
-.row.auto{height:8px;margin-bottom:4px} .row.now{height:26px}
+.seg .k{color:var(--keep-text)} .seg .c{color:var(--muted)}
+.seg em{grid-column:1/-1;font-style:normal;color:var(--over)} .seg em.m{color:var(--warn)}
+.total{padding:6px 10px;color:var(--muted)}
+.overview{position:relative;cursor:pointer}
+.row{position:relative;background:var(--panel)}
+.row.logo{height:4px;margin-bottom:2px} .row.logo i{background:var(--logo)}
+.row.auto{height:6px;margin-bottom:2px} .row.now{height:24px;background:var(--cut)}
 .row i{position:absolute;top:0;bottom:0}
-.row.auto i{background:var(--muted)} .row.auto i.missed{background:var(--warn)} .row.auto i.over{background:var(--over)}
+.row.auto i{background:#6a6a6a} .row.auto i.missed{background:var(--warn)} .row.auto i.over{background:var(--over)}
 .row.now i{background:var(--keep)}
-.row.now{background:repeating-linear-gradient(135deg,#b2545c55 0 6px,#b2545c22 6px 12px)}
 .head{position:absolute;top:0;bottom:0;width:2px;background:#fff;pointer-events:none}
-.legend{display:flex;flex-wrap:wrap;gap:4px 16px;font-size:12px;color:var(--muted);margin-top:6px}
-.legend span::before{content:"";display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:6px;background:var(--c)}
-#logoNote::before{display:none}
-.strip{position:relative;display:flex;gap:2px;overflow-x:auto;padding:4px 0 8px}
-.th{flex:none;width:88px;padding:0;border:2px solid transparent;border-radius:3px;background:none;color:var(--muted);cursor:pointer;
-  font-family:var(--mono);font-size:10px;font-variant-numeric:tabular-nums}
-.th img{display:block;width:100%;height:48px;object-fit:cover;border-radius:1px;border-bottom:4px solid var(--keep);background:var(--panel)}
-.th.cut img{border-bottom-color:var(--cut)}
+.legend{display:flex;flex-wrap:wrap;gap:2px 16px;color:var(--muted);font-size:12px;margin-top:6px}
+.legend span[style]::before{content:"";display:inline-block;width:9px;height:9px;margin-right:5px;background:var(--c)}
+.strip{display:flex;gap:2px;overflow-x:auto;padding-bottom:6px}
+.th{flex:none;width:88px;padding:0;border:0;border-top:3px solid transparent;outline-offset:-2px;background:none;color:var(--muted);cursor:pointer;font:inherit;font-size:11px}
+.th img{display:block;width:100%;height:50px;object-fit:cover;border-bottom:3px solid var(--keep);background:var(--panel)}
+.th.cut img{opacity:.35;border-bottom-color:var(--cut)}
 .th.missed{border-top-color:var(--warn)} .th.over{border-top-color:var(--over)}
-.th.cur{border-color:#fff;color:var(--text)}
-.ctl{display:flex;flex-wrap:wrap;gap:6px}
-.ctl button,.export button{background:var(--panel);color:var(--text);border:1px solid var(--line);border-radius:4px;padding:6px 10px;font:inherit;font-size:13px;cursor:pointer}
-.ctl button:hover,.export button:hover{border-color:var(--muted)}
-.ctl .gap{flex:1}
-kbd{font-family:var(--mono);font-size:11px;color:var(--muted);border:1px solid var(--line);border-radius:3px;padding:0 4px;margin-left:4px}
-:focus-visible{outline:2px solid var(--keep);outline-offset:1px}
-.export{background:var(--panel);border:1px solid var(--line);border-radius:4px}
-.export .body{padding:10px 12px;display:flex;flex-direction:column;gap:8px}
-textarea{width:100%;background:var(--bg);color:var(--text);border:1px solid var(--line);border-radius:4px;padding:8px;font-family:var(--mono);font-size:12px;resize:vertical;overflow-wrap:anywhere}
-.export .bar{display:flex;flex-wrap:wrap;gap:8px;align-items:center;color:var(--muted);font-size:12px}
+.th.cur{outline:2px solid #fff;color:var(--text)}
+.ctl{display:flex;flex-wrap:wrap;gap:4px}
+button{font:inherit}
+.ctl button,.export button{background:var(--raised);color:var(--text);border:1px solid var(--line);border-radius:2px;padding:4px 8px;cursor:pointer}
+.ctl button:hover,.export button:hover{background:#3d3d3d}
+.ctl .gap{width:8px}
+:focus-visible{outline:2px solid #aaa;outline-offset:1px}
+.export .body{padding:8px 10px;display:flex;flex-direction:column;gap:6px}
+textarea{width:100%;background:var(--bg);color:var(--text);border:1px solid var(--line);border-radius:2px;padding:6px 8px;font-family:ui-monospace,Menlo,monospace;font-size:12px;resize:vertical;overflow-wrap:anywhere}
+.export .bar{display:flex;flex-wrap:wrap;gap:8px;align-items:center;color:var(--muted)}
 </style>
 </head>
 <body>
@@ -79,13 +74,12 @@ textarea{width:100%;background:var(--bg);color:var(--text);border:1px solid var(
     <h1 id="name"></h1>
     <span class="sub" id="status"></span>
   </header>
-  <div class="note">残すかカットするかは、キーフレーム間（約4秒）ごとに決めます。カットはキーフレーム境界に丸められます。</div>
+  <p class="note">残すかカットするかは、キーフレーム間（約4秒）ごとに決めます。カットはキーフレーム境界に丸められます。</p>
 
   <div class="top">
     <div class="monitor">
       <video id="video" controls preload="metadata"></video>
-      <span class="badge" id="badge"></span>
-      <span class="tc" id="tc"></span>
+      <div class="info"><span id="tc"></span><span class="badge" id="badge"></span></div>
     </div>
     <div class="segs">
       <h2>区間</h2>
@@ -104,7 +98,7 @@ textarea{width:100%;background:var(--bg);color:var(--text);border:1px solid var(
     <div class="legend">
       <span id="legLogo" style="--c:var(--logo)">ロゴが表示されている区間</span>
       <span id="logoNote" hidden>この録画ではロゴを検出できなかったため、ロゴによる切りすぎ候補は出ません</span>
-      <span style="--c:var(--muted)">自動検出が残した区間</span>
+      <span style="--c:#6a6a6a">自動検出が残した区間</span>
       <span style="--c:var(--over)">切りすぎ候補（カットされるのにロゴが出ている区間など）</span>
       <span style="--c:var(--warn)">見逃し候補（CM の長さと一致する未カット区間）</span>
       <span style="--c:var(--keep)">いま残す区間</span>
@@ -115,18 +109,18 @@ textarea{width:100%;background:var(--bg);color:var(--text);border:1px solid var(
   <div class="strip" id="strip"></div>
 
   <div class="ctl">
-    <button type="button" id="bPlay">再生 / 停止<kbd>Space</kbd></button>
-    <button type="button" id="bPrev">前のキーフレーム<kbd>←</kbd></button>
-    <button type="button" id="bNext">次のキーフレーム<kbd>→</kbd></button>
-    <button type="button" id="bPrevB">前の境界<kbd>Shift ←</kbd></button>
-    <button type="button" id="bNextB">次の境界<kbd>Shift →</kbd></button>
-    <button type="button" id="bFlag">次の要確認箇所<kbd>N</kbd></button>
+    <button type="button" id="bPlay" title="Space">再生/停止</button>
+    <button type="button" id="bPrev" title="←">前のキーフレーム</button>
+    <button type="button" id="bNext" title="→">次のキーフレーム</button>
+    <button type="button" id="bPrevB" title="Shift ←">前の境界</button>
+    <button type="button" id="bNextB" title="Shift →">次の境界</button>
+    <button type="button" id="bFlag" title="N">次の要確認</button>
     <span class="gap"></span>
-    <button type="button" id="bIn">ここから残す<kbd>I</kbd></button>
-    <button type="button" id="bOut">ここまで残す<kbd>O</kbd></button>
-    <button type="button" id="bTog">現在のキーフレーム間を切り替え<kbd>T</kbd></button>
-    <button type="button" id="bDel">区間を削除<kbd>Backspace</kbd></button>
-    <button type="button" id="bUndo">元に戻す<kbd>⌘Z</kbd></button>
+    <button type="button" id="bIn" title="I">ここから残す</button>
+    <button type="button" id="bOut" title="O">ここまで残す</button>
+    <button type="button" id="bTog" title="T">切り替えて次へ</button>
+    <button type="button" id="bDel" title="Backspace">区間を削除</button>
+    <button type="button" id="bUndo" title="⌘Z / Ctrl+Z">元に戻す</button>
     <button type="button" id="bReset">自動検出に戻す</button>
   </div>
 
@@ -134,7 +128,7 @@ textarea{width:100%;background:var(--bg);color:var(--text);border:1px solid var(
     <h2>書き出し</h2>
     <div class="body">
       <textarea id="cmd" rows="3" readonly aria-label="カットを実行するコマンド"></textarea>
-      <div class="bar"><button type="button" id="bCopy">コマンドをコピー<kbd>E</kbd></button><span id="copied">ターミナルに貼り付けて実行すると、この区間でカットされます。</span></div>
+      <div class="bar"><button type="button" id="bCopy" title="E">コマンドをコピー</button><span id="copied">ターミナルに貼り付けて実行すると、この区間でカットされます。</span></div>
     </div>
   </div>
 </div>
