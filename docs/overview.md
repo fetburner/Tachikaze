@@ -29,7 +29,7 @@ mp4 に変換済みの録画ファイルを、再エンコードせずに CM カ
 | CM 検出の仕組みを理解する（背景知識） | [cm-detection.md](cm-detection.md) |
 | カット処理を実装する / バグを直す | [lossless-cut.md](lossless-cut.md) |
 | mp4 の読み書きコードを書く | [mp4-atom.md](mp4-atom.md) |
-| 実測値（GOP 長・カット精度・検出品質）を見る | [measurements.md](measurements.md) |
+| 実測値（GOP 長・カット精度・検出品質・確認画面の時刻）を見る | [measurements.md](measurements.md) |
 | モジュール構成・自己検証・未解決事項を知る | [architecture.md](architecture.md)（後半が開発者向け） |
 
 ## スコープ

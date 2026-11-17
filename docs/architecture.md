@@ -150,18 +150,16 @@ tachikaze make-logo IN.mp4 --rect x,y,w,h -o OUT.lgd [--threshold N]
 tachikaze review IN.mp4 [-o OUT.mp4] [--cache-dir DIR]
 ```
 
-`analyze` のキャッシュ（`trim.avs` / `work.mp4.dtvi` / `detail.jls`、任意で `logoframe.txt`）を読み、確認画面を作る（`src/review.rs`）。mp4 は読まない。フレームの情報はすべて `.dtvi` から取る。必須の入力が無ければ、`analyze` の実行例を添えて exit code 1 で止まる。`analyze` は走らせない。
+`analyze` のキャッシュ（`trim.avs` / `work.mp4.dtvi` / `detail.jls`、任意で `logoframe.txt`）から確認画面を作る。必須の入力が無ければ、`analyze` の実行例を添えて exit code 1 で止まる。`analyze` は走らせない。
 
-- 出力はキャッシュ内の `review/index.html` と `review/thumbs/00001.jpg` 以降（キーフレーム順、1始まり5桁、幅160px）。書き出しは一時ディレクトリに行い、検査を通ってから `review/` へ置き換える。古い `review/` は残さない
+- 出力はキャッシュ内の `review/index.html` と `review/thumbs/00001.jpg` 以降（キーフレーム順、1始まり5桁、幅160px）。作成と検査が失敗したときは前回の `review/` を残す。置き換えは古い `review/` を消してから移すため、この最後の段階が失敗すると `review/` が残らないことがある
 - 確認画面に出る `cut` コマンドの `-o` は、`-o OUT.mp4` を指定すれば OUT.mp4 の絶対パスになり、省略すれば入力と同じディレクトリの `<stem>_CMcut.mp4` になる。`prepare` 後の入力を渡すと既定ではキャッシュ内の `input_prepared_CMcut.mp4` になるため、録画の隣に出したいときは `-o` を指定する
 - 標準出力は `index.html` の絶対パス1行だけ。診断は標準エラーに出す。ブラウザは自動で開かない
-- 確認画面に出る `cut` のコマンドは `Trim(...)` 形式だけを使い、`cut IN.mp4 --trim -` に標準入力で渡す。`--cache-dir` を指定していれば、それも付く。`cut` 側には手を入れていない
+- 確認画面に出る `cut` コマンドは `Trim(...)` 形式だけを使い、`cut IN.mp4 --trim -` に標準入力で渡す形になる。`--cache-dir` を指定していれば、それも付く
 - 区間はすべて表示順フレーム番号の半開区間 `[start, end)`。`keep` は `trim.avs` を outward にスナップした結果。`missed` は見逃し候補をスナップせずに半開区間へ直したもの。`over` は切りすぎ候補で、理由は `logo` か `grid`
-- サムネイルとフレームの対応は「何枚目か」だけで決まるため、枚数が `.dtvi` のキーパケット数と一致しなければ停止する（下記「自己検証」13）
-- **実測**（TOKYO MX の実録画、54019フレーム、キーフレーム451個、`prepare` 後の入力）: `keyframes` の `time` を ffprobe で得た各キーフレームの `pts_time` と比べた。全451個で一致した（最大誤差 3e-7 秒）。elst 付きの元ファイルでも、ffprobe の elst 適用後の時刻と一致した
-- **実測**（同じ録画）: 9か所のサムネイルのそれぞれについて、その `time` にシークした ffmpeg のフレームと比べた PSNR は 31〜37dB だった。次のキーフレームの時刻のフレームと比べた PSNR 以上で、同程度になったのは静止画面が続く末尾付近だけだった
-- **実測**（同じ録画）: 確認画面の初期状態から作られる `Trim(...)` を `cut --trim -` に渡した出力は、`cut --trim trim.avs` の出力とバイト単位で一致した。この確認では確認画面の JS を動かさず、同じ規則を手元で再現して作ったコマンドを使った
-- 目視（同じ録画、macOS で `open` したブラウザ）: サムネイルと動画が表示され、サムネイルをクリックすると動画がその位置に飛ぶことを確かめた。何フレームずれるかまでは測っていない
+- サムネイルの枚数が揃わなければ停止する（下記「自己検証」13）
+
+実測は [measurements.md](measurements.md)「確認画面（review）のサムネイルと時刻」。
 
 ### exit code
 
@@ -400,7 +398,7 @@ TOKYO MX の ED 区間（90秒）は、ロゴ自体は出ているのに段差�
 | `audio.rs` | 音声パケットの選択（区間のソース時刻から引き当て） | [lossless-cut.md](lossless-cut.md) |
 | `verify.rs` | 自己検証 | 下記「自己検証」 |
 | `segmap.rs` | `cut` が書く区間マップ（snap 後の境界と出力タイムライン上の開始時刻）の構造体、JSON への書き出しと読み込み | 上記「cut」手順8 |
-| `review.rs` | `review` 本体: キャッシュから確認画面（`index.html` とサムネイル）を作る。データの組み立て（純粋関数）と ffmpeg・ファイル書き出しを分ける。確認画面のテンプレートは `src/review.html` | 上記「review」 |
+| `review.rs` | `review` 本体: キャッシュから確認画面（`index.html` とサムネイル）を作る。データの組み立て（純粋関数）と ffmpeg・ファイル書き出しを分ける。mp4 は読まず、フレームの情報はすべて `.dtvi` から取る。確認画面のテンプレートは `src/review.html` | 上記「review」 |
 | `subtitle.rs` | `remap-subs` 本体: ASS/SRT の Start/End を区間マップの区分的な線形写像で張り替える（シフト/破棄/クリップの分類、丸め方向） | 上記「remap-subs」 |
 | `logo/lgd.rs` | Amatsukaze 形式ロゴデータ `.lgd`（AviUtl 互換のベース部 + Amatsukaze 独自の float 部）の読み込み | [cm-detection.md](cm-detection.md) |
 | `logo/frames.rs` | ffmpeg を子プロセスとして起動し、ロゴ矩形の輝度平面をフレーム順にストリームで読む（`stream_luma_frames`、読み取ったフレーム数と `.dtvi` の `frame_count` の一致検査あり）。ロゴ矩形推定専用に、クロップせず全画面をキーフレームだけ読む関数（`stream_keyframe_luma_frames`、フレーム数一致検査なし）も持つ | [cm-detection.md](cm-detection.md) |
