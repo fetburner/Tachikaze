@@ -2066,7 +2066,7 @@ fn dtvi_video_size(dtvi: &Dtvi) -> Result<VideoSize> {
 /// `.dtvi` ヘッダの `frame_count` を読む（`dtvi.rs` の doc comment参照）。
 /// `join_logo_scp` を起動する前に、ロゴ検出で読み取ったフレーム数との一致を
 /// 検査するために使う（`frames::stream_luma_frames` の `expected_frame_count`）。
-fn dtvi_frame_count(dtvi: &Dtvi) -> Result<u64> {
+pub(crate) fn dtvi_frame_count(dtvi: &Dtvi) -> Result<u64> {
     let value = dtvi
         .header_value("frame_count")
         .ok_or_else(|| anyhow!(".dtvi のヘッダに frame_count がありません"))?;
