@@ -409,6 +409,19 @@ mod tests {
     use std::process;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    #[test]
+    fn analyze_command_puts_cache_dir_before_subcommand() {
+        let input = Path::new("/rec/IN.mp4");
+        assert_eq!(
+            analyze_command(None, input),
+            "tachikaze analyze /rec/IN.mp4 -o trim.avs"
+        );
+        assert_eq!(
+            analyze_command(Some(Path::new("/cache")), input),
+            "tachikaze --cache-dir /cache analyze /rec/IN.mp4 -o trim.avs"
+        );
+    }
+
     /// テスト用に、システムの一時ディレクトリ配下にユニークなディレクトリを作る。
     /// `WorkDir` 自体のテストなので `tempfile` クレートには頼らず、素朴な方式で
     /// 自前実装する。`--cache-dir` を明示的に渡すことでプロセス共有の環境変数を

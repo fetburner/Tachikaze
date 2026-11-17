@@ -302,14 +302,18 @@ pub fn run(config: &ReviewConfig) -> Result<PathBuf> {
     }
 
     // 検査を通った一時ディレクトリだけを `review/` にする。古い `review/` は残さない。
-    if review_dir.exists() {
-        fs::remove_dir_all(&review_dir).path_ctx("古い確認画面の削除", &review_dir)?;
-    }
-    let renamed = fs::rename(&staging, &review_dir);
-    if renamed.is_err() {
+    // 置き換えのどこで失敗しても、一時ディレクトリは消してからエラーを返す。
+    let place = || -> Result<()> {
+        if review_dir.exists() {
+            fs::remove_dir_all(&review_dir).path_ctx("古い確認画面の削除", &review_dir)?;
+        }
+        fs::rename(&staging, &review_dir).path_ctx("確認画面の配置", &review_dir)?;
+        Ok(())
+    };
+    if let Err(err) = place() {
         let _ = fs::remove_dir_all(&staging);
+        return Err(err);
     }
-    renamed.path_ctx("確認画面の配置", &review_dir)?;
 
     std::path::absolute(review_dir.join("index.html"))
         .context("index.html の絶対パス解決に失敗しました")
