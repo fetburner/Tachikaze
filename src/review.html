@@ -47,7 +47,7 @@ h2{font-size:14px;font-weight:600;margin:0;padding:8px 12px;background:var(--sub
 .head{position:absolute;top:0;bottom:0;width:2px;background:var(--accent);pointer-events:none}
 .legend{display:flex;flex-wrap:wrap;gap:2px 16px;color:var(--muted);font-size:12px;margin-top:6px}
 .legend span[style]::before{content:"";display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:6px;vertical-align:-1px;background:var(--c)}
-.strip{display:flex;gap:6px;overflow-x:auto;padding:3px 3px 8px}
+.strip{position:relative;display:flex;gap:6px;overflow-x:auto;padding:3px 3px 8px}
 .th{flex:none;width:88px;padding:0;border:0;border-top:3px solid transparent;background:none;color:var(--muted);cursor:pointer;font:inherit;font-size:11px}
 .th img{display:block;width:100%;height:50px;object-fit:cover;border-radius:6px;border-bottom:3px solid var(--keep-bar);background:var(--subtle)}
 .th.cut img{opacity:.35;border-bottom-color:var(--cut)}
@@ -107,7 +107,6 @@ textarea{width:100%;background:var(--subtle);color:var(--text);border:1px solid 
   <div class="strip" id="strip"></div>
 
   <div class="ctl">
-    <button type="button" id="bPlay" title="Space">再生/停止</button>
     <button type="button" id="bPrev" title="←">前のキーフレーム</button>
     <button type="button" id="bNext" title="→">次のキーフレーム</button>
     <button type="button" id="bPrevB" title="Shift ←">前の境界</button>
@@ -264,14 +263,16 @@ function render() {
   $('cmd').value = command();
   renderHead();
 }
-function renderHead() {
+// center が偽なら、選択中のサムネイルが帯の外に出たときだけ帯を動かす（再生中の追従用）
+function renderHead(center = true) {
   $('head').style.left = frameAt(cur) / TOTAL * 100 + '%';
   $('tc').textContent = `${fmt(TIMES[cur])}  フレーム ${FRAMES[cur]}`;
   const b = $('badge');
   b.textContent = keep[cur] ? '残す' : 'カット';
   b.className = 'badge ' + (keep[cur] ? 'keep' : 'cut');
   const t = thumbs[cur];
-  strip.scrollLeft = t.offsetLeft - strip.clientWidth / 2 + t.offsetWidth / 2;
+  const visible = t.offsetLeft >= strip.scrollLeft && t.offsetLeft + t.offsetWidth <= strip.scrollLeft + strip.clientWidth;
+  if (center || !visible) strip.scrollLeft = t.offsetLeft - strip.clientWidth / 2 + t.offsetWidth / 2;
 }
 // 残す区間をシェルのコマンドにする。Trim は両端を含むので、次の区間の先頭 frame の 1 つ手前で終える。
 function command() {
@@ -290,8 +291,18 @@ video.addEventListener('timeupdate', () => {
   // ブラウザは currentTime を内部の時間単位に丸めて返すため、シーク直後に TIMES より数 ms 小さくなることがある。
   // 1 フレーム（約 33ms）より十分小さい 10ms を足して、直前のキーフレームへ戻るのを防ぐ。
   const i = floorIdx(TIMES, video.currentTime + 0.01);
-  if (i !== cur) select(i);
+  if (i !== cur) follow(i);
 });
+// 再生中の追従。render() で区間一覧などを作り直すと、ブラウザの動画メニュー（再生速度・ピクチャーインピクチャー）が
+// 再生中に勝手に閉じた（一時停止中は閉じない）。区間は変わらないので、強調と再生位置の表示だけを更新する
+function follow(i) {
+  thumbs[cur].classList.remove('cur');
+  cur = i;
+  thumbs[cur].classList.add('cur');
+  const blks = blocks();
+  [...$('seglist').children].forEach((row, j) => row.classList.toggle('cur', cur >= blks[j][0] && cur < blks[j][1]));
+  renderHead(false);
+}
 video.addEventListener('durationchange', render);
 
 const ops = {
@@ -319,7 +330,7 @@ const ops = {
     catch { $('copied').textContent = 'コマンドを選択しました。⌘C でコピーしてください。'; }
   },
 };
-const bind = { bPlay: ops.play, bPrev: ops.prev, bNext: ops.next, bPrevB: () => ops.boundary(-1), bNextB: () => ops.boundary(1),
+const bind = { bPrev: ops.prev, bNext: ops.next, bPrevB: () => ops.boundary(-1), bNextB: () => ops.boundary(1),
   bFlag: ops.flag, bIn: ops.setIn, bOut: ops.setOut, bTog: ops.toggle, bDel: ops.del, bUndo: ops.undo, bReset: ops.reset, bCopy: ops.copy };
 for (const id in bind) $(id).onclick = bind[id];
 $('overview').onclick = e => {

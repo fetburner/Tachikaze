@@ -29,6 +29,7 @@ $ tachikaze auto IN.mp4 -o OUT.mp4
 
 ```console
 $ tachikaze analyze IN.mp4 -o trim.avs --report
+$ tachikaze review IN.mp4   # 確認画面（キャッシュ内の review/index.html）を作る。その絶対パスを標準出力に出す
 $ tachikaze cut IN.mp4 --trim trim.avs -o OUT.mp4
 ```
 
