@@ -390,6 +390,19 @@ pub fn subs_path(cache_dir: Option<&Path>, input: &Path, extension: &str) -> Res
     Ok(cache_dir_for_input(cache_dir, input)?.join(format!("{SUBS_BASE_NAME}.{extension}")))
 }
 
+/// 「先に実行してください」の案内に出す `analyze` のコマンド。`--cache-dir` は
+/// グローバル引数なので、指定時はサブコマンドより前に置く。
+pub fn analyze_command(cache_dir: Option<&Path>, input: &Path) -> String {
+    match cache_dir {
+        Some(dir) => format!(
+            "tachikaze --cache-dir {} analyze {} -o trim.avs",
+            dir.display(),
+            input.display()
+        ),
+        None => format!("tachikaze analyze {} -o trim.avs", input.display()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

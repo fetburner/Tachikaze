@@ -53,7 +53,7 @@ fn review_without_analyze_cache_suggests_analyze_and_exits_1() {
     assert_eq!(output.status.code(), Some(1), "exit code 1 のはず");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("tachikaze analyze"),
+        stderr.contains(" analyze "),
         "analyze の実行例が無い: {stderr}"
     );
     assert!(output.stdout.is_empty(), "標準出力は空のはず");

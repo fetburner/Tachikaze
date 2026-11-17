@@ -83,7 +83,7 @@ pub struct ReportSummary {
 
 /// `.dtvi` ヘッダから `(time_base_num, time_base_den)` を取得する。
 /// キーが無い、または数値としてパースできない場合は `1/1`（フレーム数=秒）にする。
-fn time_base(dtvi: &Dtvi) -> (f64, f64) {
+pub(crate) fn time_base(dtvi: &Dtvi) -> (f64, f64) {
     let parse = |key: &str| {
         dtvi.header_value(key)
             .and_then(|v| v.trim().parse::<f64>().ok())

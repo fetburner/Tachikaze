@@ -38,6 +38,7 @@ use crate::logo::interval;
 use crate::order::DisplayIdx;
 use crate::report::missed::find_missed_candidates;
 use crate::report::overcut::{find_overcut_candidates, OvercutReason};
+use crate::report::time_base;
 use crate::trim::TrimList;
 use crate::{commands, external, plan, tools, workdir};
 
@@ -66,19 +67,6 @@ pub struct ReviewSource<'a> {
 /// 組み立て（HTML の `thumb`）と書き出し（ffmpeg の連番）で同じ規則を使う。
 fn thumb_relative_path(index: usize) -> String {
     format!("thumbs/{:05}.jpg", index + 1)
-}
-
-/// `.dtvi` ヘッダの `(time_base_num, time_base_den)`。キーが無ければ `1/1`
-/// （[`crate::report`] の `time_base` と同じ規則）。
-fn time_base(dtvi: &Dtvi) -> (f64, f64) {
-    let parse = |key: &str| {
-        dtvi.header_value(key)
-            .and_then(|v| v.trim().parse::<f64>().ok())
-    };
-    (
-        parse("time_base_num").unwrap_or(1.0),
-        parse("time_base_den").unwrap_or(1.0),
-    )
 }
 
 /// `path` を `file://` URL にする。RFC 3986 の非予約文字（英数字と `-._~`）と `/` 以外の
@@ -262,10 +250,9 @@ pub fn run(config: &ReviewConfig) -> Result<PathBuf> {
         if !required.is_file() {
             bail!(
                 "キャッシュに必要なファイルが見つかりませんでした: {}\n\
-                 先に次を実行してください:\n  \
-                 tachikaze analyze {} -o trim.avs",
+                 先に次を実行してください:\n  {}",
                 required.display(),
-                config.input.display()
+                workdir::analyze_command(cache, &config.input)
             );
         }
     }
@@ -318,7 +305,11 @@ pub fn run(config: &ReviewConfig) -> Result<PathBuf> {
     if review_dir.exists() {
         fs::remove_dir_all(&review_dir).path_ctx("古い確認画面の削除", &review_dir)?;
     }
-    fs::rename(&staging, &review_dir).path_ctx("確認画面の配置", &review_dir)?;
+    let renamed = fs::rename(&staging, &review_dir);
+    if renamed.is_err() {
+        let _ = fs::remove_dir_all(&staging);
+    }
+    renamed.path_ctx("確認画面の配置", &review_dir)?;
 
     std::path::absolute(review_dir.join("index.html"))
         .context("index.html の絶対パス解決に失敗しました")

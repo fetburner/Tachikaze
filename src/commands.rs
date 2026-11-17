@@ -824,10 +824,9 @@ fn resolve_dtvi_path(
 
     bail!(
         "`--dtvi` が指定されておらず、キャッシュにも `.dtvi` が見つかりませんでした: {}\n\
-         先に次を実行してください:\n  \
-         tachikaze analyze {} -o trim.avs",
+         先に次を実行してください:\n  {}",
         cached.display(),
-        input.display()
+        workdir::analyze_command(cache_dir, input)
     );
 }
 
@@ -1337,12 +1336,37 @@ mod tests {
             .expect_err("キャッシュに無ければ解決に失敗するはず");
         let message = err.to_string();
         assert!(
-            message.contains("tachikaze analyze"),
+            message.contains(" analyze "),
             "analyze の実行例が含まれていない: {message}"
         );
         assert!(
             message.contains(&input_path.display().to_string()),
             "入力パスが含まれていない: {message}"
+        );
+
+        fs::remove_dir_all(&input_dir).ok();
+        fs::remove_dir_all(&cache_root).ok();
+    }
+
+    #[test]
+    fn resolve_dtvi_path_missing_with_cache_dir_puts_flag_before_subcommand() {
+        let cache_root = make_scratch_dir("resolve-dtvi-missing-cache-flag");
+
+        let input_dir = make_scratch_dir("resolve-dtvi-missing-cache-flag-input");
+        let input_path = input_dir.join("IN.mp4");
+        fs::write(&input_path, b"dummy mp4 content").expect("write input");
+
+        let err = resolve_dtvi_path(None, Some(&cache_root), &input_path)
+            .expect_err("キャッシュに無ければ解決に失敗するはず");
+        let message = err.to_string();
+        let expected = format!(
+            "tachikaze --cache-dir {} analyze {} -o trim.avs",
+            cache_root.display(),
+            input_path.display()
+        );
+        assert!(
+            message.contains(&expected),
+            "--cache-dir がサブコマンドより前に付いた実行例が無い: {message}"
         );
 
         fs::remove_dir_all(&input_dir).ok();
