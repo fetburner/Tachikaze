@@ -277,7 +277,6 @@ pub enum Snap {
     Inward,
 }
 
-/// `make-logo` サブコマンドの引数。
 /// `review` サブコマンドの引数。
 #[derive(Debug, Args)]
 pub struct ReviewArgs {
@@ -285,6 +284,7 @@ pub struct ReviewArgs {
     pub input: PathBuf,
 }
 
+/// `make-logo` サブコマンドの引数。
 #[derive(Debug, Args)]
 pub struct MakeLogoArgs {
     pub input: PathBuf,
