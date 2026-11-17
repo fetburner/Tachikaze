@@ -116,7 +116,7 @@ tachikaze auto IN.mp4 -o OUT.mp4 [--cm-output CM.mp4] [--ignore-gate] [-f|--forc
 
 `prepare` → `analyze` → gate 判定 → `cut` → `remap-subs` を対話なしで合成する（`src/auto.rs`）。アルゴリズムは持たず、各ステップは上記の関数・処理をそのまま呼ぶ（`commands::execute_cut` を `cut` サブコマンドと共有。詳細は `src/commands.rs` / `src/auto.rs` の doc comment）。
 
-- gate が「疑わしいので止める」と判定したら cut せず exit code 3 で停止し、trim.avs のパスと、確認画面を開く `review` のコマンド例、「直して cut する」コマンド例を出す。`review` の例は `auto` を自動実行しない（対話なしで完結する性質を保つため）。入力は `cut` の例と同じ `prepare` 後のパス、`--cache-dir` は `auto` が使ったものを渡す。`--analyze-only` で止まったときも同じ 2 つの例を出す
+- gate が「疑わしいので止める」と判定したら cut せず exit code 3 で停止し、trim.avs のパスと、確認画面を開く `review` のコマンド例、「直して cut する」コマンド例を出す。`auto` は `review` を自動実行しない（対話なしで完結する性質を保つため）。`review` の例の入力は `cut` の例と同じ `prepare` 後のパス、`--cache-dir` は `auto` が使ったもの、`-o` は `cut` の例と同じ出力先を渡す（`review` の既定の出力先はキャッシュ内になるため）。`--analyze-only` で止まったときも同じ 2 つの例を出す
 - `--ignore-gate` で無視できるのは gate の判定だけで、自己検証や `.dtvi` 必須は変わらない
 - `--analyze-only` は `--ignore-gate` の有無に関わらず cut へ進まない。gate が疑わしいと判定していれば exit code は 3 のまま（無視の対象は「cut へ進むかどうか」で、停止コードそのものではない）
 - 1プロセスにつき入力は1本。複数ファイルはシェルのループに任せる。1入力1プロセスにすることで、exit code の意味が「その1本に対する答え」に一意になる（下記「exit code」）
