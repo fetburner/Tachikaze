@@ -6,7 +6,7 @@
     "docs-lint": "textlint README.md CLAUDE.md THIRD-PARTY-NOTICES.md 'docs/**/*.md'"
   },
   "devDependencies": {
-    "textlint": "15.8.0",
+    "textlint": "16.0.0",
     "textlint-rule-preset-ja-technical-writing": "12.0.2"
   }
 }
