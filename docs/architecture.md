@@ -253,6 +253,8 @@ $ ffmpeg -i IN.mp4 -c copy -use_editlist 0 -movflags +faststart OUT.mp4
 
 **`stsd` が複数エントリ**（`check_single_stsd_entry`）。`write.rs` が `sample_description_index: 1` 固定で `stsc` を再構築しているため。対応するにはサンプルごとの index 保持（`read.rs` の `SampleInfo` と `write.rs` の両方の変更）が必要。無劣化 remux ではパラメータ差異という原因自体を解消できないので、事前除去の回避策は提示できない。
 
+**sample entry の単一子 box の重複**（`mp4-atom` が parse 時に拒否）。`avcC` / `esds` / `dOps` などが2つ以上あると、0.17 は `Error::DuplicateBox` で読み込みを止める。0.16 は後の方を黙って採用していた。どちらが正しいかを決める根拠がなく、黙って片方で書き出すと別の設定の映像・音声になるので、止まる方を採る。`colr` は `Vec` で保持するため対象外。ソースで確認したのみで、この入力のフィクスチャは無い。
+
 **オープン GOP**（`check_closed_gop`）。「S の同期サンプルからデコード順に `E - S` パケット取る」規則が成立しない。`.dtvi` の `leading_frame_count` で判定する（`.dtvi` が無い場合も判定不能として停止）。
 
 **映像2本以上 / 音声2本以上**（`check_track_counts`）。映像1本 + 音声1本のみ対応。`prepare`（`src/prepare.rs::reject_multiple_video_or_audio_tracks`）も同じ制約を入口で課す。`prepare` は `-map 0:v:0 -map 0:a:0` 固定で ffmpeg に渡すため、この検査が無いと二重音声放送のような入力でも黙って1本目だけを残し、`cut` が本来拒否すべき構成を素通しさせてしまう。
@@ -280,11 +282,22 @@ $ ffmpeg -i IN.mp4 -c copy -use_editlist 0 -movflags +faststart OUT.mp4
 
 ### `stsd` sample entry の再 encode による情報欠落
 
-`mp4-atom` は `stsd` の sample entry を encode 時に正規化し、未知の子 box を捨てる。`btrt` の欠落や子 box の順序変更、`esds` の長さ表現の変更、QuickTime sound description v1/v2 から v0 への変換が起こりうる。前バージョンでも同じ挙動だった。
+`mp4-atom` は `stsd` の sample entry を encode 時に正規化する。子 box は crate 側の固定順で書き出され、`esds` の長さ表現は最小バイト数に直り、QuickTime sound description v1/v2 は v0 で書き戻される。この挙動は 0.16 と 0.17 で同じ。
+
+0.17 で保持するようになった範囲（0.16 では捨てるか誤読していた）:
+
+- `esds` の省略可能フィールド（stream priority・dependency ES ID・URL・OCR ES ID）。0.16 は flags を読み捨てるため、これらがあると後続の記述子を誤読していた
+- 複数の `colr`（`Vec<Colr>` で保持）
+- `st3d` / `sv3d` / `vexu` / `hfov`（`Spatial` として保持）
+- Opus の channel mapping family 1 以上（多チャンネル）。0.16 は parse 時に `Unsupported` で止まっていた
+
+それ以外の未知の子 box は従来どおり捨てる（`mp4-atom` は warn のみ出す）。`btrt` を保持する field が無い Codec（`Ac3` / `Eac3` / `Flac` / `Samr` / `Mp3` / `Camm` / `Tx3g`）は、子 box の `btrt` を捨てる（0.16 も同じ）。このうち音声の `Ac3` / `Eac3` / `Flac` / `Samr` は cut を通るため、`btrt` の欠落は実際に起きうる（`Mp3` は cut が拒否する）。
+
+**Opus 多チャンネル（family 1 以上）の cut 出力は未検証。** 0.17 は table を RFC 7845 §5.1.1 相当の規則で検査してから読むが、tachikaze 側にこの入力のフィクスチャは無い。カット後の再生、ffprobe による確認、A/V 位置の検査はいずれも行っていない。`check_no_unsupported_codecs` は拒否しないため、そのまま `cut` を通る。
 
 そのため、常に v2 の `Lpcm` や `chan` / `clap` を持つ entry は、cut で気付かず情報を失いうる。QuickTime `.mp3` sample entry は PR #174 で cut と prepare の拒否対象にしたため、現状の経路では情報欠落は起きない。対策の方針は決定済みで、出力 `stsd` に元のバイト列をそのままコピーする。
 
-0.16 の `Codec::Unknown` は parse 時に本体を保持するが、encode 時はエラーになる。Unknown のトラックは `check_supported` が事前に拒否するため、現状の cut 呼び出し経路ではその encode エラーに到達しない。
+`Codec::Unknown` は parse 時に本体を保持するが、encode 時は `UnknownCodec` エラーになる（0.16 と 0.17 で同じ）。Unknown のトラックは `check_supported` が事前に拒否するため、現状の cut 呼び出し経路ではその encode エラーに到達しない。
 
 ### 継ぎ目の MDCT 過渡（クリックノイズ）
 

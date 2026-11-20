@@ -77,7 +77,7 @@ SML# の売りは **C との直接 FFI**。しかし FFI を使わない設計�
 
 | クレート | 用途 |
 |---|---|
-| `mp4-atom` 0.16 | mp4 のアトム読み書き（**実ファイルで検証済み**、[mp4-atom.md](mp4-atom.md)） |
+| `mp4-atom` 0.17 | mp4 のアトム読み書き（**実ファイルで検証済み**、[mp4-atom.md](mp4-atom.md)） |
 | `clap` 4.6（`derive`） | サブコマンドと引数のパース |
 | `anyhow` 1.0 | エラーの伝播（`Context` で経路情報を足す） |
 | `serde` 1.0（`derive`） / `serde_json` 1.0 | `SegmentMap`（`src/segmap.rs`）の JSON 読み書き |

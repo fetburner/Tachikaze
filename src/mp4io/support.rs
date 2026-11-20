@@ -294,6 +294,7 @@ mod tests {
                 pre_skip: 0,
                 input_sample_rate: 48_000,
                 output_gain: 0,
+                channel_mapping: None,
             },
             btrt: None,
         })])
@@ -305,6 +306,10 @@ mod tests {
             esds: Esds {
                 es_desc: EsDescriptor {
                     es_id: 0,
+                    depends_on_es_id: None,
+                    url: None,
+                    ocr_es_id: None,
+                    stream_priority: 0,
                     dec_config: DecoderConfig {
                         object_type_indication: 0x40,
                         stream_type: 5,

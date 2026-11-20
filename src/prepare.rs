@@ -475,6 +475,7 @@ mod tests {
                 pre_skip: 0,
                 input_sample_rate: 48_000,
                 output_gain: 0,
+                channel_mapping: None,
             },
             btrt: None,
         }))
