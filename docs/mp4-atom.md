@@ -10,8 +10,8 @@ mp4 の読み書きコードを書くときはこの文書を読む。**検証�
 
 本ツールはコーデックを理解する必要がない。理想は **`stsd` を不透明なバイト列としてコピーすること**。`mp4-atom` はサンプル表の読み書きに必要な構造を公開するが、sample entry の生バイト保持は未対応（[architecture.md](architecture.md)「stsd sample entry の再 encode による情報欠落」）:
 
-- `Codec` 列挙が映像・音声・字幕を網羅し、`#[non_exhaustive]`（0.16 時点）。映像は `Avc1` / `Avc3` / `Jpeg` / `Hev1` / `Hvc1` / `Vp08` / `Vp09` / `Av01` / `Uncv`。音声は `Opus` / `Mp4a` / `Mp3` / `Flac` / `Ac3` / `Eac3` / `Samr` / `Ipcm` / `Fpcm` / `Sowt` / `Twos` / `Lpcm` / `In24` / `In32` / `Fl32` / `Fl64` / `S16l`。字幕は `Tx3g` / `Wvtt`。メタデータは `Mett` / `Metx` / `Urim` / `Camm` / `Evte` / `Mebx`
-- 未知の sample entry は `Codec::Unknown(FourCC, Vec<u8>)` で本体を保持するが、0.16 では encode 時にエラーになる
+- `Codec` 列挙が映像・音声・字幕を網羅し、`#[non_exhaustive]`（0.17 時点）。映像は `Avc1` / `Avc3` / `Jpeg` / `Hev1` / `Hvc1` / `Vp08` / `Vp09` / `Av01` / `Uncv`。音声は `Opus` / `Mp4a` / `Mp3` / `Flac` / `Ac3` / `Eac3` / `Samr` / `Ipcm` / `Fpcm` / `Sowt` / `Twos` / `Lpcm` / `In24` / `In32` / `Fl32` / `Fl64` / `S16l`。字幕は `Tx3g` / `Wvtt`。メタデータは `Mett` / `Metx` / `Urim` / `Camm` / `Evte` / `Mebx`
+- 未知の sample entry は `Codec::Unknown(FourCC, Vec<u8>)` で本体を保持するが、0.17 でも encode 時に `UnknownCodec` エラーになる（`stsd/mod.rs`）
 - `Any::Unknown(FourCC, Vec<u8>)` で未知アトムを不透明バイト列として保持
 - `stsz` / `stsc` / `stco` / `co64` / `stts` / `ctts` / `stss` をすべて公開
 
@@ -54,6 +54,7 @@ E2E で実検証済みか、認識のみ（未検証）かの区別は [measurem
 - `StszSamples` は `Identical { count, size }` と `Different { sizes }` の**構造体バリアント**（タプルではない）
 - `CttsEntry::sample_offset` は **`i64`**
 - `Header::size` は `Option<u64>`
+- 0.17 で `Dops` に `channel_mapping`、`EsDescriptor` に `depends_on_es_id` / `url` / `ocr_es_id` / `stream_priority` が増えた。struct literal（テストの組み立て）は新フィールドを書かないとコンパイルできない。`Avc1` などの `colr` は `Option` から `Vec` になった
 
 ## サンプル表の復元
 

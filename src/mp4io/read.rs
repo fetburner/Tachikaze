@@ -63,7 +63,7 @@ pub(crate) fn track_codec(trak: &Trak) -> Option<&Codec> {
 ///
 /// カット処理は「ソース上の DTS から最近傍パケットを引き当ててビットコピーする」
 /// だけでコーデックに依存しない（docs/lossless-cut.md「音声の扱い」）。そのため
-/// 特定コーデックに限定せず、`mp4-atom` 0.16 が `Codec` として認識する音声系を
+/// 特定コーデックに限定せず、`mp4-atom` 0.17 が `Codec` として認識する音声系を
 /// 音声トラックとして識別する。QuickTime `.mp3` sample entry (`Codec::Mp3`) も音声として
 /// 数えるが、書き戻しで情報を失う懸念があるため cut と prepare は拒否する
 /// （`support::check_no_unsupported_codecs`）。`mp4a` + `esds` の `Codec::Mp4a` は拒否対象外。
@@ -507,7 +507,7 @@ mod tests {
         };
     }
 
-    /// `mp4-atom` 0.16 が認識する音声系 Codec を 1 つずつ構築して返す。
+    /// `mp4-atom` 0.17 が認識する音声系 Codec を 1 つずつ構築して返す。
     ///
     /// 対象一覧（圧縮 7 種 + 非圧縮/QT 系 10 種）と 1:1 で対応させる。Mp3 も分類上は
     /// 音声として認識するが、`support::check_no_unsupported_codecs` が cut / prepare で拒否する。
@@ -522,6 +522,7 @@ mod tests {
                 pre_skip: 0,
                 input_sample_rate: 48_000,
                 output_gain: 0,
+                channel_mapping: None,
             },
             btrt: None,
         });
@@ -531,6 +532,10 @@ mod tests {
             esds: Esds {
                 es_desc: EsDescriptor {
                     es_id: 0,
+                    depends_on_es_id: None,
+                    url: None,
+                    ocr_es_id: None,
+                    stream_priority: 0,
                     dec_config: DecoderConfig {
                         object_type_indication: 0x40, // AAC
                         stream_type: 5,
