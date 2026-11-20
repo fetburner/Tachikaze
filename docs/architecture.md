@@ -291,7 +291,7 @@ $ ffmpeg -i IN.mp4 -c copy -use_editlist 0 -movflags +faststart OUT.mp4
 - `st3d` / `sv3d` / `vexu` / `hfov`（`Spatial` として保持）
 - Opus の channel mapping family 1 以上（多チャンネル）。0.16 は parse 時に `Unsupported` で止まっていた
 
-それ以外の未知の子 box は従来どおり捨てる（`mp4-atom` は warn のみ出す）。
+それ以外の未知の子 box は従来どおり捨てる（`mp4-atom` は warn のみ出す）。`btrt` を保持する field が無い Codec（`Ac3` / `Eac3` / `Flac` / `Samr` / `Mp3` / `Camm` / `Tx3g`）は、子 box の `btrt` を捨てる（0.16 も同じ）。このうち音声の `Ac3` / `Eac3` / `Flac` / `Samr` は cut を通るため、`btrt` の欠落は実際に起きうる（`Mp3` は cut が拒否する）。
 
 **Opus 多チャンネル（family 1 以上）の cut 出力は未検証。** 0.17 は table を RFC 7845 §5.1.1 相当の規則で検査してから読むが、tachikaze 側にこの入力のフィクスチャは無い。カット後の再生、ffprobe による確認、A/V 位置の検査はいずれも行っていない。`check_no_unsupported_codecs` は拒否しないため、そのまま `cut` を通る。
 
