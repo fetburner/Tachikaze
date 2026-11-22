@@ -3613,6 +3613,8 @@ mod tests {
     #[test]
     #[ignore = "dtvindex/chapter_exe/join_logo_scp の実バイナリと実サンプルmp4が必要（docs/toolchain-macos.md）"]
     fn analyze_run_produces_trim_list_with_real_tools() {
+        let _env_guard = TOOL_PATH_ENV_LOCK.lock().unwrap();
+
         // キャッシュの根を明示して、利用者の実際のキャッシュ（`~/.cache/tachikaze`）
         // を汚さないようにする（`cache_dir: None` にすると既定値が使われてしまう）。
         let cache_root = unique_scratch_dir("integration-cache");
