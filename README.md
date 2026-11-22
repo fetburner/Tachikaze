@@ -42,6 +42,36 @@ $ for f in *.mp4; do
   done
 ```
 
+### ロゴ用 ffmpeg の上書き
+
+`analyze`、`auto`、`make-logo` では、実行環境に合わせてロゴ矩形のデコードに使う ffmpeg の設定を指定できます。
+
+- `--logo-ffmpeg-input-arg=<ARG>` は `-i` より前に渡す引数です。ffmpeg の引数1個につき1回指定し、オプション名と値は別々に渡します。空白を含む値は `--logo-ffmpeg-input-arg='path with spaces'` のように引用します。Tachikaze は受け取った値を順番どおり ffmpeg へ渡します。
+- `--logo-ffmpeg-vf=<FILTER>` は `-vf` の値で、1回だけ指定できます。`{x}`、`{y}`、`{w}`、`{h}` はロゴ矩形の座標とサイズに展開されます。全フレームを元の表示順で出力し、各フレームを幅 `{w}`、高さ `{h}` にするフィルターを指定してください。8ビットのグレースケールへの変換は、Tachikaze が `-pix_fmt gray` で指定します。
+
+いずれかを指定すると、ロゴ矩形が決まった後の学習と検出では、上書き設定でそれぞれ全編を1回デコードします。
+自動推定では通常、全編デコード1回分の画素列を学習と検出で共有します。再生バッファの見積もりが1 GiBを超える場合は、両方を同じ設定で別々にデコードします。
+候補を選ぶための全画面キーフレーム走査には上書き設定を使いません。`--no-logo` との併用はエラーです。
+
+J4125 と i965 で測定・採用した HW-crop 経路は、GPU 上で `crop` と `scale_vaapi` を適用し、矩形の画素を `hwdownload` で転送します。
+次のコマンドは J4125 と i965 の環境に固有の構成例であり、Tachikaze の既定値ではありません。
+測定時のコマンド文字列は記録に残っておらず、掲載例の文字列そのものは実機で検証していません。
+他の GPU やドライバーでの動作や画素の一致は確認していません。iHD では `scale_vaapi` が `VAProfile is not supported` で失敗しました。
+
+```console
+$ LIBVA_DRIVER_NAME=i965 tachikaze auto IN.mp4 -o OUT.mp4 \
+    --logo-ffmpeg-input-arg=-hwaccel \
+    --logo-ffmpeg-input-arg=vaapi \
+    --logo-ffmpeg-input-arg=-hwaccel_device \
+    --logo-ffmpeg-input-arg=/dev/dri/renderD128 \
+    --logo-ffmpeg-input-arg=-hwaccel_output_format \
+    --logo-ffmpeg-input-arg=vaapi \
+    --logo-ffmpeg-vf='crop={w}:{h}:{x}:{y},scale_vaapi=w={w}:h={h}:format=nv12,hwdownload,format=nv12'
+```
+
+Apple Silicon の VideoToolbox は実測でソフトウェア経路より約7〜10倍の時間がかかり、画素も一致しなかったため採用していません。
+両環境の測定結果は [docs/measurements.md「VA-API ハードウェアデコードの検証（Issue #164）」](docs/measurements.md#va-api-ハードウェアデコードの検証issue-164) にあります。
+
 ## 依存
 
 本体に加え、次の外部ツールが `PATH` 上に必要です。

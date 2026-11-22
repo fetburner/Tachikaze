@@ -81,6 +81,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, bail, Context};
 
 use crate::errctx::PathContext;
+use crate::logo::frames::FfmpegOverrides;
 use crate::{analyze, cli, commands, gate, mp4io, prepare, report, segmap, subtitle, workdir};
 
 /// `auto` サブコマンドの設定（`src/cli.rs::Commands::Auto` の CLI 引数と1対1）。
@@ -109,6 +110,8 @@ pub struct AutoConfig {
     pub no_logo: bool,
     /// `--logo-dir`（ロゴ辞書の場所の上書き。`analyze --logo-dir` と同じ）。
     pub logo_dir: Option<PathBuf>,
+    /// 矩形決定後のロゴ学習・検出に使う ffmpeg の設定。
+    pub ffmpeg_overrides: FfmpegOverrides,
 }
 
 /// 入力1本の処理結果（失敗は `anyhow::Result::Err` で表す。`commands::run_auto`
@@ -134,12 +137,16 @@ pub fn run(config: &AutoConfig, input: &Path) -> anyhow::Result<InputStatus> {
     if let Some(path) = &config.cm_output {
         commands::reject_dash_output(path, "--cm-output")?;
     }
-    // `--logo` と `--no-logo` の併用は静的な設定の誤り（`clap` の
+    // `--no-logo` とロゴ用オプションの競合は静的な設定の誤り（`clap` の
     // `conflicts_with` でも弾かれるが、`AutoConfig` を直接組み立てて
     // `auto::run` を呼ぶ経路（このモジュールの単体テスト等）も同じ規則で
     // 弾くため、`analyze::validate_logo_flags` をここでも呼ぶ。実処理
     // （`prepare`/`analyze`）より前に検出する）。
-    analyze::validate_logo_flags(config.logo.as_deref(), config.no_logo)?;
+    analyze::validate_logo_flags(
+        config.logo.as_deref(),
+        config.no_logo,
+        &config.ffmpeg_overrides,
+    )?;
 
     // `--cm-output` を指定したときのみ CM 側出力を作る（既定では作らない）。
     // `--snap inward` は保持区間を退化させうるため `--cm-output` と併用できない
@@ -404,7 +411,7 @@ fn process_one(
 /// （`prepare` 後の入力）・`original_input`（ユーザーが実際に指定した元の
 /// 入力、`process_one` の引数）から `analyze::AnalyzeConfig` を組み立てる。
 ///
-/// `logo`/`no_logo`/`logo_dir` はそのまま転記するだけ（#135）。`analyze` 側の
+/// ロゴ関連の設定はそのまま転記する。`analyze` 側の
 /// 解釈（`--logo` 明示・`--no-logo`・自動推定のどれになるか）は
 /// `analyze::run_auto_logo_detection`/`analyze::validate_logo_flags` が持ち、
 /// `auto` はその判断を複製しない。純粋な struct 変換だけの小さい関数に分離した
@@ -433,6 +440,7 @@ fn build_analyze_config(
         logo: config.logo.clone(),
         no_logo: config.no_logo,
         logo_dir: config.logo_dir.clone(),
+        ffmpeg_overrides: config.ffmpeg_overrides.clone(),
         source_name_hint: Some(original_input.to_path_buf()),
     }
 }
@@ -656,6 +664,7 @@ mod tests {
             jls_set: vec![],
             cache_dir: None,
             logo: None,
+            ffmpeg_overrides: FfmpegOverrides::default(),
             no_logo: false,
             logo_dir: None,
         };
@@ -683,6 +692,7 @@ mod tests {
             jls_set: vec![],
             cache_dir: None,
             logo: None,
+            ffmpeg_overrides: FfmpegOverrides::default(),
             no_logo: false,
             logo_dir: None,
         };
@@ -709,6 +719,7 @@ mod tests {
             jls_set: vec![],
             cache_dir: None,
             logo: None,
+            ffmpeg_overrides: FfmpegOverrides::default(),
             no_logo: false,
             logo_dir: None,
         };
@@ -731,6 +742,7 @@ mod tests {
             jls_set: vec![],
             cache_dir: None,
             logo: None,
+            ffmpeg_overrides: FfmpegOverrides::default(),
             no_logo: false,
             logo_dir: None,
         };
@@ -753,6 +765,7 @@ mod tests {
             jls_set: vec!["not-key-value".to_string()],
             cache_dir: None,
             logo: None,
+            ffmpeg_overrides: FfmpegOverrides::default(),
             no_logo: false,
             logo_dir: None,
         };
@@ -780,6 +793,10 @@ mod tests {
             jls_set: vec![],
             cache_dir: None,
             logo: Some(PathBuf::from("/tmp/logo.lgd")),
+            ffmpeg_overrides: FfmpegOverrides {
+                input_args: vec!["-threads".into(), "1".into()],
+                filter_template: Some("crop={w}:{h}:{x}:{y}".into()),
+            },
             no_logo: true,
             logo_dir: None,
         };
@@ -807,6 +824,7 @@ mod tests {
             jls_set: vec![],
             cache_dir: Some(PathBuf::from("/tmp/cache")),
             logo: None,
+            ffmpeg_overrides: FfmpegOverrides::default(),
             no_logo: true,
             logo_dir: Some(PathBuf::from("/tmp/dict")),
         };
@@ -829,7 +847,7 @@ mod tests {
     }
 
     #[test]
-    fn build_analyze_config_forwards_explicit_logo() {
+    fn build_analyze_config_forwards_explicit_logo_and_ffmpeg_overrides() {
         let config = AutoConfig {
             output: PathBuf::from("/tmp/out.mp4"),
             cm_output: None,
@@ -843,6 +861,10 @@ mod tests {
             jls_set: vec![],
             cache_dir: None,
             logo: Some(PathBuf::from("/tmp/logo.lgd")),
+            ffmpeg_overrides: FfmpegOverrides {
+                input_args: vec!["-threads".into(), "1".into()],
+                filter_template: Some("crop={w}:{h}:{x}:{y}".into()),
+            },
             no_logo: false,
             logo_dir: None,
         };
@@ -855,5 +877,13 @@ mod tests {
 
         assert_eq!(analyze_config.logo, Some(PathBuf::from("/tmp/logo.lgd")));
         assert!(!analyze_config.no_logo);
+        assert_eq!(
+            analyze_config.ffmpeg_overrides.input_args,
+            config.ffmpeg_overrides.input_args
+        );
+        assert_eq!(
+            analyze_config.ffmpeg_overrides.filter_template,
+            config.ffmpeg_overrides.filter_template
+        );
     }
 }

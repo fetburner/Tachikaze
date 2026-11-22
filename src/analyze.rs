@@ -35,7 +35,7 @@ use crate::external;
 use crate::jls::{self, JlsEntry};
 use crate::logo::dict;
 use crate::logo::estimate::{self, SampleLabel};
-use crate::logo::frames::{self, LogoRect, VideoSize};
+use crate::logo::frames::{self, FfmpegOverrides, LogoRect, VideoSize};
 use crate::logo::hier;
 use crate::logo::lgd::{self, LogoData};
 use crate::logo::scan;
@@ -90,8 +90,9 @@ pub struct AnalyzeConfig {
     pub jls_set: Vec<(String, String)>,
     /// `--jl-file`。未指定なら `tools::default_jl_command_file` の既定値を使う。
     pub jl_file: Option<PathBuf>,
-    /// `--logo`（ロゴ検出に使う `.lgd`）。`Some` のときの挙動は1バイトも
-    /// 変わらない（issue #97「解くべき問題」、issue #135「解くべき問題」）。
+    /// `--logo`（ロゴ検出に使う `.lgd`）。ロゴ用 ffmpeg の上書きを指定しない場合、
+    /// `Some` のときの挙動は1バイトも変わらない（issue #97「解くべき問題」、
+    /// issue #135「解くべき問題」）。
     /// `None` かつ `no_logo` が `false` のとき（既定）は、自動推定
     /// （[`run_auto_logo_detection`]）が試みられる。`no_logo` と同時に
     /// `Some` にしてはいけない（[`validate_logo_flags`] で検査する）。
@@ -104,6 +105,8 @@ pub struct AnalyzeConfig {
     /// `dict::resolve_dict_dir` の既定に従う。`logo`/`no_logo` 経路では
     /// 使わない（自動推定のときだけ参照する）。
     pub logo_dir: Option<PathBuf>,
+    /// 矩形決定後のロゴ学習・検出に使う ffmpeg の設定。
+    pub ffmpeg_overrides: FfmpegOverrides,
     /// 自動推定で学習した `.lgd` の辞書ファイル名・`LogoData.name` を作るときに
     /// `input` の代わりに使う元入力の表示名（レビュー指摘、issue #135）。
     ///
@@ -129,7 +132,7 @@ fn dict_naming_source(config: &AnalyzeConfig) -> &Path {
 }
 
 /// [`AnalyzeConfig::logo`] と [`AnalyzeConfig::no_logo`] が両立しないことを
-/// 検査する。
+/// 検査する。ロゴ処理を無効にしたときは ffmpeg 上書き設定も拒否する。
 ///
 /// `--logo` は特定の `.lgd` を明示するオプション、`--no-logo` は自動推定を
 /// 行わせないオプションで、両方指定する意味が無い（`--logo` があれば
@@ -138,13 +141,25 @@ fn dict_naming_source(config: &AnalyzeConfig) -> &Path {
 /// を直接組み立てて `analyze::run`/`auto::run` を呼ぶ経路（プログラム的な
 /// 呼び出し、および両モジュールの単体テスト）も同じ規則で弾くため、実処理
 /// （`WorkDir::new` や外部ツール解決）より前にここでも検査する。
-pub fn validate_logo_flags(logo: Option<&Path>, no_logo: bool) -> Result<()> {
+pub fn validate_logo_flags(
+    logo: Option<&Path>,
+    no_logo: bool,
+    ffmpeg_overrides: &FfmpegOverrides,
+) -> Result<()> {
     anyhow::ensure!(
         !(logo.is_some() && no_logo),
         "--logo と --no-logo は同時に指定できません（--logo は特定の .lgd を使う指定、\
          --no-logo は自動推定を行わない指定で、両立しません）"
     );
+    anyhow::ensure!(
+        !(no_logo && ffmpeg_overrides_enabled(ffmpeg_overrides)),
+        "--no-logo と ffmpeg 上書き（--logo-ffmpeg-input-arg / --logo-ffmpeg-vf）は同時に指定できません"
+    );
     Ok(())
+}
+
+fn ffmpeg_overrides_enabled(overrides: &FfmpegOverrides) -> bool {
+    !overrides.input_args.is_empty() || overrides.filter_template.is_some()
 }
 
 /// analyze パイプライン全体の成果物。
@@ -186,7 +201,11 @@ pub struct AnalyzeOutput {
 /// `.lgd` のパスを打ち間違えても外部プロセス2本ぶん待たされてから失敗して
 /// いた）。
 pub fn run(config: &AnalyzeConfig) -> Result<AnalyzeOutput> {
-    validate_logo_flags(config.logo.as_deref(), config.no_logo)?;
+    validate_logo_flags(
+        config.logo.as_deref(),
+        config.no_logo,
+        &config.ffmpeg_overrides,
+    )?;
 
     let dtvindex_path = tools::resolve_tool(DTVINDEX)?;
     let chapter_exe_path = tools::resolve_tool(CHAPTER_EXE)?;
@@ -350,10 +369,11 @@ fn run_pipeline(
             dict_dir,
             &no_logo_trim,
             dict_naming_source(config),
+            &config.ffmpeg_overrides,
         )?
     } else {
         // `--logo` があるときだけ動く経路（E14-8、issue #97）。フレーム数の不一致
-        // （`frames::stream_luma_frames` が内部で検査する。CLAUDE.md 罠3）は
+        // （`frames::stream_luma_frames_with` が内部で検査する。CLAUDE.md 罠3）は
         // ここで `?` によりエラーとして中断し、この時点ではまだ join_logo_scp を
         // 起動していない（issue #97「罠」: この検査は省略可能なオプションにせず、
         // 必ず join_logo_scp の起動前に済ませる）。
@@ -381,6 +401,7 @@ fn run_pipeline(
                     work.path(),
                     &dtvi_for_logo,
                     &work.logoframe_path(),
+                    &config.ffmpeg_overrides,
                 )?
             }
             None => None,
@@ -523,10 +544,11 @@ fn run_auto_logo_detection(
     dict_dir: &Path,
     no_logo_trim: &TrimList,
     naming_source: &Path,
+    ffmpeg_overrides: &FfmpegOverrides,
 ) -> Result<Option<PathBuf>> {
     let video_size = dtvi_video_size(dtvi)?;
     // `.dtvi` ヘッダの `frame_count` を使う（`dtvi.frames.len()` ではない）。
-    // `detect_logo`（`frames::stream_luma_frames` 経由）と `scan::run`
+    // `detect_logo` の全編デコードと `scan::run`
     // （`MakeLogoConfig::frame_count`）はどちらもこのヘッダ値を
     // `expected_frame_count` として使うため、規則を揃える（レビュー指摘）。
     // `dtvi.frames` はテスト用に意図的に切り詰められることがあり
@@ -556,6 +578,7 @@ fn run_auto_logo_detection(
             cwd,
             dtvi,
             logoframe_path,
+            ffmpeg_overrides,
         )? {
             eprintln!("[analyze] 辞書の候補で検出に成功しました。-inlogo を渡します。");
             return Ok(Some(inlogo));
@@ -661,6 +684,7 @@ fn run_auto_logo_detection(
             naming_source,
             candidate.estimated_rect,
             attempt,
+            ffmpeg_overrides,
         )? {
             CandidateOutcome::TrainingFailed(err) => {
                 eprintln!("[analyze] 候補{attempt}: 学習に失敗したため次候補へ進みます: {err}");
@@ -737,10 +761,11 @@ const SHARED_DECODE_PLAYBACK_LIMIT_BYTES: u64 = 1024 * 1024 * 1024;
 /// 崩壊して採用ロゴが変わることを確認済みのため棄却した。本関数は代わりに
 /// **同一のクロップ位置（同一の `-vf crop` 呼び出し）に対して1回だけ ffmpeg を
 /// 起動し、その出力を学習と検出の両方に再利用する**方式を採る。呼ばれる ffmpeg
-/// のコマンドライン・矩形・`-pix_fmt gray` は従来の `scan::run`/`detect_logo` と
-/// 完全に同一なので、得られる画素列は従来経路とバイト単位で同一になる（decode が
-/// 決定的——同じファイル・同じコマンドラインなら常に同じバイト列を返す——という、
-/// はるかに弱く安全な前提にしか依存しない）。
+/// のコマンドライン・矩形・`-pix_fmt gray` は `scan::run`/`detect_logo` の
+/// 全編デコードと揃えるので、得られる画素列は全編デコードの2パスとバイト単位で
+/// 同一になる。decode が決定的——同じファイル・同じコマンドラインなら常に
+/// 同じバイト列を返す——という、はるかに弱く安全な前提にしか依存しない。
+/// 上書き指定時も学習と検出に同じコマンドラインを使うため、この前提は変わらない。
 ///
 /// 再生バッファの推定サイズが [`SHARED_DECODE_PLAYBACK_LIMIT_BYTES`] を超える
 /// 場合は、上記の共有を諦めて [`train_and_detect_candidate_two_pass`]（従来どおり
@@ -757,6 +782,7 @@ fn train_and_detect_candidate(
     naming_source: &Path,
     rect: LogoRect,
     attempt: usize,
+    ffmpeg_overrides: &FfmpegOverrides,
 ) -> Result<CandidateOutcome> {
     // レビュー指摘（nit）: `scan::run`/`scan::finish_learner` と同じ検査を
     // デコード前に行う。この検査を省くと、奇数矩形を渡した場合に全編フル
@@ -793,6 +819,7 @@ fn train_and_detect_candidate(
             naming_source,
             rect,
             attempt,
+            ffmpeg_overrides,
         );
     }
 
@@ -802,26 +829,27 @@ fn train_and_detect_candidate(
     // 連結して保持する（検出時に `chunks_exact` で1枚ずつ戻す）。
     let mut playback = Vec::with_capacity(estimated_bytes as usize);
 
-    // ここで呼ぶ `stream_luma_frames` の引数（`rect`/`video_size`/フレーム数）は
+    // `stream_luma_frames_with` に渡す矩形・映像サイズ・フレーム数・上書き設定は
     // `scan::run` が組み立てる `MakeLogoConfig` と完全に同一。同じ ffmpeg
     // コマンドラインを1回だけ実行し、その出力を学習と検出の両方に使う。
     //
     // レビュー指摘（nit）: このデコードのエラー（フレーム数不一致・ffmpeg起動
     // 失敗等）は [`train_and_detect_candidate_two_pass`] が `scan::run` の
     // 失敗を扱う流儀と揃え、`TrainingFailed` として次候補へ進む（ハード
-    // アボートしない）。両経路とも `scan::run`/`stream_luma_frames` という
+    // アボートしない）。両経路とも `stream_luma_frames_with` という
     // 同じ関数を呼ぶため、失敗の扱いだけ経路によって変えると「候補の学習に
     // 失敗したら次候補へ進む」という直列ループの前提（issue #135「罠」）が
     // 経路依存になってしまう。全候補が同じ入力を同じ方法でデコードするため、
     // 実際に頻発するフレーム数不一致（環境要因）が起きれば以降の候補も同様に
     // 失敗し、`run_auto_logo_detection` は結局「ロゴ無し」へ収束する。
-    if let Err(err) = frames::stream_luma_frames(
+    if let Err(err) = frames::stream_luma_frames_with(
         ffmpeg_path,
         work_mp4,
         cwd,
         rect,
         video_size,
         u64::from(total_frames),
+        ffmpeg_overrides,
         |frame| {
             learner.add_frame(frame)?;
             playback.extend_from_slice(frame);
@@ -873,9 +901,9 @@ fn train_and_detect_candidate(
 }
 
 /// [`train_and_detect_candidate`] のフォールバック経路: 学習（[`scan::run`]）と
-/// 検出（[`detect_logo`]、変更なし）をそれぞれ別デコードで行う、issue #153 導入
-/// 前の挙動そのもの。[`SHARED_DECODE_PLAYBACK_LIMIT_BYTES`] を超える候補、または
-/// 将来デコード共有を切り離したくなった場合の退避先として残す。
+/// 検出（[`detect_logo`]）をそれぞれ別デコードで行う、issue #153 導入前の挙動。
+/// [`SHARED_DECODE_PLAYBACK_LIMIT_BYTES`] を超える候補、または将来デコード共有を
+/// 切り離したくなった場合の退避先として残す。上書き設定は学習と検出の両方に渡す。
 #[allow(clippy::too_many_arguments)]
 fn train_and_detect_candidate_two_pass(
     ffmpeg_path: &Path,
@@ -888,6 +916,7 @@ fn train_and_detect_candidate_two_pass(
     naming_source: &Path,
     rect: LogoRect,
     attempt: usize,
+    ffmpeg_overrides: &FfmpegOverrides,
 ) -> Result<CandidateOutcome> {
     let scan_config = scan::MakeLogoConfig {
         ffmpeg: ffmpeg_path.to_path_buf(),
@@ -896,6 +925,7 @@ fn train_and_detect_candidate_two_pass(
         rect,
         video_size,
         frame_count: u64::from(total_frames),
+        ffmpeg_overrides: ffmpeg_overrides.clone(),
         threshold: scan::DEFAULT_THRESHOLD,
         name: auto_logo_name(naming_source),
         service_id: scan::UNSPECIFIED_SERVICE_ID,
@@ -909,7 +939,7 @@ fn train_and_detect_candidate_two_pass(
     };
 
     // 学習した候補を一旦キャッシュ内に `.lgd` として書き、既存の
-    // `detect_logo`（変更なし）にそのまま渡す。
+    // `detect_logo` に渡す。
     let candidate_lgd_path = cwd.join(format!("logo-candidate-{attempt}.lgd"));
     scan::write_lgd(&scan_output.logo, &candidate_lgd_path)?;
 
@@ -920,6 +950,7 @@ fn train_and_detect_candidate_two_pass(
         cwd,
         dtvi,
         logoframe_path,
+        ffmpeg_overrides,
     )?;
     // 作業ディレクトリに書いた候補の `.lgd` は使い終わったら消す
     // （レビュー指摘: 失敗した候補ぶんが残ると紛らわしい。成功した場合も
@@ -1141,6 +1172,7 @@ fn detect_logo(
     cwd: &Path,
     dtvi: &Dtvi,
     logoframe_path: &Path,
+    ffmpeg_overrides: &FfmpegOverrides,
 ) -> Result<Option<PathBuf>> {
     let logo_data = lgd::read(lgd_path)?;
     let mask = score::LogoMask::new(&logo_data)
@@ -1151,8 +1183,10 @@ fn detect_logo(
     let expected_frame_count = dtvi_frame_count(dtvi)?;
 
     let lgd_bytes = fs::read(lgd_path).path_ctx(".lgd の読み込み（キャッシュキー用）", lgd_path)?;
-    let score_cache_file =
-        score_cache_path(cwd, score_cache_key(&lgd_bytes, expected_frame_count, dtvi));
+    let score_cache_file = score_cache_path(
+        cwd,
+        score_cache_key(&lgd_bytes, expected_frame_count, dtvi, ffmpeg_overrides),
+    );
 
     let mut scores: Vec<(f32, f32)> = Vec::new();
     let mut loaded_from_cache = false;
@@ -1166,16 +1200,30 @@ fn detect_logo(
     }
 
     if !loaded_from_cache {
-        scores = detect_logo_scores_hier(
-            ffmpeg_path,
-            work_mp4,
-            cwd,
-            &mask,
-            rect,
-            video_size,
-            dtvi,
-            expected_frame_count,
-        )?;
+        // 上書き時はプロセスごとの初期化を避け、同じ画素経路で全フレームを採点する。
+        scores = if ffmpeg_overrides_enabled(ffmpeg_overrides) {
+            decode_logo_scores_full(
+                ffmpeg_path,
+                work_mp4,
+                cwd,
+                &mask,
+                rect,
+                video_size,
+                expected_frame_count,
+                ffmpeg_overrides,
+            )?
+        } else {
+            detect_logo_scores_hier(
+                ffmpeg_path,
+                work_mp4,
+                cwd,
+                &mask,
+                rect,
+                video_size,
+                dtvi,
+                expected_frame_count,
+            )?
+        };
 
         if let Err(err) = write_score_cache(&score_cache_file, &scores) {
             eprintln!(
@@ -1264,10 +1312,9 @@ fn decide_inlogo_from_scores(
 // --- corr スコア列キャッシュ（issue #152、レビュー指摘で入力識別子と
 // フォーマット検査を追加） ---
 //
-// `detect_logo` の主コストは `frames::stream_luma_frames` による全編フル
-// デコード（実測30分1080pで約19秒）。その出力である `scores`（corr スコア列）
-// を `cwd`（キャッシュディレクトリ）内のファイルへ保存し、ロゴ・入力とも
-// 変わらない再実行ではデコードそのものを丸ごと省く。
+// `detect_logo` の主コストは全編フルデコード（実測30分1080pで約19秒）。
+// 採点した `scores`（corr スコア列）を `cwd` に保存する。
+// ロゴ・入力・上書き設定が一致する再実行ではデコードを省く。
 
 /// FNV-1a（64bit）の実装。`std::collections::hash_map::DefaultHasher` は
 /// バージョン間の安定性が保証されない（`Hasher` トレイトのドキュメントに
@@ -1285,9 +1332,9 @@ fn fnv1a_64(bytes: &[u8]) -> u64 {
     hash
 }
 
-/// キャッシュキー: `.lgd` のバイト列 + `expected_frame_count` + 入力ファイル
-/// 自体の識別子（`.dtvi` ヘッダの `source_size`/`source_mtime_ns`/
-/// `source_fingerprint`）から作る（issue #152「やること 2」、レビュー指摘）。
+/// キャッシュキーは `.lgd`、フレーム数、入力ファイルの識別子（`.dtvi` ヘッダの
+/// `source_size`/`source_mtime_ns`/`source_fingerprint`）から作る
+/// （issue #152「やること 2」、レビュー指摘）。ffmpeg 上書き設定もキーに含める。
 ///
 /// **レビュー指摘で発覚した実害**: 当初は `.lgd` + `expected_frame_count` だけ
 /// だったため、キャッシュファイルのパス（`score_cache_path`）は `cwd`
@@ -1303,27 +1350,45 @@ fn fnv1a_64(bytes: &[u8]) -> u64 {
 /// 「同じパスだが別内容」を確実に別キーにできる。
 ///
 /// `.lgd` が変わる（再学習・別ロゴ）、`.dtvi` の `frame_count` が変わる、
-/// または入力の実体が変わると必ず別キーになる。ヘッダにキーが無い場合
-/// （将来の `.dtvi` フォーマット変更等）も、値の有無自体を区別できるよう
-/// 存在フラグを1バイト挟んで連結する（「キーが無い」と「キーの値が空文字列」
-/// が同じバイト列に化けないようにするため）。全体を1回の FNV-1a に通す
-/// （FNV-1a はストリーミング可能で、別々にハッシュしてから混ぜるより衝突
-/// 耐性の議論が単純）。
-fn score_cache_key(lgd_bytes: &[u8], expected_frame_count: u64, dtvi: &Dtvi) -> u64 {
-    let mut buf = Vec::with_capacity(lgd_bytes.len() + 8);
-    buf.extend_from_slice(lgd_bytes);
+/// 入力の実体が変わる、または ffmpeg 上書き設定が変わると、別キーになるよう
+/// ハッシュに渡すバイト列を必ず変える。
+///
+/// 可変長の値にはバイト長を付ける。ヘッダ値とフィルターには1バイトの存在フラグも
+/// 付け、欠落と空文字列を区別する（将来の `.dtvi` フォーマット変更等でヘッダに
+/// キーが無い場合も、「キーが無い」と「キーの値が空文字列」が同じバイト列に
+/// 化けないようにするため）。入力引数は OS のバイト表現を件数と指定順で記録し、
+/// 引数の境界と非 UTF-8 のバイトを保つ。全体を1回の FNV-1a に通す
+/// （FNV-1a はストリーミング可能で、別々にハッシュしてから混ぜるより衝突耐性の
+/// 議論が単純）。
+fn score_cache_key(
+    lgd_bytes: &[u8],
+    expected_frame_count: u64,
+    dtvi: &Dtvi,
+    overrides: &FfmpegOverrides,
+) -> u64 {
+    fn append_bytes(buf: &mut Vec<u8>, bytes: &[u8]) {
+        buf.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+        buf.extend_from_slice(bytes);
+    }
+
+    let mut buf = Vec::with_capacity(lgd_bytes.len() + 16);
+    append_bytes(&mut buf, lgd_bytes);
     buf.extend_from_slice(&expected_frame_count.to_le_bytes());
     for key in ["source_size", "source_mtime_ns", "source_fingerprint"] {
-        match dtvi.header_value(key) {
-            Some(value) => {
-                buf.push(1);
-                buf.extend_from_slice(value.as_bytes());
-            }
-            None => buf.push(0),
+        let value = dtvi.header_value(key);
+        buf.push(u8::from(value.is_some()));
+        if let Some(value) = value {
+            append_bytes(&mut buf, value.as_bytes());
         }
-        // フィールドの区切り。値のバイト列の中に紛れ込んでも次のフィールドの
-        // 存在フラグ（0/1）が続くため境界の曖昧さは生じない。
-        buf.push(0xff);
+    }
+    buf.push(u8::from(ffmpeg_overrides_enabled(overrides)));
+    buf.extend_from_slice(&(overrides.input_args.len() as u64).to_le_bytes());
+    for arg in &overrides.input_args {
+        append_bytes(&mut buf, arg.as_encoded_bytes());
+    }
+    buf.push(u8::from(overrides.filter_template.is_some()));
+    if let Some(filter) = &overrides.filter_template {
+        append_bytes(&mut buf, filter.as_bytes());
     }
     fnv1a_64(&buf)
 }
@@ -1382,7 +1447,10 @@ const SCORE_CACHE_FORMAT_VERSION: u32 = 1;
 /// フルデコードへの切り替えを意味するが、キーが入力（`.lgd`・フレーム数・
 /// 入力識別子）を固定し、その入力に対してどちらの経路を通るかは決定的
 /// （同じ入力なら常に同じ経路になる）なため、タグの整合性は崩れない。
-const SCORE_CACHE_DERIVATION: u32 = 1;
+///
+/// `2` = 上書き無しの階層化（性能フォールバックを含む）と、上書き有効時の
+/// 全編デコード。ffmpeg 上書き設定もキャッシュキーに含める（issue #166）。
+const SCORE_CACHE_DERIVATION: u32 = 2;
 
 /// キャッシュファイルのヘッダ長（magic 4バイト + 形式版4バイト + 導出方法
 /// タグ4バイト + 要素数8バイト）。
@@ -1524,12 +1592,13 @@ const REQUIRED_STABLE_ROUNDS: u32 = 3;
 const HIER_FALLBACK_GOP_FRACTION_THRESHOLD: f64 = 0.4;
 
 /// 全編フルデコードで `(corr0, corr1)` スコア列を作る（issue #152 導入時点の
-/// 唯一の経路、[`detect_logo_scores_hier`] 導入前の `detect_logo` の実装から
-/// 1バイトも変えていない）。
+/// 唯一の経路）。上書き無しでは [`detect_logo_scores_hier`] 導入前の
+/// `detect_logo` と同じ ffmpeg 引数を使う。
 ///
-/// [`detect_logo_scores_hier`] が [`HIER_FALLBACK_GOP_FRACTION_THRESHOLD`] を
-/// 超えたときのフォールバック先として使う他、将来階層化そのものを無効化する
-/// 選択肢が要る場合の退避先にもなる。
+/// [`detect_logo_scores_hier`] が [`HIER_FALLBACK_GOP_FRACTION_THRESHOLD`] に
+/// 達し、部分デコードより全編デコードが有利になるときのフォールバック先として
+/// 残した。ロゴ用 ffmpeg の上書きが有効なときも、この全編経路を使う。
+#[allow(clippy::too_many_arguments)]
 fn decode_logo_scores_full(
     ffmpeg_path: &Path,
     work_mp4: &Path,
@@ -1538,15 +1607,17 @@ fn decode_logo_scores_full(
     rect: LogoRect,
     video_size: VideoSize,
     expected_frame_count: u64,
+    ffmpeg_overrides: &FfmpegOverrides,
 ) -> Result<Vec<(f32, f32)>> {
     let mut scores: Vec<(f32, f32)> = Vec::with_capacity(expected_frame_count as usize);
-    frames::stream_luma_frames(
+    frames::stream_luma_frames_with(
         ffmpeg_path,
         work_mp4,
         cwd,
         rect,
         video_size,
         expected_frame_count,
+        ffmpeg_overrides,
         |frame| {
             scores.push(mask.evaluate(frame));
             Ok(())
@@ -1754,6 +1825,7 @@ fn detect_logo_scores_hier(
                 rect,
                 video_size,
                 expected_frame_count,
+                &FfmpegOverrides::default(),
             );
         }
 
@@ -2555,26 +2627,36 @@ mod tests {
 
     #[test]
     fn validate_logo_flags_rejects_logo_and_no_logo_together() {
-        let err = validate_logo_flags(Some(Path::new("/tmp/logo.lgd")), true)
-            .expect_err("--logo と --no-logo の併用は拒否するはず");
+        let err = validate_logo_flags(
+            Some(Path::new("/tmp/logo.lgd")),
+            true,
+            &FfmpegOverrides::default(),
+        )
+        .expect_err("--logo と --no-logo の併用は拒否するはず");
         assert!(err.to_string().contains("--logo"));
         assert!(err.to_string().contains("--no-logo"));
     }
 
     #[test]
     fn validate_logo_flags_allows_logo_alone() {
-        validate_logo_flags(Some(Path::new("/tmp/logo.lgd")), false)
-            .expect("--logo 単独は許可されるはず");
+        validate_logo_flags(
+            Some(Path::new("/tmp/logo.lgd")),
+            false,
+            &FfmpegOverrides::default(),
+        )
+        .expect("--logo 単独は許可されるはず");
     }
 
     #[test]
     fn validate_logo_flags_allows_no_logo_alone() {
-        validate_logo_flags(None, true).expect("--no-logo 単独は許可されるはず");
+        validate_logo_flags(None, true, &FfmpegOverrides::default())
+            .expect("--no-logo 単独は許可されるはず");
     }
 
     #[test]
     fn validate_logo_flags_allows_both_omitted() {
-        validate_logo_flags(None, false).expect("両方省略（自動推定）も許可されるはず");
+        validate_logo_flags(None, false, &FfmpegOverrides::default())
+            .expect("両方省略（自動推定）も許可されるはず");
     }
 
     /// `frame_number`（表示順）だけを指定して最小限の `DtviFrame` を作る
@@ -2855,16 +2937,16 @@ mod tests {
     #[test]
     fn score_cache_key_differs_when_lgd_bytes_differ() {
         let dtvi = dtvi_with_header(&[]);
-        let key_a = score_cache_key(b"lgd-a", 100, &dtvi);
-        let key_b = score_cache_key(b"lgd-b", 100, &dtvi);
+        let key_a = score_cache_key(b"lgd-a", 100, &dtvi, &FfmpegOverrides::default());
+        let key_b = score_cache_key(b"lgd-b", 100, &dtvi, &FfmpegOverrides::default());
         assert_ne!(key_a, key_b, ".lgd が変われば別キーになるはず");
     }
 
     #[test]
     fn score_cache_key_differs_when_frame_count_differs() {
         let dtvi = dtvi_with_header(&[]);
-        let key_a = score_cache_key(b"same-lgd", 100, &dtvi);
-        let key_b = score_cache_key(b"same-lgd", 101, &dtvi);
+        let key_a = score_cache_key(b"same-lgd", 100, &dtvi, &FfmpegOverrides::default());
+        let key_b = score_cache_key(b"same-lgd", 101, &dtvi, &FfmpegOverrides::default());
         assert_ne!(key_a, key_b, "frame_count が変われば別キーになるはず");
     }
 
@@ -2888,9 +2970,9 @@ mod tests {
             ("source_mtime_ns", "111"),
             ("source_fingerprint", "bbbb"),
         ]);
-        let key_a = score_cache_key(b"same-lgd", 100, &dtvi_a);
-        let key_b = score_cache_key(b"same-lgd", 100, &dtvi_b);
-        let key_c = score_cache_key(b"same-lgd", 100, &dtvi_c);
+        let key_a = score_cache_key(b"same-lgd", 100, &dtvi_a, &FfmpegOverrides::default());
+        let key_b = score_cache_key(b"same-lgd", 100, &dtvi_b, &FfmpegOverrides::default());
+        let key_c = score_cache_key(b"same-lgd", 100, &dtvi_c, &FfmpegOverrides::default());
         assert_ne!(key_a, key_b, "source_size が変われば別キーになるはず");
         assert_ne!(
             key_a, key_c,
@@ -2904,12 +2986,135 @@ mod tests {
         // ことを確認する（score_cache_key の存在フラグの目的）。
         let dtvi_missing = dtvi_with_header(&[]);
         let dtvi_empty = dtvi_with_header(&[("source_size", "")]);
-        let key_missing = score_cache_key(b"lgd", 100, &dtvi_missing);
-        let key_empty = score_cache_key(b"lgd", 100, &dtvi_empty);
+        let key_missing = score_cache_key(b"lgd", 100, &dtvi_missing, &FfmpegOverrides::default());
+        let key_empty = score_cache_key(b"lgd", 100, &dtvi_empty, &FfmpegOverrides::default());
         assert_ne!(
             key_missing, key_empty,
             "ヘッダに無い場合と空文字列の場合は別キーになるはず"
         );
+    }
+
+    #[test]
+    fn score_cache_key_distinguishes_ffmpeg_overrides() {
+        let dtvi = dtvi_with_header(&[]);
+        let overrides = [
+            FfmpegOverrides::default(),
+            FfmpegOverrides {
+                input_args: vec!["ab".into(), "c".into()],
+                filter_template: None,
+            },
+            FfmpegOverrides {
+                input_args: vec!["a".into(), "bc".into()],
+                filter_template: None,
+            },
+            FfmpegOverrides {
+                input_args: vec!["c".into(), "ab".into()],
+                filter_template: None,
+            },
+            FfmpegOverrides {
+                input_args: vec!["ab c".into()],
+                filter_template: None,
+            },
+            FfmpegOverrides {
+                input_args: vec![],
+                filter_template: Some(String::new()),
+            },
+            FfmpegOverrides {
+                input_args: vec![],
+                filter_template: Some("crop={w}:{h}:{x}:{y}".into()),
+            },
+            FfmpegOverrides {
+                input_args: vec![],
+                filter_template: Some("crop={w}:{h}:{x}:{y},format=gray".into()),
+            },
+        ];
+        let keys: std::collections::HashSet<_> = overrides
+            .iter()
+            .map(|overrides| score_cache_key(b"lgd", 100, &dtvi, overrides))
+            .collect();
+        assert_eq!(keys.len(), overrides.len());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn detect_logo_overrides_decode_once_and_check_frame_count() {
+        let dir = unique_scratch_dir("detect-logo-ffmpeg-overrides");
+        let input = dir.join("input.mp4");
+        fs::write(&input, []).unwrap();
+        let lgd = dir.join("logo.lgd");
+        let logo = LogoData {
+            w: 8,
+            h: 8,
+            log_uv_x: 1,
+            log_uv_y: 1,
+            imgw: 8,
+            imgh: 8,
+            imgx: 0,
+            imgy: 0,
+            name: "test".into(),
+            service_id: 0,
+            a_y: vec![1.0; 64],
+            b_y: vec![0.0; 64],
+            a_u: vec![1.0; 16],
+            b_u: vec![0.0; 16],
+            a_v: vec![1.0; 16],
+            b_v: vec![0.0; 16],
+        };
+        scan::write_lgd(&logo, &lgd).unwrap();
+        let ffmpeg = dir.join("ffmpeg");
+        write_executable_script(
+            &ffmpeg,
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" >> ffmpeg-args\nprintf '%064d' 0\n",
+        );
+        let logoframe = dir.join("logoframe.txt");
+        let args_log = dir.join("ffmpeg-args");
+        let detect = |frame_count: &str, overrides: &FfmpegOverrides| {
+            // 階層化の入口では空のフレーム表を拒否する。全編経路は実デコード数を検査する。
+            let dtvi = dtvi_with_header(&[
+                ("width", "8"),
+                ("height", "8"),
+                ("frame_count", frame_count),
+            ]);
+            detect_logo(&ffmpeg, &lgd, &input, &dir, &dtvi, &logoframe, overrides)
+        };
+        let err = detect("1", &FfmpegOverrides::default()).unwrap_err();
+        assert!(err.to_string().contains(".dtvi のフレーム表"));
+        assert!(!args_log.exists());
+
+        for (overrides, expected_filter) in [
+            (
+                FfmpegOverrides {
+                    input_args: vec!["-threads".into(), "1".into()],
+                    filter_template: None,
+                },
+                "crop=8:8:0:0",
+            ),
+            (
+                FfmpegOverrides {
+                    input_args: vec![],
+                    filter_template: Some("crop={w}:{h}:{x}:{y},format=gray".into()),
+                },
+                "crop=8:8:0:0,format=gray",
+            ),
+        ] {
+            assert!(detect("1", &overrides).unwrap().is_none());
+            let logged = fs::read_to_string(&args_log).unwrap();
+            assert_eq!(logged.lines().filter(|arg| *arg == "-i").count(), 1);
+            assert!(!logged
+                .lines()
+                .any(|arg| arg == "-skip_frame" || arg == "-ss"));
+            assert!(logged.contains(&format!("-vf\n{expected_filter}\n")));
+            if !overrides.input_args.is_empty() {
+                assert!(logged.contains("\n-threads\n1\n-i\n"));
+            }
+            fs::remove_file(&args_log).unwrap();
+
+            let err = detect("2", &overrides).unwrap_err();
+            assert!(format!("{err:#}").contains("フレーム数"), "{err:#}");
+            assert!(args_log.exists());
+            fs::remove_file(&args_log).unwrap();
+        }
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     // --- 候補ごとの学習+検出の1回デコード共有（issue #153）: ffmpeg を起動しない
@@ -3041,6 +3246,7 @@ mod tests {
             Path::new("input"),
             odd_rect,
             1,
+            &FfmpegOverrides::default(),
         );
         let err = result.expect_err("奇数矩形はエラーになるはず");
         assert!(
@@ -3078,6 +3284,7 @@ mod tests {
             Path::new("input"),
             even_rect,
             1,
+            &FfmpegOverrides::default(),
         );
         match result {
             Ok(CandidateOutcome::TrainingFailed(_)) => {}
@@ -3193,6 +3400,7 @@ mod tests {
             jls_set: vec![],
             jl_file: None,
             logo: None,
+            ffmpeg_overrides: FfmpegOverrides::default(),
             no_logo: true,
             logo_dir: None,
             source_name_hint: None,
@@ -3263,6 +3471,7 @@ mod tests {
             jls_set: vec![],
             jl_file: None,
             logo: None,
+            ffmpeg_overrides: FfmpegOverrides::default(),
             no_logo: true,
             logo_dir: None,
             source_name_hint: None,
@@ -3346,6 +3555,7 @@ mod tests {
             jls_set: vec![],
             jl_file: None,
             logo: None,
+            ffmpeg_overrides: FfmpegOverrides::default(),
             no_logo: true,
             logo_dir: None,
             source_name_hint: None,
@@ -3371,6 +3581,7 @@ mod tests {
             jls_set: vec![],
             jl_file: None,
             logo: None,
+            ffmpeg_overrides: FfmpegOverrides::default(),
             no_logo: true,
             logo_dir: None,
             source_name_hint: None,
@@ -3418,6 +3629,7 @@ mod tests {
             jls_set: vec![],
             jl_file: None,
             logo: None,
+            ffmpeg_overrides: FfmpegOverrides::default(),
             no_logo: true,
             logo_dir: None,
             source_name_hint: None,

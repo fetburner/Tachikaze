@@ -1,8 +1,9 @@
+use std::ffi::OsString;
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
-use crate::logo::frames::LogoRect;
+use crate::logo::frames::{FfmpegOverrides, LogoRect};
 use crate::logo::scan;
 
 #[derive(Debug, Parser)]
@@ -100,8 +101,9 @@ pub struct AnalyzeArgs {
     /// 指定時のみこの `.lgd` でロゴ検出を行い、検出フレーム割合が閾値以上かつ
     /// logoframe の出力が空でなければキャッシュへ書いて join_logo_scp に
     /// `-inlogo` を渡す。それ以外はフォールバックして渡さない（`src/analyze.rs`
-    /// の doc comment `inlogo_decision`参照）。**指定したときの挙動は
-    /// 1バイトも変わらない（#97/#135）。** `--no-logo` と同時には指定できない。
+    /// の doc comment `inlogo_decision`参照）。
+    /// **ロゴ用 ffmpeg の上書きを省略すれば、指定したときの挙動は従来と1バイトも変わらない（#97/#135）。**
+    /// `--no-logo` と同時には指定できない。
     #[arg(long)]
     pub logo: Option<PathBuf>,
 
@@ -110,7 +112,10 @@ pub struct AnalyzeArgs {
     /// 従来どおり常にロゴ無し（`-inlogo` を渡さない）で処理したい場合に使う。
     /// `--logo` と同時には指定できない（`--logo` があれば明示の `.lgd` を
     /// 使うため、`--no-logo` を付ける意味が無い）。
-    #[arg(long = "no-logo", conflicts_with = "logo")]
+    #[arg(
+        long = "no-logo",
+        conflicts_with_all = ["logo", "logo_ffmpeg_input_arg", "logo_ffmpeg_vf"]
+    )]
     pub no_logo: bool,
 
     /// ロゴ辞書（学習済み `.lgd` を蓄積するディレクトリ）の場所を上書きする。
@@ -119,6 +124,9 @@ pub struct AnalyzeArgs {
     /// 参照）を使う。`--logo`/`--no-logo` 指定時は辞書を読み書きしないため無視する。
     #[arg(long = "logo-dir")]
     pub logo_dir: Option<PathBuf>,
+
+    #[command(flatten)]
+    pub logo_ffmpeg: LogoFfmpegArgs,
 }
 
 #[derive(Debug, Args)]
@@ -257,18 +265,25 @@ pub struct AutoArgs {
     #[arg(long = "jls-set")]
     pub jls_set: Vec<String>,
 
-    /// ロゴ検出に使う `.lgd`（`analyze --logo` と同じ）。指定したときの挙動は
-    /// 1バイトも変わらない。`--no-logo` と同時には指定できない。
+    /// ロゴ検出に使う `.lgd`（`analyze --logo` と同じ）。
+    /// ロゴ用 ffmpeg の上書きを省略すれば、指定したときの挙動は従来と1バイトも変わらない（#97/#135）。
+    /// `--no-logo` と同時には指定できない。
     #[arg(long)]
     pub logo: Option<PathBuf>,
 
     /// 自動推定によるロゴ検出を行わない（`analyze --no-logo` と同じ）。
-    #[arg(long = "no-logo", conflicts_with = "logo")]
+    #[arg(
+        long = "no-logo",
+        conflicts_with_all = ["logo", "logo_ffmpeg_input_arg", "logo_ffmpeg_vf"]
+    )]
     pub no_logo: bool,
 
     /// ロゴ辞書の場所を上書きする（`analyze --logo-dir` と同じ）。
     #[arg(long = "logo-dir")]
     pub logo_dir: Option<PathBuf>,
+
+    #[command(flatten)]
+    pub logo_ffmpeg: LogoFfmpegArgs,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -310,6 +325,29 @@ pub struct MakeLogoArgs {
     /// 単色背景ではない（ロゴの外側に映像が写っている）として学習から除外する。
     #[arg(long, default_value_t = scan::DEFAULT_THRESHOLD)]
     pub threshold: u8,
+
+    #[command(flatten)]
+    pub logo_ffmpeg: LogoFfmpegArgs,
+}
+
+#[derive(Debug, Args)]
+pub struct LogoFfmpegArgs {
+    /// ロゴ用 ffmpeg の -i より前に渡す1引数（繰り返し可）。環境固有。既定では使わない。レシピは README 参照。
+    #[arg(long, value_name = "ARG", allow_hyphen_values = true)]
+    logo_ffmpeg_input_arg: Vec<OsString>,
+
+    /// ロゴ用 ffmpeg の -vf を上書きする（{x}/{y}/{w}/{h} を矩形に展開）。環境固有。既定では使わない。レシピは README 参照。
+    #[arg(long, value_name = "FILTER")]
+    logo_ffmpeg_vf: Option<String>,
+}
+
+impl From<LogoFfmpegArgs> for FfmpegOverrides {
+    fn from(args: LogoFfmpegArgs) -> Self {
+        Self {
+            input_args: args.logo_ffmpeg_input_arg,
+            filter_template: args.logo_ffmpeg_vf,
+        }
+    }
 }
 
 /// `--rect x,y,w,h` を [`LogoRect`] にパースする（clap の `value_parser`）。
@@ -428,6 +466,91 @@ mod tests {
         ])
         .expect_err("--logo と --no-logo の併用は拒否するはず");
         assert!(err.to_string().contains("no-logo") || err.to_string().contains("logo"));
+    }
+
+    #[test]
+    fn logo_ffmpeg_options_preserve_arguments_and_describe_their_use() {
+        for command in [
+            &["analyze", "in.mp4"][..],
+            &["auto", "in.mp4", "-o", "out.mp4"],
+            &[
+                "make-logo",
+                "in.mp4",
+                "--rect",
+                "10,20,100,40",
+                "-o",
+                "out.lgd",
+            ],
+        ] {
+            let argv = ["tachikaze"].into_iter().chain(command.iter().copied());
+            let cli = Cli::try_parse_from(argv.clone().chain([
+                "--logo-ffmpeg-input-arg=-hwaccel",
+                "--logo-ffmpeg-input-arg",
+                "-threads",
+                "--logo-ffmpeg-input-arg=device with spaces",
+                "--logo-ffmpeg-vf=crop={w}:{h}:{x}:{y},format=gray",
+            ]))
+            .unwrap();
+            let overrides = FfmpegOverrides::from(match cli.command {
+                Commands::Analyze(args) => args.logo_ffmpeg,
+                Commands::Auto(args) => args.logo_ffmpeg,
+                Commands::MakeLogo(args) => args.logo_ffmpeg,
+                _ => unreachable!(),
+            });
+            assert_eq!(
+                overrides.input_args,
+                ["-hwaccel", "-threads", "device with spaces"]
+            );
+            assert_eq!(
+                overrides.filter_template.as_deref(),
+                Some("crop={w}:{h}:{x}:{y},format=gray")
+            );
+
+            let err = Cli::try_parse_from(argv.clone().chain(["--help"])).unwrap_err();
+            assert_eq!(err.kind(), clap::error::ErrorKind::DisplayHelp);
+            let help = err.to_string();
+            assert!(help.contains("--logo-ffmpeg-input-arg <ARG>"));
+            assert!(help.contains("--logo-ffmpeg-vf <FILTER>"));
+            assert_eq!(
+                help.matches("環境固有。既定では使わない。レシピは README 参照")
+                    .count(),
+                2
+            );
+
+            let err = Cli::try_parse_from(
+                argv.chain(["--logo-ffmpeg-vf=first", "--logo-ffmpeg-vf=second"]),
+            )
+            .unwrap_err();
+            assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+        }
+    }
+
+    #[test]
+    fn no_logo_conflicts_with_each_ffmpeg_override() {
+        for command in [
+            &["analyze", "in.mp4"][..],
+            &["auto", "in.mp4", "-o", "out.mp4"],
+        ] {
+            for (option, arg) in [
+                (
+                    "--logo-ffmpeg-input-arg",
+                    "--logo-ffmpeg-input-arg=-threads",
+                ),
+                ("--logo-ffmpeg-vf", "--logo-ffmpeg-vf=crop={w}:{h}:{x}:{y}"),
+            ] {
+                let err = Cli::try_parse_from(
+                    ["tachikaze"]
+                        .into_iter()
+                        .chain(command.iter().copied())
+                        .chain([arg, "--no-logo"]),
+                )
+                .unwrap_err();
+                assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+                let message = err.to_string();
+                assert!(message.contains("--no-logo"));
+                assert!(message.contains(option));
+            }
+        }
     }
 
     #[test]
