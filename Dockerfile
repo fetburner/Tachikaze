@@ -3,8 +3,7 @@
 # Linux (arm64) 向けマルチステージビルド。実測は docs/docker.md 参照。
 #
 # tools:     外部3ツール（chapter_exe / join_logo_scp / dtvindex）をソースからビルド。
-#            3ツールは本リポジトリに含まれないため git clone する
-#            （バージョン留めなし。pin したい場合はここに commit SHA を指定する）。
+#            commit SHA は scripts/build-external-tools.sh で固定する。
 #            runtime と同じ debian:trixie でビルドし、libav の共有ライブラリ版を揃える。
 # tachikaze: 公式 rust イメージで本体を cargo build。rustup は不要。
 # runtime:   ビルド済みバイナリと join_logo_scp の JL ルールファイル、ffmpeg/ffprobe
@@ -39,25 +38,8 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 
 WORKDIR /build
 
-# join_logo_scp: 無修正でビルドできる（docs/toolchain-macos.md で macOS でも無修正と
-# 確認済み。Linux でも同様。実測は docs/docker.md）。
-RUN git clone --depth 1 https://github.com/tobitti0/join_logo_scp.git \
-    && cd join_logo_scp/src && make
-
-# dtvindex: 無修正でビルドできる。chapter_exe の Makefile が兄弟ディレクトリ
-# （../../dtvindex、つまり /build/dtvindex）を自動検出するため、chapter_exe と
-# 同じ /build 直下に置く。
-RUN git clone --depth 1 https://github.com/tobitti0/dtvindex.git \
-    && cd dtvindex && make
-
-# chapter_exe: docs/toolchain-macos.md に書かれている3点パッチ（malloc.h /
-# memalign / uname -m の SIMD 分岐）はいずれも macOS 固有の問題で、Linux (arm64)
-# では不要（実測。詳細は docs/docker.md）。無修正で `make` が
-# `AviSynth=enabled, dtvindex=enabled` になることをビルド時ログで確認する。
-RUN git clone --depth 1 https://github.com/tobitti0/chapter_exe.git \
-    && cd chapter_exe/src && make \
-    && ./chapter_exe -v 2>&1 | grep -q 'dtvindex=enabled' \
-    || (echo 'chapter_exe が dtvindex=enabled でビルドされていません' >&2 && exit 1)
+COPY scripts/build-external-tools.sh /build/build-external-tools.sh
+RUN /build/build-external-tools.sh /build /usr/local
 
 # ---------------------------------------------------------------------------
 # tachikaze 本体
@@ -100,11 +82,11 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     ca-certificates \
     $TACHIKAZE_EXTRA_APT
 
-COPY --from=tools /build/chapter_exe/src/chapter_exe /usr/local/bin/chapter_exe
-COPY --from=tools /build/join_logo_scp/src/join_logo_scp /usr/local/bin/join_logo_scp
-COPY --from=tools /build/dtvindex/build/dtvindex /usr/local/bin/dtvindex
+COPY --from=tools /usr/local/bin/chapter_exe /usr/local/bin/chapter_exe
+COPY --from=tools /usr/local/bin/join_logo_scp /usr/local/bin/join_logo_scp
+COPY --from=tools /usr/local/bin/dtvindex /usr/local/bin/dtvindex
 COPY --from=tachikaze /usr/local/bin/tachikaze /usr/local/bin/tachikaze
-COPY --from=tools /build/join_logo_scp/JL/ /usr/local/share/join_logo_scp/JL/
+COPY --from=tools /usr/local/share/join_logo_scp/JL/ /usr/local/share/join_logo_scp/JL/
 
 # 出力は入力の隣に書く方針（変更しない）。メディアディレクトリは docker run 時に
 # rw でマウントすること（docs/docker.md）。
