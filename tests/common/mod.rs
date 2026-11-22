@@ -223,6 +223,37 @@ pub fn tools_available() -> bool {
     true
 }
 
+// --- 偽ツールのスクリプト作成（`auto_e2e.rs` が使う） ---
+
+/// `path` に `script` の内容を書き、実行権限を付与する。
+///
+/// `auto` の E2E が `dtvindex` / `chapter_exe` / `join_logo_scp` の偽ツール
+/// （シェルスクリプト）を作るために使う。現状の利用箇所は `auto_e2e.rs` のみだが、
+/// 他のテストが外部ツールを偽装する必要が生じたときのために置き場所は `common` に
+/// している。
+#[allow(dead_code)]
+#[cfg(unix)]
+pub fn write_executable_script(path: &Path, script: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::write(path, script).expect("スクリプトを書けること");
+    let mut perms = std::fs::metadata(path).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(path, perms).expect("実行権限を付与できること");
+}
+
+/// `dir` を既存の `PATH` の先頭に前置した文字列を返す（外部ツールの解決先を
+/// 差し替える唯一の手段が `PATH` の書き換えであるため、子プロセスの `PATH` に
+/// 偽ツールを注入するためのヘルパ）。
+#[allow(dead_code)]
+pub fn prepend_path(dir: &Path) -> std::ffi::OsString {
+    let mut value = dir.as_os_str().to_os_string();
+    if let Some(existing) = std::env::var_os("PATH") {
+        value.push(":");
+        value.push(existing);
+    }
+    value
+}
+
 // `mod common;` を宣言する統合テストバイナリごとに複製されて実行されるが、子プロセス内で検証するため重複実行しても問題ない。
 #[cfg(test)]
 mod tests {
@@ -278,35 +309,4 @@ mod tests {
             assert!(result.expect("optional prerequisites must not panic"));
         }
     }
-}
-
-// --- 偽ツールのスクリプト作成（`auto_e2e.rs` が使う） ---
-
-/// `path` に `script` の内容を書き、実行権限を付与する。
-///
-/// `auto` の E2E が `dtvindex` / `chapter_exe` / `join_logo_scp` の偽ツール
-/// （シェルスクリプト）を作るために使う。現状の利用箇所は `auto_e2e.rs` のみだが、
-/// 他のテストが外部ツールを偽装する必要が生じたときのために置き場所は `common` に
-/// している。
-#[allow(dead_code)]
-#[cfg(unix)]
-pub fn write_executable_script(path: &Path, script: &str) {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::write(path, script).expect("スクリプトを書けること");
-    let mut perms = std::fs::metadata(path).unwrap().permissions();
-    perms.set_mode(0o755);
-    std::fs::set_permissions(path, perms).expect("実行権限を付与できること");
-}
-
-/// `dir` を既存の `PATH` の先頭に前置した文字列を返す（外部ツールの解決先を
-/// 差し替える唯一の手段が `PATH` の書き換えであるため、子プロセスの `PATH` に
-/// 偽ツールを注入するためのヘルパ）。
-#[allow(dead_code)]
-pub fn prepend_path(dir: &Path) -> std::ffi::OsString {
-    let mut value = dir.as_os_str().to_os_string();
-    if let Some(existing) = std::env::var_os("PATH") {
-        value.push(":");
-        value.push(existing);
-    }
-    value
 }
