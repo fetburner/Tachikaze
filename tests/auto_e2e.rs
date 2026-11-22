@@ -189,7 +189,7 @@ fn auto_completes_full_pipeline_with_fake_tools() {
         return;
     }
     if !ffprobe_available() {
-        eprintln!("ffprobe が無いためスキップします。");
+        common::skip("ffprobe が無いためスキップします。");
         return;
     }
 
@@ -261,7 +261,7 @@ fn auto_ignore_gate_overrides_gate_stop_but_gate_alone_stops_without_it() {
         return;
     }
     if !ffprobe_available() {
-        eprintln!("ffprobe が無いためスキップします。");
+        common::skip("ffprobe が無いためスキップします。");
         return;
     }
 
@@ -430,7 +430,7 @@ fn analyze_and_cut_support_dash_for_stdout_and_stdin() {
         return;
     }
     if !ffprobe_available() {
-        eprintln!("ffprobe が無いためスキップします。");
+        common::skip("ffprobe が無いためスキップします。");
         return;
     }
 

@@ -363,10 +363,11 @@ mod tests {
 
         // cwd 非依存にする（`external::tests` がプロセスの cwd を一時的に変えるため）。
         const FIXTURE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/sample.mp4");
-        if !Path::new(FIXTURE).exists() {
-            eprintln!(
+        if !Path::new(FIXTURE).exists()
+            && crate::test_support::skip(&format!(
                 "{FIXTURE} が無いためスキップします。`tests/fixtures/gen.sh` を実行してください。"
-            );
+            ))
+        {
             return;
         }
 

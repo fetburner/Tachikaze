@@ -1210,10 +1210,9 @@ mod tests {
         if Path::new(FIXTURE).exists() {
             return false;
         }
-        eprintln!(
+        crate::test_support::skip(&format!(
             "{FIXTURE} が無いためスキップします。`tests/fixtures/gen.sh` を実行してください。"
-        );
-        true
+        ))
     }
 
     /// フィクスチャ(GOP120・599フレーム)から、cut_and_verify を呼ぶのに必要な一式を
@@ -1784,7 +1783,9 @@ mod tests {
         match crate::tools::resolve_tool(crate::tools::FFPROBE) {
             Ok(path) => Some(path),
             Err(err) => {
-                eprintln!("ffprobe が見つからないためスキップします: {err}");
+                crate::test_support::skip(&format!(
+                    "ffprobe が見つからないためスキップします: {err}"
+                ));
                 None
             }
         }

@@ -45,3 +45,6 @@ pub mod tools;
 pub mod trim;
 pub mod verify;
 pub mod workdir;
+
+#[cfg(test)]
+mod test_support;

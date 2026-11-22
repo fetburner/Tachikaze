@@ -50,6 +50,8 @@ $ npm ci && npm run docs-lint  # ドキュメントの文面検査（CI の docs
 
 外部3ツール（chapter_exe / join_logo_scp / dtvindex）の用意は [docs/toolchain-macos.md](docs/toolchain-macos.md)。**テストは3ツールが有る環境でも無い環境でも通る**（どちらか一方でしか通らない状態にしないこと）。「ツールが見つからない」ことを期待するテストは、ツールを `PATH` に入れた環境では前提が崩れる。そのため子プロセスの `PATH` を空にして自分で条件を作る。例は `tests/auto_e2e.rs` の `run_auto_without_tools`。`src/analyze.rs` の `run_propagates_tool_resolution_failure_with_searched_locations` も同様。
 
+`TACHIKAZE_REQUIRE_TEST_PREREQS=1` を設定すると、フィクスチャや ffmpeg / ffprobe が欠けたテストはスキップせずに失敗する。前提を揃えた環境（CI の E2E ジョブ）で使う。未設定なら、欠けたテストはスキップして成功扱いになる。
+
 フィクスチャの**音声は時間変化する信号**にしてある（定常サイン波ではコーデックによって音声パケットが同一バイト列になり、罠 4 を検出できない）。`gen.sh` は Opus 版 `sample.mp4` と AAC 版 `sample_aac.mp4` を同じ映像条件で生成する。映像側のパラメータを変えると `tests/data/sample.dtvi` が使えなくなるので変えないこと。
 
 ## 静かに壊れる 4 つの罠
