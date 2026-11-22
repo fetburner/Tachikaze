@@ -406,6 +406,8 @@ fn validate_stsc(entries: &[mp4_atom::StscEntry], n_chunks: u32) -> anyhow::Resu
 mod tests {
     use super::*;
 
+    static FFPROBE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// フィクスチャ: H.264 (Avc1) + Opus, GOP 120, 30000/1001fps の mp4。
     /// `tests/fixtures/gen.sh` で生成する。無ければスキップする。
     // cwd 非依存にする（`external::tests` がプロセスの cwd を一時的に変えるため）。
@@ -690,10 +692,15 @@ mod tests {
     }
 
     fn skip_if_ffprobe_missing() -> bool {
-        match std::process::Command::new("ffprobe")
-            .arg("-version")
-            .output()
-        {
+        let result = {
+            let _guard = FFPROBE_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            std::process::Command::new("ffprobe")
+                .arg("-version")
+                .output()
+        };
+        match result {
             Ok(output) if output.status.success() => false,
             _ => {
                 eprintln!("ffprobe が無いためスキップします。");
@@ -713,21 +720,43 @@ mod tests {
     ///
     /// 出力はストリームのデコード順（ファイルに格納されている順）そのものなので、
     /// こちらで復元したサンプル一覧とインデックスをそのまま突き合わせられる。
+    ///
+    /// このテストの ffprobe 起動失敗は、以前 macOS の master で8回中4回再現した。
+    /// Linux の Debian trixie コンテナ（2コア）では3回回して再現しなかった。
+    /// 今回は起動失敗時に kind と raw_os_error を出すようにして、macOS arm64 で
+    /// cargo test を10回実行したが再現せず、エラーの種類を特定できなかった。
+    /// そのため一時エラーに限った再試行ではなく、このモジュール内での直列化を選んだ。
+    ///
+    /// この Mutex が直列化するのは mp4io::read::tests 内の ffprobe 起動だけで、
+    /// 他モジュールが起動する ffprobe や ffmpeg は対象外である。モジュール外との
+    /// 競合は残るが、同じモジュールから同時に起動する ffprobe は抑えられる。
+    /// 起動失敗はスキップせず、kind と OS エラー番号を付けてテストを失敗させる。
     fn ffprobe_packets(stream_selector: &str) -> Vec<FfprobePacket> {
-        let output = std::process::Command::new("ffprobe")
-            .args([
-                "-v",
-                "error",
-                "-select_streams",
-                stream_selector,
-                "-show_entries",
-                "packet=size,pos,flags",
-                "-of",
-                "compact=p=0",
-                FIXTURE,
-            ])
-            .output()
-            .expect("ffprobe を起動できること");
+        let result = {
+            let _guard = FFPROBE_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            std::process::Command::new("ffprobe")
+                .args([
+                    "-v",
+                    "error",
+                    "-select_streams",
+                    stream_selector,
+                    "-show_entries",
+                    "packet=size,pos,flags",
+                    "-of",
+                    "compact=p=0",
+                    FIXTURE,
+                ])
+                .output()
+        };
+        let output = result.unwrap_or_else(|error| {
+            panic!(
+                "ffprobe を起動できること: kind={:?}, raw_os_error={:?}: {error}",
+                error.kind(),
+                error.raw_os_error()
+            )
+        });
         assert!(
             output.status.success(),
             "ffprobe が失敗した: {:?}",
