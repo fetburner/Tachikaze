@@ -91,6 +91,7 @@ fn run_auto(cache_dir: Option<PathBuf>, args: AutoArgs) -> anyhow::Result<ExitOu
         logo,
         no_logo,
         logo_dir,
+        logo_ffmpeg,
     } = args;
 
     let config = auto::AutoConfig {
@@ -108,6 +109,7 @@ fn run_auto(cache_dir: Option<PathBuf>, args: AutoArgs) -> anyhow::Result<ExitOu
         logo,
         no_logo,
         logo_dir,
+        ffmpeg_overrides: logo_ffmpeg.into(),
     };
 
     match auto::run(&config, &input)? {
@@ -153,6 +155,7 @@ fn run_make_logo(args: MakeLogoArgs) -> anyhow::Result<()> {
         rect,
         output,
         threshold,
+        logo_ffmpeg,
     } = args;
 
     reject_dash_output(&output, "-o/--output")?;
@@ -182,6 +185,7 @@ fn run_make_logo(args: MakeLogoArgs) -> anyhow::Result<()> {
         video_size,
         frame_count,
         threshold,
+        ffmpeg_overrides: logo_ffmpeg.into(),
         name: logo_name_from_input(&input),
         service_id: logo::scan::UNSPECIFIED_SERVICE_ID,
     };
@@ -398,6 +402,7 @@ fn run_analyze(cache_dir: Option<PathBuf>, args: AnalyzeArgs) -> anyhow::Result<
         logo,
         no_logo,
         logo_dir,
+        logo_ffmpeg,
     } = args;
 
     let jls_set = jls_set
@@ -420,6 +425,7 @@ fn run_analyze(cache_dir: Option<PathBuf>, args: AnalyzeArgs) -> anyhow::Result<
         logo,
         no_logo,
         logo_dir,
+        ffmpeg_overrides: logo_ffmpeg.into(),
         // `analyze` を直接叩く経路では `input` が既にユーザー入力そのものなので
         // 上書きは不要（`AnalyzeConfig::source_name_hint` の doc comment参照。
         // `auto` 経由のときだけ `auto::build_analyze_config` が設定する）。

@@ -35,7 +35,7 @@
 //!
 //! ## クロマ平面は学習しない
 //!
-//! フレーム供給（[`super::frames::stream_luma_frames`]）は輝度平面のみを流す
+//! フレーム供給（[`super::frames::stream_luma_frames_with`]）は輝度平面のみを流す
 //! （E14-5）。そのため `aU`/`bU`/`aV`/`bV` は学習せず、恒等変換（`a=1, b=0`、
 //! つまり「観測値をそのまま背景とみなす」= クロマ側の補正を無効化する値）で
 //! 埋める。これは最小実装としての判断で、クロマの学習が必要になった場合は
@@ -72,7 +72,7 @@ pub const DEFAULT_THRESHOLD: u8 = 12;
 pub const UNSPECIFIED_SERVICE_ID: i32 = -1;
 
 /// 8bit グレースケールの最大値。`.lgd` の `aY`/`bY` の意味（モジュール doc comment
-/// 「学習アルゴリズム」節参照）における `maxv`。`stream_luma_frames` は常に
+/// 「学習アルゴリズム」節参照）における `maxv`。`stream_luma_frames_with` は常に
 /// `-pix_fmt gray`（8bit）で読むため固定値でよい。
 const MAXV: f64 = 255.0;
 
@@ -284,10 +284,10 @@ impl FrameLearner {
         }
     }
 
-    /// フレームを1枚追加する。`frame` は `w*h` バイトの輝度平面（`stream_luma_frames`
+    /// フレームを1枚追加する。`frame` は `w*h` バイトの輝度平面（`stream_luma_frames_with`
     /// が渡す形式そのまま）。
     ///
-    /// 常に `Ok(())` を返す（`stream_luma_frames` の `on_frame` にそのまま渡せる形。
+    /// 常に `Ok(())` を返す（`stream_luma_frames_with` の `on_frame` にそのまま渡せる形。
     /// 「フレームが足りない」判定は全フレームを読み終えた後 [`FrameLearner::finish`]
     /// で行う）。
     pub fn add_frame(&mut self, frame: &[u8]) -> anyhow::Result<()> {
@@ -385,7 +385,7 @@ pub struct MakeLogoConfig {
     /// `ffmpeg` の実行ファイルパス（`tools::resolve_tool(tools::FFMPEG)`）。
     pub ffmpeg: std::path::PathBuf,
     pub input: std::path::PathBuf,
-    /// `stream_luma_frames` に渡す作業ディレクトリ（`external::spawn_streaming` の
+    /// `stream_luma_frames_with` に渡す作業ディレクトリ（`external::spawn_streaming` の
     /// `current_dir`。入力は絶対パス化されるため、実質どこでもよい）。
     pub cwd: std::path::PathBuf,
     /// 既に2の倍数に丸め済みの矩形（[`round_rect_to_even`] は呼び出し側が事前に
@@ -397,6 +397,8 @@ pub struct MakeLogoConfig {
     /// （`mp4io::read::samples`）から数えて渡す。表示順・デコード順のどちらで
     /// 数えても総数は変わらないため、順序の区別は不要。
     pub frame_count: u64,
+    /// ロゴ矩形の全編デコードに使う ffmpeg の設定。
+    pub ffmpeg_overrides: frames::FfmpegOverrides,
     pub threshold: u8,
     pub name: String,
     pub service_id: i32,
@@ -427,13 +429,14 @@ pub fn run(config: &MakeLogoConfig) -> anyhow::Result<MakeLogoOutput> {
     );
 
     let mut learner = FrameLearner::new(config.rect.w, config.rect.h, config.threshold);
-    frames::stream_luma_frames(
+    frames::stream_luma_frames_with(
         &config.ffmpeg,
         &config.input,
         &config.cwd,
         config.rect,
         config.video_size,
         config.frame_count,
+        &config.ffmpeg_overrides,
         |frame| learner.add_frame(frame),
     )?;
 
@@ -449,11 +452,11 @@ pub fn run(config: &MakeLogoConfig) -> anyhow::Result<MakeLogoOutput> {
 /// [`FrameLearner`] を確定させ、学習結果から [`LogoData`] を組み立てる
 /// （[`run`] の後半部分を分離したもの、issue #153「やること 1」）。
 ///
-/// フレーム供給を `run` のように `stream_luma_frames`（ffmpeg 起動）に限らず、
+/// フレーム供給を `run` のように `stream_luma_frames_with`（ffmpeg 起動）に限らず、
 /// 既に集め終えたフレームから作った `FrameLearner` を渡すだけで同じ結果を
 /// 組み立てられるようにするために分離した。`src/analyze.rs` の
 /// `run_auto_logo_detection` は、候補ごとの学習用デコードと検出用デコードを
-/// 1回に共有する経路でこの関数を呼ぶ（学習は `stream_luma_frames` の
+/// 1回に共有する経路でこの関数を呼ぶ（学習は `stream_luma_frames_with` の
 /// コールバック内で `FrameLearner::add_frame` を呼びながら進め、デコードが
 /// 終わった時点でこの関数で確定させる）。`run` と全く同じフィールド組み立てを
 /// 行うため、[`round_rect_to_even`] 適用済みの矩形を渡すこと（`w`/`h` が2の倍数
