@@ -69,7 +69,7 @@ builder を distroless と同じ Debian 世代に揃えれば **`tachikaze` / `j
 
 イメージ全体を distroless にするには、`chapter_exe` / `dtvindex` / `ffmpeg` / `ffprobe` が要求する 130〜212 本の共有ライブラリが要る。これらを `COPY --from=tools` 等で個別に持ってくる必要がある。これは技術的に不可能ではないが:
 
-- distroless には `apt` / `dpkg` が無いため、`ldd` の出力から**手作業でファイルリストを組み、バージョンが変わるたびに追随する**運用になる。アップストリームの `chapter_exe` / `dtvindex` / `ffmpeg` はバージョン固定していないため、依存ライブラリの集合が変わりうる（上記「結果まとめ」参照）
+- distroless には `apt` / `dpkg` が無いため、`ldd` の出力から**手作業でファイルリストを組み、依存ライブラリが変わるたびに追随する**運用になる。Dockerfile は Debian trixie の apt から `ffmpeg` を入れるため、apt リポジトリの更新で `ffmpeg` の版や依存ライブラリの集合が変わりうる。`chapter_exe` / `join_logo_scp` / `dtvindex` は `scripts/build-external-tools.sh` の commit SHA に固定している（下記「Dockerfile の構成」参照）
 - 共有ライブラリ本体だけでなく、`libfontconfig` の設定ファイル・`ca-certificates` のバンドル・`iconv` の `gconv` モジュールなど、**ファイル以外の実行時データも一致させる必要がある**。今回は未検証だが、`ffmpeg` が TLS 系ライブラリ（`libgnutls` / `libssl`）を含んでいることから、証明書バンドルが必要になる場面はありうる
 - 手作業でのライブラリ一覧管理は、抜け漏れが「ビルドは通るが実行時にしか判明しない」失敗モードを生む。CLAUDE.md「静かに壊れる4つの罠」と同じ種類の問題（エラーを出さずに間違った・不完全な結果になる）を Dockerfile 自体に持ち込むことになるため避けた
 
@@ -81,7 +81,7 @@ builder を distroless と同じ Debian 世代に揃えれば **`tachikaze` / `j
 
 マルチステージ（`Dockerfile`）:
 
-1. **tools**: `debian:trixie` + `build-essential` / `pkg-config` / ffmpeg の `-dev` パッケージ群。`join_logo_scp` / `dtvindex` / `chapter_exe` を `git clone --depth 1` してビルドする。`chapter_exe` のビルド直後に `chapter_exe -v` の出力へ `dtvindex=enabled` が含まれるかを `RUN` の中で検証し、含まれなければビルドを失敗させる。`dtvindex=disabled` でビルドされた `chapter_exe` は入力経路が無く、エラーを出さずに動かなくなるため、ビルドの時点でこれを検出して止める。runtime と同じ Debian 13 (trixie) でビルドし、`libavformat` 等の共有ライブラリ版を揃える
+1. **tools**: `debian:trixie` + `build-essential` / `pkg-config` / ffmpeg の `-dev` パッケージ群。`scripts/build-external-tools.sh` が3ツールを commit SHA で取得してビルドする。`chapter_exe` のビルド直後に `chapter_exe -v` の出力へ `dtvindex=enabled` が含まれるかを検証し、含まれなければビルドを失敗させる。`dtvindex=disabled` でビルドされた `chapter_exe` は入力経路が無く、エラーを出さずに動かなくなるため、ビルドの時点でこれを検出して止める。runtime と同じ Debian 13 (trixie) でビルドし、`libavformat` 等の共有ライブラリ版を揃える
 2. **tachikaze**: 公式 `rust:1-trixie` で `cargo build --release --locked`。`rustup` や apt の `cargo` は使わない（Debian の apt 版は edition 2021 の依存クレートに対して古すぎることがあるため）。tools / runtime と同じ trixie ベース
 3. **runtime**: `debian:trixie` + `ffmpeg` パッケージ。この `ffmpeg` パッケージは、`prepare` と `--verify` が使う `ffmpeg` / `ffprobe` 本体を提供する。同時に、`chapter_exe` / `dtvindex` が実行時に要求する `libavformat` 等の共有ライブラリも兼ねる。tools の `-dev` パッケージと同じ trixie の apt リポジトリなのでバージョンが揃う。4つのバイナリを `/usr/local/bin/` に、`JL/` を `/usr/local/share/join_logo_scp/JL/` に置く
 
@@ -92,7 +92,7 @@ runtime は `ffmpeg` と `ca-certificates` を明示的にインストールす�
 
 `ENTRYPOINT ["tachikaze"]` なので `docker run tachikaze <サブコマンド> ...` がそのまま `tachikaze <サブコマンド> ...` になる。
 
-3ツールはバージョン固定（pin）していない（`git clone --depth 1` は常に upstream の default branch HEAD を取る）。再現性が必要なら `Dockerfile` の各 `git clone` に commit SHA を指定すること。
+3ツールの commit SHA は `scripts/build-external-tools.sh` 冒頭の変数に記載している。SHA を更新するときは同スクリプトの変数を書き換え、`make docker-build` でイメージをビルドする。続けて、その Docker イメージで下記「実行例で確認したこと」の `auto --verify` を通す。スクリプトは default branch の HEAD ではなく、指定した SHA を GitHub から fetch する。
 
 ## ビルド
 
@@ -199,6 +199,6 @@ Apple Silicon の Docker Desktop で確認した。
 
 - Docker Desktop の Linux VM からホストの VideoToolbox は使えない。Apple Silicon ネイティブでも VideoToolbox がソフトウェアデコードより遅い実測がある（[measurements.md の E20-1 の節](measurements.md#va-api-ハードウェアデコードの検証issue-164)）。
 - **イメージサイズ**: `--no-install-recommends` を tools・runtime 両方の `apt-get install` に付けた状態で、当時 ubuntu:24.04 ベースで実測 **753MB**。付ける前は 1.14GB だった（-34%）。X11・フォント関連ライブラリなど推奨パッケージの分が減る。現行の `debian:trixie` でも同程度。`--no-install-recommends` を付けた状態でも `auto --verify` のフルパイプラインが通ることを確認済み。`ffmpeg` パッケージ自体が持ち込む必須の共有ライブラリ（`libavformat` 系一式）は削れない。これ以上詰めるなら ffmpeg を静的ビルドする、または `apt` の代わりに BtbN の静的ビルド済みバイナリを使う方法があるが、この文書の範囲では対応しない
-- 3ツールはバージョン固定していない（上記「Dockerfile の構成」参照）。ビルドのたびに upstream の最新 HEAD を取るため、upstream 側の変更で本書の実測（パッチ不要）が将来変わる可能性がある。**再現性だけでなくライセンス上の要件でもある**: `chapter_exe` / `join_logo_scp` / `dtvindex` は GPL 系（[THIRD-PARTY-NOTICES.md](../THIRD-PARTY-NOTICES.md)）で、GPL の義務は配布時に発生する。現在は `Dockerfile`（レシピ）を置いているだけなので義務は生じない。しかしビルド済みイメージをレジストリに push して配布するなら「対応する完全なソース」の提供義務が生じる。そのためには**イメージを公開する前に各 `git clone` を commit SHA 固定にする**必要がある（固定していないと、後から対応ソースを再現できない）
+- 3ツールは `scripts/build-external-tools.sh` の commit SHA で版を固定している。upstream 側の変更は SHA を更新するまでビルドに影響しない。`chapter_exe` / `join_logo_scp` / `dtvindex` は GPL 系（[THIRD-PARTY-NOTICES.md](../THIRD-PARTY-NOTICES.md)）で、固定 SHA から対応する完全なソースを再取得できる。`Dockerfile`（レシピ）のみを置く段階では対応する完全なソースの提供義務は生じないが、ビルド済みイメージを公開して配布する場合は対応する完全なソースの提供義務が生じる
 - **キャッシュは再実行を省略しない**（上記「実行例で確認したこと」）。`--cache-dir` を共有しても2回目以降の `analyze` が速くなるわけではない
 - **arm64 イメージが必須**。Apple Silicon で使う場合は `linux/arm64` をネイティブ実行する。x86_64 イメージでは QEMU エミュレーションが挟まり遅くなる
