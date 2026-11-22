@@ -92,11 +92,13 @@ RUN rm -f /etc/apt/apt.conf.d/docker-clean
 # --no-install-recommends: 実測で 1.14GB → 753MB（-34%、当時 ubuntu:24.04）。
 # X11/フォント関連の推奨パッケージを削っても auto --verify のフルパイプラインは
 # 通ることを確認済み（docs/docker.md「既知の制約」）。
+ARG TACHIKAZE_EXTRA_APT=""
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
     apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
     ffmpeg \
-    ca-certificates
+    ca-certificates \
+    $TACHIKAZE_EXTRA_APT
 
 COPY --from=tools /build/chapter_exe/src/chapter_exe /usr/local/bin/chapter_exe
 COPY --from=tools /build/join_logo_scp/src/join_logo_scp /usr/local/bin/join_logo_scp
