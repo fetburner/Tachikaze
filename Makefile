@@ -22,7 +22,7 @@ build:
 # arm64 イメージが要る（x86_64 のみのイメージは QEMU エミュレーションで極端に
 # 遅くなる。docs/docker.md「既知の制約」参照）。
 docker-build:
-	docker build -t tachikaze .
+	docker build --build-arg TACHIKAZE_EXTRA_APT="$(EXTRA_APT)" -t tachikaze .
 
 # JL コマンドファイルと外部3ツール（chapter_exe/dtvindex/join_logo_scp）は
 # 本リポジトリに含まれないため install 対象にしない（配置先の取り決めは

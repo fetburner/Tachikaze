@@ -85,6 +85,9 @@ builder を distroless と同じ Debian 世代に揃えれば **`tachikaze` / `j
 2. **tachikaze**: 公式 `rust:1-trixie` で `cargo build --release --locked`。`rustup` や apt の `cargo` は使わない（Debian の apt 版は edition 2021 の依存クレートに対して古すぎることがあるため）。tools / runtime と同じ trixie ベース
 3. **runtime**: `debian:trixie` + `ffmpeg` パッケージ。この `ffmpeg` パッケージは、`prepare` と `--verify` が使う `ffmpeg` / `ffprobe` 本体を提供する。同時に、`chapter_exe` / `dtvindex` が実行時に要求する `libavformat` 等の共有ライブラリも兼ねる。tools の `-dev` パッケージと同じ trixie の apt リポジトリなのでバージョンが揃う。4つのバイナリを `/usr/local/bin/` に、`JL/` を `/usr/local/share/join_logo_scp/JL/` に置く
 
+runtime は `ffmpeg` と `ca-certificates` を明示的にインストールする。
+ビルド引数 `TACHIKAZE_EXTRA_APT` には追加する apt パッケージ名を空白区切りで指定できる。既定は空。
+
 `apt-get` と `cargo` は BuildKit の cache mount（`/var/cache/apt`・`/var/lib/apt`・cargo registry/git・`target/`）を使う。キャッシュはイメージレイヤーに入らないので、`rm -rf /var/lib/apt/lists/*` でレイヤーを掃除する必要はない。Debian のベースイメージが持つ `docker-clean`（install 後に apt キャッシュを消す設定）は、cache mount が効くように各ステージで削除している。
 
 `ENTRYPOINT ["tachikaze"]` なので `docker run tachikaze <サブコマンド> ...` がそのまま `tachikaze <サブコマンド> ...` になる。
@@ -94,8 +97,12 @@ builder を distroless と同じ Debian 世代に揃えれば **`tachikaze` / `j
 ## ビルド
 
 ```console
-$ make docker-build          # docker build -t tachikaze . と同じ
+$ make docker-build
 ```
+
+`make docker-build EXTRA_APT="パッケージ名1 パッケージ名2"` は、追加パッケージ名をビルド引数 `TACHIKAZE_EXTRA_APT` に渡す。
+`docker build` を直接使う場合は `--build-arg TACHIKAZE_EXTRA_APT="パッケージ名1 パッケージ名2"` を指定する。
+対象アーキテクチャにパッケージが存在しない場合は、apt のエラーでビルドが止まる。
 
 ## 実行
 
@@ -123,6 +130,31 @@ $ docker run --rm -v "$MEDIA_DIR":"$MEDIA_DIR" -v "$CACHE_DIR":"$CACHE_DIR" tach
     --cache-dir "$CACHE_DIR" --verify
 ```
 
+### J4125 と i965 の構成例
+
+E20-1 では Synology DS920+（J4125）の Debian 13 コンテナで、FFmpeg ラッパーを使った GPU 側クロップ経路を実測した。
+次の例は同じ経路をロゴ検出の CLI オプションで設定する。測定時のコマンド文字列は記録に残っておらず、掲載例の動作やロゴ検出の高速化は J4125 実機で検証していない。
+実測条件と結果は [measurements.md の E20-1 の節](measurements.md#va-api-ハードウェアデコードの検証issue-164)を参照。
+
+amd64 イメージに `i965-va-driver` を追加し、実行時にホストの `/dev/dri/renderD128` を渡して `LIBVA_DRIVER_NAME=i965` を設定する。
+`IN.lgd` には入力に対応する学習済みロゴ辞書を指定する。
+
+```console
+$ make docker-build EXTRA_APT=i965-va-driver
+$ docker run --rm --device /dev/dri/renderD128 -e LIBVA_DRIVER_NAME=i965 \
+    -v "$MEDIA_DIR":"$MEDIA_DIR" -v "$CACHE_DIR":"$CACHE_DIR" tachikaze \
+    analyze "$MEDIA_DIR/IN.mp4" --logo "$MEDIA_DIR/IN.lgd" \
+    -o "$MEDIA_DIR/trim.avs" --cache-dir "$CACHE_DIR" \
+    --logo-ffmpeg-input-arg=-hwaccel --logo-ffmpeg-input-arg=vaapi \
+    --logo-ffmpeg-input-arg=-hwaccel_device --logo-ffmpeg-input-arg=/dev/dri/renderD128 \
+    --logo-ffmpeg-input-arg=-hwaccel_output_format --logo-ffmpeg-input-arg=vaapi \
+    --logo-ffmpeg-vf='crop={w}:{h}:{x}:{y},scale_vaapi=w={w}:h={h}:format=nv12,hwdownload,format=nv12'
+```
+
+`intel-media-va-driver` や `mesa-va-drivers` なども、対象アーキテクチャで入手できるパッケージ名を `EXTRA_APT` に渡して追加できる。
+これらのドライバーでの利用は未検証。J4125 の iHD では GPU 側クロップの `scale_vaapi` が `VAProfile is not supported` で失敗した。
+Raspberry Pi でのハードウェアデコードも未検証。
+
 ## キャッシュがホストと共有できない条件
 
 キャッシュディレクトリの実体は `<cache_root>/<入力ファイルの絶対パスのハッシュ>-<stem>/`（`src/workdir.rs::cache_dir_for_input`）。`cache_root` は `--cache-dir` を明示すればその値になる（絶対パス化されるだけで、入力ごとのサブディレクトリ規則自体は変わらない）。未指定なら `<ホームディレクトリ>/.cache/tachikaze` で、`std::env::home_dir()` から決まる。置き場所を決める環境変数は一切読まない仕様。ホームディレクトリ自体が特定できない場合は `--cache-dir` を促すエラーで停止する。**入力ファイルの絶対パス自体（マウント先のパス）が変わると、同じ内容のファイルでも別のディレクトリ名になり、ネイティブ実行（macOS で直接 `tachikaze` を動かす場合）とキャッシュを共有できない。**
@@ -144,6 +176,16 @@ $ docker run --rm -v "$MEDIA_DIR":"$MEDIA_DIR" -v "$CACHE_DIR":"$CACHE_DIR" tach
 
 `--ignore-gate` を付けた理由: 同じ理由（検出対象の CM がそもそも無い合成素材）で gate が「除去フレーム数 0 → 疑わしいので止める」と判定するため、smoke test として最後まで通す目的で判定を無視した。実際の運用では gate の停止判定を無視せず、`trim.avs` を確認してから `--ignore-gate` するか `cut` を直接叩くこと。
 
+### 追加 apt パッケージのビルド検証
+
+Apple Silicon の Docker Desktop で確認した。
+
+- 既定の arm64 ビルドは成功し、runtime の install 行は `ffmpeg ca-certificates` のみだった。上記の `sample.mp4` による smoke E2E は終了コード 0 で、`--verify` の CRC32 検証も通った。
+- `DOCKER_DEFAULT_PLATFORM=linux/amd64 make docker-build EXTRA_APT=i965-va-driver` はエミュレーションで成功した。コンテナ内で `uname -m` は `x86_64` を返した。`i965-va-driver`（`2.4.1+dfsg1-2`）と `/usr/lib/x86_64-linux-gnu/dri/i965_drv_video.so` の導入を確認した。
+- arm64 で `EXTRA_APT=i965-va-driver` を指定したビルドは、`E: Package 'i965-va-driver' has no installation candidate` で停止した。
+
+既定のイメージでも `ffmpeg -hwaccels` に `vaapi` が出るが、この表示が示すのは Debian の FFmpeg のビルド時の VA-API 対応だけで、ドライバーの導入やデバイスへのアクセスは確認できない。
+
 ### キャッシュは再実行を省略しない（実測）
 
 同じ入力・同じ `--cache-dir`（ホストにマウント済み、内容も共有できる状態）で `auto` に `-f`（既存出力の上書き）を付けて2回連続実行し、両回のログを比較した。**2回目も `dtvindex build` / `chapter_exe -v` / `join_logo_scp` が3つとも全く同じコマンドラインで再実行される**。これは Docker 固有の問題ではなく tachikaze 共通の挙動で、`analyze` に「既存の成果物があれば再実行をスキップする」判定が無いためである。キャッシュは「`cut` が `.dtvi` を自動解決できるようにするための受け渡し場所」であって、再実行を省略する仕組みではない。したがって「キャッシュを共有すれば2回目以降が速くなる」という期待は**外れる**。速くなるとしたら OS のページキャッシュ（同じファイルの再読み込みが速くなる）程度で、`dtvindex`/`chapter_exe`/`join_logo_scp` の実行自体は毎回フルで走る。
@@ -155,6 +197,7 @@ $ docker run --rm -v "$MEDIA_DIR":"$MEDIA_DIR" -v "$CACHE_DIR":"$CACHE_DIR" tach
 
 ## 既知の制約
 
+- Docker Desktop の Linux VM からホストの VideoToolbox は使えない。Apple Silicon ネイティブでも VideoToolbox がソフトウェアデコードより遅い実測がある（[measurements.md の E20-1 の節](measurements.md#va-api-ハードウェアデコードの検証issue-164)）。
 - **イメージサイズ**: `--no-install-recommends` を tools・runtime 両方の `apt-get install` に付けた状態で、当時 ubuntu:24.04 ベースで実測 **753MB**。付ける前は 1.14GB だった（-34%）。X11・フォント関連ライブラリなど推奨パッケージの分が減る。現行の `debian:trixie` でも同程度。`--no-install-recommends` を付けた状態でも `auto --verify` のフルパイプラインが通ることを確認済み。`ffmpeg` パッケージ自体が持ち込む必須の共有ライブラリ（`libavformat` 系一式）は削れない。これ以上詰めるなら ffmpeg を静的ビルドする、または `apt` の代わりに BtbN の静的ビルド済みバイナリを使う方法があるが、この文書の範囲では対応しない
 - 3ツールはバージョン固定していない（上記「Dockerfile の構成」参照）。ビルドのたびに upstream の最新 HEAD を取るため、upstream 側の変更で本書の実測（パッチ不要）が将来変わる可能性がある。**再現性だけでなくライセンス上の要件でもある**: `chapter_exe` / `join_logo_scp` / `dtvindex` は GPL 系（[THIRD-PARTY-NOTICES.md](../THIRD-PARTY-NOTICES.md)）で、GPL の義務は配布時に発生する。現在は `Dockerfile`（レシピ）を置いているだけなので義務は生じない。しかしビルド済みイメージをレジストリに push して配布するなら「対応する完全なソース」の提供義務が生じる。そのためには**イメージを公開する前に各 `git clone` を commit SHA 固定にする**必要がある（固定していないと、後から対応ソースを再現できない）
 - **キャッシュは再実行を省略しない**（上記「実行例で確認したこと」）。`--cache-dir` を共有しても2回目以降の `analyze` が速くなるわけではない
