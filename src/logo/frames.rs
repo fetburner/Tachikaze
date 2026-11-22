@@ -7,6 +7,25 @@
 //! 全フレームをメモリに溜めない設計にする（[`stream_luma_frames`] はフレームごとに
 //! コールバックを呼ぶ）。
 //!
+//! ## ffmpeg 引数の組み立てと上書き（E20-2）
+//!
+//! 既存の5関数が使う引数は `build_ffmpeg_args` で組み立てる。
+//! 関数ごとの設定の適用漏れを防ぐため、上書きも同じビルダーで行う。
+//! [`stream_luma_frames_with`] は [`FfmpegOverrides`] で上書き設定を受け取る。
+//! 追加入力引数は `-loglevel error` の直後に挿入し、`-skip_frame`、`-ss`、
+//! `-i` より前に置く。各要素を ffmpeg の1引数として順に渡し、シェルは介さない。
+//!
+//! フィルターテンプレートは E20-1 の実測で必要と判断した。
+//! `docs/measurements.md`「VA-API ハードウェアデコードの検証（Issue #164）」の
+//! 「採用判定」を参照する。
+//! `filter_template` を指定する場合、展開後のフィルターは 8-bit gray で
+//! 1フレーム `w*h` バイトを出力しなければならない。
+//! `read_frames` に渡すフレームサイズは設定値に頼らず
+//! `rect.frame_bytes()` で求める。出力に端数バイトがある場合や、実際の
+//! フレーム数が期待値と一致しない場合は、`read_frames` がエラーを返す。
+//! Rust 側ではハードウェア名やフィルター名を解釈せず、
+//! 妥当性の検査は ffmpeg に任せる。
+//!
 //! ## 座標系がこの issue の本質
 //!
 //! ロゴ区間は後段で `join_logo_scp -inlogo` に渡され、chapter_exe が出した
@@ -149,6 +168,7 @@
 //! 発覚、罠3は`start_time`ヘッダが0の実録画では近似がたまたま正しい値になり、
 //! `start_time`が非0のE2Eフィクスチャで初めて発覚した）。
 
+use std::ffi::{OsStr, OsString};
 use std::io::{ErrorKind, Read};
 use std::path::Path;
 
@@ -222,6 +242,143 @@ pub struct VideoSize {
     pub height: u32,
 }
 
+/// ffmpeg の入力引数とロゴ矩形用フィルターの上書き設定。`Default` は上書き無し。
+///
+/// 出力形式の契約はモジュール doc comment「ffmpeg 引数の組み立てと上書き（E20-2）」を参照する。
+#[derive(Debug, Clone, Default)]
+pub struct FfmpegOverrides {
+    /// `-loglevel error` の直後、`-skip_frame` / `-ss` / `-i` より前に
+    /// 順序どおり挿入する。各要素をそのまま1引数として渡すため、オプションと
+    /// その値は別の要素にする。
+    pub input_args: Vec<OsString>,
+    /// `-vf` に渡す1個の文字列。`{x}` / `{y}` / `{w}` / `{h}` を矩形の
+    /// 10進整数に展開する。未知のプレースホルダーや対になっていない波括弧は起動前に
+    /// エラーにする。`None` の場合は従来の `crop=w:h:x:y` を使う。
+    pub filter_template: Option<String>,
+}
+
+enum DecodeMode {
+    Full(LogoRect),
+    Keyframes,
+    CroppedKeyframes(LogoRect),
+    Range {
+        rect: LogoRect,
+        seek_seconds: f64,
+        frame_count: u64,
+    },
+    SeekUntilEof {
+        rect: LogoRect,
+        seek_seconds: f64,
+    },
+}
+
+/// `-vf` 用のテンプレートにある `{x}` / `{y}` / `{w}` / `{h}` を
+/// `rect` の10進整数に展開する。未知のプレースホルダー、閉じていない `{`、
+/// 対になる `{` がない `}` はエラーにする。
+///
+/// 出力形式の契約は [`FfmpegOverrides`] を参照する。
+fn expand_filter_template(template: &str, rect: LogoRect) -> anyhow::Result<String> {
+    let mut expanded = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(index) = rest.find(['{', '}']) {
+        expanded.push_str(&rest[..index]);
+        let Some(placeholder) = rest[index..].strip_prefix('{') else {
+            bail!("フィルターテンプレート `{template}` に対になる開き波括弧のない `}}` があります");
+        };
+        let Some((name, tail)) = placeholder.split_once('}') else {
+            bail!("フィルターテンプレート `{template}` に閉じていないプレースホルダーがあります");
+        };
+        let value = match name {
+            "x" => rect.x,
+            "y" => rect.y,
+            "w" => rect.w,
+            "h" => rect.h,
+            _ => bail!("フィルターテンプレート `{template}` に未知のプレースホルダー `{{{name}}}` があります"),
+        };
+        expanded.push_str(&value.to_string());
+        rest = tail;
+    }
+    expanded.push_str(rest);
+    Ok(expanded)
+}
+
+/// デコード方法に応じて ffmpeg の引数を組み立てる。追加入力引数は
+/// `-loglevel error` の直後、`-skip_frame` / `-ss` / `-i` より前に、要素ごとに
+/// 1引数として挿入する。
+///
+/// テンプレートを指定した場合は [`expand_filter_template`] で `{x}` / `{y}` /
+/// `{w}` / `{h}` を展開し、`-vf` の値にする。矩形が無い場合や、未知の
+/// プレースホルダーまたは対になっていない波括弧がある場合は起動前にエラーにする。
+/// 出力形式の契約は [`FfmpegOverrides`] を参照する。
+fn build_ffmpeg_args(
+    input: &Path,
+    mode: DecodeMode,
+    overrides: &FfmpegOverrides,
+) -> anyhow::Result<Vec<OsString>> {
+    let (rect, keyframes_only, seek_seconds, frame_limit) = match mode {
+        DecodeMode::Full(rect) => (Some(rect), false, None, None),
+        DecodeMode::Keyframes => (None, true, None, None),
+        DecodeMode::CroppedKeyframes(rect) => (Some(rect), true, None, None),
+        DecodeMode::Range {
+            rect,
+            seek_seconds,
+            frame_count,
+        } => (Some(rect), false, Some(seek_seconds), Some(frame_count)),
+        DecodeMode::SeekUntilEof { rect, seek_seconds } => {
+            (Some(rect), false, Some(seek_seconds), None)
+        }
+    };
+
+    let mut args = Vec::from(["-hide_banner", "-loglevel", "error"].map(OsString::from));
+    // 追加入力引数、`-skip_frame`、入力シークの `-ss` は入力オプションなので
+    // `-i` より前に置く。
+    // `-skip_frame` を `-i` より後ろに置くと全フレームがデコードされた。
+    // `stream_keyframe_luma_frames` の doc comment を参照する。
+    args.extend(overrides.input_args.iter().cloned());
+    if keyframes_only {
+        args.extend(["-skip_frame", "nokey"].map(OsString::from));
+    }
+    if let Some(seconds) = seek_seconds {
+        args.extend([OsString::from("-ss"), seconds.to_string().into()]);
+    }
+    args.extend([OsString::from("-i"), input.as_os_str().to_owned()]);
+    args.extend(["-map", "0:v:0", "-an", "-sn"].map(OsString::from));
+
+    let filter = match (rect, overrides.filter_template.as_deref()) {
+        (Some(rect), Some(template)) => Some(expand_filter_template(template, rect)?),
+        (Some(rect), None) => Some(format!("crop={}:{}:{}:{}", rect.w, rect.h, rect.x, rect.y)),
+        (None, Some(template)) => {
+            bail!("フィルターテンプレート `{template}` にはロゴ矩形が必要です")
+        }
+        (None, None) => None,
+    };
+    if let Some(filter) = filter {
+        args.extend([OsString::from("-vf"), filter.into()]);
+    }
+    // `-fps_mode passthrough` を外すと599フレームが601フレームになった実測がある。
+    // モジュール doc comment「フレームの重複・欠落を防ぐオプション」を参照する。
+    args.extend(["-pix_fmt", "gray", "-fps_mode", "passthrough"].map(OsString::from));
+    if let Some(count) = frame_limit {
+        args.extend([OsString::from("-frames:v"), count.to_string().into()]);
+    }
+    args.extend(["-f", "rawvideo", "-"].map(OsString::from));
+    Ok(args)
+}
+
+fn spawn_ffmpeg(
+    ffmpeg: &Path,
+    input: &Path,
+    cwd: &Path,
+    mode: DecodeMode,
+    overrides: &FfmpegOverrides,
+) -> anyhow::Result<external::StreamingChild> {
+    let absolute_input =
+        std::fs::canonicalize(input).path_ctx("入力ファイルの絶対パス解決", input)?;
+    let args = build_ffmpeg_args(&absolute_input, mode, overrides)?;
+    let args: Vec<&OsStr> = args.iter().map(OsString::as_os_str).collect();
+    external::spawn_streaming(ffmpeg, &args, cwd)
+}
+
 /// `ffmpeg` を起動し、`input` からロゴ矩形 `rect` の輝度平面を1フレームずつ
 /// `on_frame` に渡す。
 ///
@@ -250,35 +407,35 @@ pub fn stream_luma_frames(
     expected_frame_count: u64,
     on_frame: impl FnMut(&[u8]) -> anyhow::Result<()>,
 ) -> anyhow::Result<u64> {
+    stream_luma_frames_with(
+        ffmpeg,
+        input,
+        cwd,
+        rect,
+        video_size,
+        expected_frame_count,
+        &FfmpegOverrides::default(),
+        on_frame,
+    )
+}
+
+/// [`stream_luma_frames`] と同じ検査を行い、[`FfmpegOverrides`] の入力引数と
+/// フィルターを使ってロゴ矩形の輝度平面を読む。矩形の範囲外やテンプレートの
+/// 不備は ffmpeg を起動する前にエラーにする。
+#[allow(clippy::too_many_arguments)]
+pub fn stream_luma_frames_with(
+    ffmpeg: &Path,
+    input: &Path,
+    cwd: &Path,
+    rect: LogoRect,
+    video_size: VideoSize,
+    expected_frame_count: u64,
+    overrides: &FfmpegOverrides,
+    on_frame: impl FnMut(&[u8]) -> anyhow::Result<()>,
+) -> anyhow::Result<u64> {
     rect.validate(video_size.width, video_size.height)?;
 
-    let absolute_input =
-        std::fs::canonicalize(input).path_ctx("入力ファイルの絶対パス解決", input)?;
-    let filter = format!("crop={}:{}:{}:{}", rect.w, rect.h, rect.x, rect.y);
-    let input_arg = absolute_input.as_os_str();
-
-    let args: Vec<&std::ffi::OsStr> = vec![
-        std::ffi::OsStr::new("-hide_banner"),
-        std::ffi::OsStr::new("-loglevel"),
-        std::ffi::OsStr::new("error"),
-        std::ffi::OsStr::new("-i"),
-        input_arg,
-        std::ffi::OsStr::new("-map"),
-        std::ffi::OsStr::new("0:v:0"),
-        std::ffi::OsStr::new("-an"),
-        std::ffi::OsStr::new("-sn"),
-        std::ffi::OsStr::new("-vf"),
-        std::ffi::OsStr::new(&filter),
-        std::ffi::OsStr::new("-pix_fmt"),
-        std::ffi::OsStr::new("gray"),
-        std::ffi::OsStr::new("-fps_mode"),
-        std::ffi::OsStr::new("passthrough"),
-        std::ffi::OsStr::new("-f"),
-        std::ffi::OsStr::new("rawvideo"),
-        std::ffi::OsStr::new("-"),
-    ];
-
-    let mut child = external::spawn_streaming(ffmpeg, &args, cwd)?;
+    let mut child = spawn_ffmpeg(ffmpeg, input, cwd, DecodeMode::Full(rect), overrides)?;
     let read_result = read_frames(
         child.stdout(),
         rect.frame_bytes(),
@@ -355,32 +512,13 @@ pub fn stream_keyframe_luma_frames(
         );
     }
 
-    let absolute_input =
-        std::fs::canonicalize(input).path_ctx("入力ファイルの絶対パス解決", input)?;
-    let input_arg = absolute_input.as_os_str();
-
-    let args: Vec<&std::ffi::OsStr> = vec![
-        std::ffi::OsStr::new("-hide_banner"),
-        std::ffi::OsStr::new("-loglevel"),
-        std::ffi::OsStr::new("error"),
-        std::ffi::OsStr::new("-skip_frame"),
-        std::ffi::OsStr::new("nokey"),
-        std::ffi::OsStr::new("-i"),
-        input_arg,
-        std::ffi::OsStr::new("-map"),
-        std::ffi::OsStr::new("0:v:0"),
-        std::ffi::OsStr::new("-an"),
-        std::ffi::OsStr::new("-sn"),
-        std::ffi::OsStr::new("-pix_fmt"),
-        std::ffi::OsStr::new("gray"),
-        std::ffi::OsStr::new("-fps_mode"),
-        std::ffi::OsStr::new("passthrough"),
-        std::ffi::OsStr::new("-f"),
-        std::ffi::OsStr::new("rawvideo"),
-        std::ffi::OsStr::new("-"),
-    ];
-
-    let mut child = external::spawn_streaming(ffmpeg, &args, cwd)?;
+    let mut child = spawn_ffmpeg(
+        ffmpeg,
+        input,
+        cwd,
+        DecodeMode::Keyframes,
+        &FfmpegOverrides::default(),
+    )?;
     let read_result = read_keyframe_frames(child.stdout(), frame_bytes, on_frame);
     finish_stream(child, read_result)
 }
@@ -411,35 +549,13 @@ pub fn stream_keyframe_cropped_luma_frames(
 ) -> anyhow::Result<u64> {
     rect.validate(video_size.width, video_size.height)?;
 
-    let absolute_input =
-        std::fs::canonicalize(input).path_ctx("入力ファイルの絶対パス解決", input)?;
-    let filter = format!("crop={}:{}:{}:{}", rect.w, rect.h, rect.x, rect.y);
-    let input_arg = absolute_input.as_os_str();
-
-    let args: Vec<&std::ffi::OsStr> = vec![
-        std::ffi::OsStr::new("-hide_banner"),
-        std::ffi::OsStr::new("-loglevel"),
-        std::ffi::OsStr::new("error"),
-        std::ffi::OsStr::new("-skip_frame"),
-        std::ffi::OsStr::new("nokey"),
-        std::ffi::OsStr::new("-i"),
-        input_arg,
-        std::ffi::OsStr::new("-map"),
-        std::ffi::OsStr::new("0:v:0"),
-        std::ffi::OsStr::new("-an"),
-        std::ffi::OsStr::new("-sn"),
-        std::ffi::OsStr::new("-vf"),
-        std::ffi::OsStr::new(&filter),
-        std::ffi::OsStr::new("-pix_fmt"),
-        std::ffi::OsStr::new("gray"),
-        std::ffi::OsStr::new("-fps_mode"),
-        std::ffi::OsStr::new("passthrough"),
-        std::ffi::OsStr::new("-f"),
-        std::ffi::OsStr::new("rawvideo"),
-        std::ffi::OsStr::new("-"),
-    ];
-
-    let mut child = external::spawn_streaming(ffmpeg, &args, cwd)?;
+    let mut child = spawn_ffmpeg(
+        ffmpeg,
+        input,
+        cwd,
+        DecodeMode::CroppedKeyframes(rect),
+        &FfmpegOverrides::default(),
+    )?;
     let read_result = read_keyframe_frames(child.stdout(), rect.frame_bytes(), on_frame);
     finish_stream(child, read_result)
 }
@@ -482,41 +598,17 @@ pub fn decode_frame_range_luma_frames(
 ) -> anyhow::Result<u64> {
     rect.validate(video_size.width, video_size.height)?;
 
-    let absolute_input =
-        std::fs::canonicalize(input).path_ctx("入力ファイルの絶対パス解決", input)?;
-    let filter = format!("crop={}:{}:{}:{}", rect.w, rect.h, rect.x, rect.y);
-    let input_arg = absolute_input.as_os_str();
-    // `-ss` は `-i` より前（入力シーク）。値は呼び出し側が計算した秒数を
-    // そのまま文字列化する（ffmpeg は小数秒の `-ss` を受け付ける）。
-    let seek_arg = format!("{seek_seconds}");
-    let count_arg = frame_count.to_string();
-
-    let args: Vec<&std::ffi::OsStr> = vec![
-        std::ffi::OsStr::new("-hide_banner"),
-        std::ffi::OsStr::new("-loglevel"),
-        std::ffi::OsStr::new("error"),
-        std::ffi::OsStr::new("-ss"),
-        std::ffi::OsStr::new(&seek_arg),
-        std::ffi::OsStr::new("-i"),
-        input_arg,
-        std::ffi::OsStr::new("-map"),
-        std::ffi::OsStr::new("0:v:0"),
-        std::ffi::OsStr::new("-an"),
-        std::ffi::OsStr::new("-sn"),
-        std::ffi::OsStr::new("-vf"),
-        std::ffi::OsStr::new(&filter),
-        std::ffi::OsStr::new("-pix_fmt"),
-        std::ffi::OsStr::new("gray"),
-        std::ffi::OsStr::new("-fps_mode"),
-        std::ffi::OsStr::new("passthrough"),
-        std::ffi::OsStr::new("-frames:v"),
-        std::ffi::OsStr::new(&count_arg),
-        std::ffi::OsStr::new("-f"),
-        std::ffi::OsStr::new("rawvideo"),
-        std::ffi::OsStr::new("-"),
-    ];
-
-    let mut child = external::spawn_streaming(ffmpeg, &args, cwd)?;
+    let mut child = spawn_ffmpeg(
+        ffmpeg,
+        input,
+        cwd,
+        DecodeMode::Range {
+            rect,
+            seek_seconds,
+            frame_count,
+        },
+        &FfmpegOverrides::default(),
+    )?;
     let read_result = read_frames(child.stdout(), rect.frame_bytes(), frame_count, on_frame);
     finish_stream(child, read_result)
 }
@@ -547,36 +639,13 @@ pub fn decode_from_seek_until_eof_luma_frames(
 ) -> anyhow::Result<u64> {
     rect.validate(video_size.width, video_size.height)?;
 
-    let absolute_input =
-        std::fs::canonicalize(input).path_ctx("入力ファイルの絶対パス解決", input)?;
-    let filter = format!("crop={}:{}:{}:{}", rect.w, rect.h, rect.x, rect.y);
-    let input_arg = absolute_input.as_os_str();
-    let seek_arg = format!("{seek_seconds}");
-
-    let args: Vec<&std::ffi::OsStr> = vec![
-        std::ffi::OsStr::new("-hide_banner"),
-        std::ffi::OsStr::new("-loglevel"),
-        std::ffi::OsStr::new("error"),
-        std::ffi::OsStr::new("-ss"),
-        std::ffi::OsStr::new(&seek_arg),
-        std::ffi::OsStr::new("-i"),
-        input_arg,
-        std::ffi::OsStr::new("-map"),
-        std::ffi::OsStr::new("0:v:0"),
-        std::ffi::OsStr::new("-an"),
-        std::ffi::OsStr::new("-sn"),
-        std::ffi::OsStr::new("-vf"),
-        std::ffi::OsStr::new(&filter),
-        std::ffi::OsStr::new("-pix_fmt"),
-        std::ffi::OsStr::new("gray"),
-        std::ffi::OsStr::new("-fps_mode"),
-        std::ffi::OsStr::new("passthrough"),
-        std::ffi::OsStr::new("-f"),
-        std::ffi::OsStr::new("rawvideo"),
-        std::ffi::OsStr::new("-"),
-    ];
-
-    let mut child = external::spawn_streaming(ffmpeg, &args, cwd)?;
+    let mut child = spawn_ffmpeg(
+        ffmpeg,
+        input,
+        cwd,
+        DecodeMode::SeekUntilEof { rect, seek_seconds },
+        &FfmpegOverrides::default(),
+    )?;
     let read_result = read_keyframe_frames(child.stdout(), rect.frame_bytes(), on_frame);
     finish_stream(child, read_result)
 }
@@ -741,6 +810,260 @@ fn fill_or_eof<R: Read>(reader: &mut R, buf: &mut [u8]) -> anyhow::Result<usize>
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    const TEST_RECT: LogoRect = LogoRect {
+        x: 10,
+        y: 20,
+        w: 30,
+        h: 40,
+    };
+
+    const TEST_INPUT: &str = "/video/ロゴ test.mp4";
+
+    const TEST_VIDEO_SIZE: VideoSize = VideoSize {
+        width: 640,
+        height: 360,
+    };
+
+    fn unexpected_frame(_: &[u8]) -> anyhow::Result<()> {
+        panic!("ffmpeg の起動前にエラーになるはずだが on_frame が呼ばれた");
+    }
+
+    fn assert_default_command(
+        expected_args: &str,
+        decode: impl FnOnce(&Path, &Path, &Path) -> anyhow::Result<u64>,
+    ) {
+        let cwd = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let ffmpeg = cwd.join("ffmpeg-must-not-exist");
+        assert!(ffmpeg.is_absolute() && !ffmpeg.exists());
+        let input = cwd.join("Cargo.toml");
+        let absolute_input = input.canonicalize().unwrap();
+        let expected_args = expected_args.replace("{input}", &absolute_input.to_string_lossy());
+        let expected = format!(
+            "外部プロセスの起動に失敗しました: `{} {expected_args}`",
+            ffmpeg.display()
+        );
+
+        let err = decode(&ffmpeg, &input, cwd).unwrap_err();
+        assert!(err.to_string().starts_with(&expected), "message={err}");
+    }
+
+    #[test]
+    fn stream_luma_frames_keeps_default_args() {
+        assert_default_command(
+            "-hide_banner -loglevel error -i {input} -map 0:v:0 -an -sn \
+             -vf crop=30:40:10:20 -pix_fmt gray -fps_mode passthrough -f rawvideo -",
+            |ffmpeg, input, cwd| {
+                stream_luma_frames(
+                    ffmpeg,
+                    input,
+                    cwd,
+                    TEST_RECT,
+                    TEST_VIDEO_SIZE,
+                    1,
+                    unexpected_frame,
+                )
+            },
+        );
+    }
+
+    #[test]
+    fn stream_keyframe_luma_frames_keeps_default_args() {
+        assert_default_command(
+            "-hide_banner -loglevel error -skip_frame nokey -i {input} -map 0:v:0 -an -sn \
+             -pix_fmt gray -fps_mode passthrough -f rawvideo -",
+            |ffmpeg, input, cwd| {
+                stream_keyframe_luma_frames(ffmpeg, input, cwd, TEST_VIDEO_SIZE, unexpected_frame)
+            },
+        );
+    }
+
+    #[test]
+    fn stream_keyframe_cropped_luma_frames_keeps_default_args() {
+        assert_default_command(
+            "-hide_banner -loglevel error -skip_frame nokey -i {input} -map 0:v:0 -an -sn \
+             -vf crop=30:40:10:20 -pix_fmt gray -fps_mode passthrough -f rawvideo -",
+            |ffmpeg, input, cwd| {
+                stream_keyframe_cropped_luma_frames(
+                    ffmpeg,
+                    input,
+                    cwd,
+                    TEST_RECT,
+                    TEST_VIDEO_SIZE,
+                    unexpected_frame,
+                )
+            },
+        );
+    }
+
+    #[test]
+    fn decode_frame_range_luma_frames_keeps_default_args() {
+        assert_default_command(
+            "-hide_banner -loglevel error -ss 12.375 -i {input} -map 0:v:0 -an -sn \
+             -vf crop=30:40:10:20 -pix_fmt gray -fps_mode passthrough -frames:v 123 -f rawvideo -",
+            |ffmpeg, input, cwd| {
+                decode_frame_range_luma_frames(
+                    ffmpeg,
+                    input,
+                    cwd,
+                    TEST_RECT,
+                    TEST_VIDEO_SIZE,
+                    12.375,
+                    123,
+                    unexpected_frame,
+                )
+            },
+        );
+    }
+
+    #[test]
+    fn decode_from_seek_until_eof_luma_frames_keeps_default_args() {
+        assert_default_command(
+            "-hide_banner -loglevel error -ss 12.375 -i {input} -map 0:v:0 -an -sn \
+             -vf crop=30:40:10:20 -pix_fmt gray -fps_mode passthrough -f rawvideo -",
+            |ffmpeg, input, cwd| {
+                decode_from_seek_until_eof_luma_frames(
+                    ffmpeg,
+                    input,
+                    cwd,
+                    TEST_RECT,
+                    TEST_VIDEO_SIZE,
+                    12.375,
+                    unexpected_frame,
+                )
+            },
+        );
+    }
+
+    #[test]
+    fn input_overrides_keep_argument_boundaries_and_precede_skip_and_seek() {
+        let overrides = FfmpegOverrides {
+            input_args: ["-option", "value with \"quotes\" and spaces", "-option", ""]
+                .map(OsString::from)
+                .to_vec(),
+            ..FfmpegOverrides::default()
+        };
+        for (mode, input_option) in [
+            (DecodeMode::Keyframes, ["-skip_frame", "nokey"]),
+            (
+                DecodeMode::SeekUntilEof {
+                    rect: TEST_RECT,
+                    seek_seconds: 12.375,
+                },
+                ["-ss", "12.375"],
+            ),
+        ] {
+            let args = build_ffmpeg_args(Path::new(TEST_INPUT), mode, &overrides).unwrap();
+            assert_eq!(
+                args[..11],
+                [
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-option",
+                    "value with \"quotes\" and spaces",
+                    "-option",
+                    "",
+                    input_option[0],
+                    input_option[1],
+                    "-i",
+                    TEST_INPUT,
+                ],
+            );
+        }
+    }
+
+    #[test]
+    fn filter_override_expands_coordinates_as_one_argument() {
+        let overrides = FfmpegOverrides {
+            filter_template: Some("crop={w}:{h}:{x}:{y}, format=gray, crop={w}:{h}".into()),
+            ..FfmpegOverrides::default()
+        };
+        let args = build_ffmpeg_args(
+            Path::new(TEST_INPUT),
+            DecodeMode::Full(TEST_RECT),
+            &overrides,
+        )
+        .unwrap();
+        assert_eq!(
+            args[9..13],
+            [
+                "-vf",
+                "crop=30:40:10:20, format=gray, crop=30:40",
+                "-pix_fmt",
+                "gray"
+            ],
+        );
+    }
+
+    #[test]
+    fn unknown_filter_placeholder_is_an_error() {
+        let err = expand_filter_template("crop={width}:{h}:{x}:{y}", TEST_RECT).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "フィルターテンプレート `crop={width}:{h}:{x}:{y}` に未知のプレースホルダー `{width}` があります"
+        );
+    }
+
+    #[test]
+    fn malformed_filter_braces_are_errors() {
+        for (template, reason) in [
+            ("crop={w", "閉じていないプレースホルダーがあります"),
+            ("crop=w}", "対になる開き波括弧のない `}` があります"),
+            ("crop={{w}}", "未知のプレースホルダー `{{w}` があります"),
+            ("crop={w}}", "対になる開き波括弧のない `}` があります"),
+            ("crop={w}{", "閉じていないプレースホルダーがあります"),
+        ] {
+            let err = expand_filter_template(template, TEST_RECT).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                format!("フィルターテンプレート `{template}` に{reason}")
+            );
+        }
+    }
+
+    #[test]
+    fn filter_override_requires_a_rect() {
+        let overrides = FfmpegOverrides {
+            filter_template: Some("crop={w}:{h}:{x}:{y}".into()),
+            ..FfmpegOverrides::default()
+        };
+        let err = build_ffmpeg_args(Path::new(TEST_INPUT), DecodeMode::Keyframes, &overrides)
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "フィルターテンプレート `crop={w}:{h}:{x}:{y}` にはロゴ矩形が必要です"
+        );
+    }
+
+    #[test]
+    fn stream_with_overrides_validates_rect_and_template_before_spawning_ffmpeg() {
+        let cwd = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let overrides = FfmpegOverrides {
+            filter_template: Some("crop={w}:{h}:{x}:{y".into()),
+            ..FfmpegOverrides::default()
+        };
+        for (width, expected_error) in [
+            (TEST_RECT.w, "映像範囲の外"),
+            (
+                TEST_RECT.x + TEST_RECT.w,
+                "フィルターテンプレート `crop={w}:{h}:{x}:{y` に閉じていないプレースホルダーがあります",
+            ),
+        ] {
+            let err = stream_luma_frames_with(
+                &cwd.join("ffmpeg-must-not-be-invoked"),
+                &cwd.join("Cargo.toml"),
+                cwd,
+                TEST_RECT,
+                VideoSize { width, height: 360 },
+                1,
+                &overrides,
+                unexpected_frame,
+            )
+            .unwrap_err();
+            assert!(err.to_string().contains(expected_error), "message={err}");
+        }
+    }
 
     // ---------------------------------------------------------------
     // LogoRect::validate
