@@ -417,10 +417,9 @@ mod tests {
         if std::path::Path::new(FIXTURE).exists() {
             return false;
         }
-        eprintln!(
+        crate::test_support::skip(&format!(
             "{FIXTURE} が無いためスキップします。`tests/fixtures/gen.sh` を実行してください。"
-        );
-        true
+        ))
     }
 
     #[test]
@@ -702,10 +701,7 @@ mod tests {
         };
         match result {
             Ok(output) if output.status.success() => false,
-            _ => {
-                eprintln!("ffprobe が無いためスキップします。");
-                true
-            }
+            _ => crate::test_support::skip("ffprobe が無いためスキップします。"),
         }
     }
 

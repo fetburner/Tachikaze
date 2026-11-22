@@ -600,19 +600,15 @@ mod tests {
         if Path::new(FIXTURE).exists() {
             return false;
         }
-        eprintln!(
+        crate::test_support::skip(&format!(
             "{FIXTURE} が無いためスキップします。`tests/fixtures/gen.sh` を実行してください。"
-        );
-        true
+        ))
     }
 
     fn skip_if_missing(bin: &str) -> bool {
         match std::process::Command::new(bin).arg("-version").output() {
             Ok(output) if output.status.success() => false,
-            _ => {
-                eprintln!("{bin} が無いためスキップします。");
-                true
-            }
+            _ => crate::test_support::skip(&format!("{bin} が無いためスキップします。")),
         }
     }
 

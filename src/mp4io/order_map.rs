@@ -210,10 +210,9 @@ mod tests {
         if std::path::Path::new(FIXTURE).exists() {
             return false;
         }
-        eprintln!(
+        crate::test_support::skip(&format!(
             "{FIXTURE} が無いためスキップします。`tests/fixtures/gen.sh` を実行してください。"
-        );
-        true
+        ))
     }
 
     /// 実際に `dtvindex build` で生成した `.dtvi` の抜粋（ヘッダ全体 + 先頭40フレーム）。
