@@ -5,7 +5,8 @@ on:
     branches: [master]
   pull_request:
 
-# 本 CI は docs-lint（textlint）、test（fmt / clippy / 単体テスト）、e2e の3ジョブ。
+# 本 CI は actionlint（ワークフロー検査）、docs-lint（textlint）、test（fmt / clippy / 単体テスト）、e2e の4ジョブ。
+# actionlint は Docker コンテナ action を使うため ubuntu-latest で動かす。
 # docs-lint と test は ubuntu-slim で動かす。ジョブ上限は 15 分で、特権操作（Docker-in-Docker 等）はできない。
 # コールドビルドが 15 分に近づくようなら ubuntu-latest に戻す。
 # test は TACHIKAZE_REQUIRE_TEST_PREREQS を設定せず、外部ツールもフィクスチャもない環境で通ることを検査する。
@@ -19,6 +20,24 @@ on:
 # フィクスチャはコミットせず毎回生成する。ffmpeg の導入と生成には合わせて約1分かかる。
 # 実ツールを使うテストは、上流起因の失敗と本体のデグレを見分けるため、e2e では --skip で除外して別ジョブで扱う。
 jobs:
+  # actionlint の実行と PR への行コメントに reviewdog/action-actionlint を使う。
+  # 上流 rhysd/actionlint 1.7.12 と ShellCheck 0.11.0 を同梱し、GHCR イメージを digest で固定した v1.74.0 を SHA で参照する。
+  # v1.75.0 以降は個人のフォーク kjanat/actionlint から 1.17.x を取得するため、更新しない。
+  actionlint:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: reviewdog/action-actionlint@8b682e1e7e512151d73a6b9449cbff173846226e  # v1.74.0
+        with:
+          # github-pr-review は PR がないと指摘を処理せずに成功で終わるため、push では Actions の注釈を使う。
+          reporter: ${{ github.event_name == 'pull_request' && 'github-pr-review' || 'github-annotations' }}
+          # SC2086 など info の指摘でもジョブを失敗させる。
+          fail_level: any
+          filter_mode: nofilter
+
   # 日本語ドキュメントの文面検査（ルールは .textlintrc.json、版は package-lock.json で固定）。
   # no-doubled-joshi / ja-no-mixed-period 等は技術文書では誤検知が多いため無効化し、
   # 文長(120字)・読点数など読みやすさに直結する規則だけを効かせている。
