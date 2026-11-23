@@ -5,10 +5,17 @@ on:
     branches: [master]
   pull_request:
 
-# 本 CI は docs-lint（textlint）と test（fmt / clippy / 単体テスト）の2ジョブ。
-# どちらも外部3ツールや ffmpeg は要らないため、1 vCPU の ubuntu-slim で足りる。
-# 制約: ジョブ上限 15 分・特権操作不可（Docker-in-Docker 等）。
+# 本 CI は docs-lint（textlint）、test（fmt / clippy / 単体テスト）、e2e の3ジョブ。
+# docs-lint と test は ubuntu-slim で動かす。ジョブ上限は 15 分で、特権操作（Docker-in-Docker 等）はできない。
 # コールドビルドが 15 分に近づくようなら ubuntu-latest に戻す。
+# test は TACHIKAZE_REQUIRE_TEST_PREREQS を設定せず、外部ツールもフィクスチャもない環境で通ることを検査する。
+# TACHIKAZE_REQUIRE_TEST_PREREQS は e2e だけで設定する。
+# ubuntu-slim は container ジョブに使えないため、e2e は ubuntu-24.04 と ubuntu-24.04-arm で動かす。
+# 主な実行環境は Linux で、arm64 は事前検証済みだが x86_64 は未検証のため、両方で実行する。
+# e2e は rust:1-trixie を使い、runtime と同じ Debian 13 の ffmpeg を apt で入れる。
+# Debian 13 は stable のため、ffmpeg のマイナー版は変わらない。
+# フィクスチャはコミットせず毎回生成する。ffmpeg の導入と生成には合わせて約1分かかる。
+# 実ツールを使うテストは、上流起因の失敗と本体のデグレを見分けるため、e2e では --skip で除外して別ジョブで扱う。
 jobs:
   # 日本語ドキュメントの文面検査（ルールは .textlintrc.json、版は package-lock.json で固定）。
   # no-doubled-joshi / ja-no-mixed-period 等は技術文書では誤検知が多いため無効化し、
@@ -52,3 +59,40 @@ jobs:
 
       - name: cargo test
         run: cargo test
+
+  e2e:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    container: rust:1-trixie
+    env:
+      TACHIKAZE_REQUIRE_TEST_PREREQS: "1"
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: ffmpeg
+        run: |
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends ffmpeg
+          ffmpeg -version | head -1
+
+      - uses: actions/cache@v6
+        with:
+          path: |
+            /usr/local/cargo/registry
+            /usr/local/cargo/git
+            target
+          key: ${{ runner.os }}-${{ runner.arch }}-e2e-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-e2e-cargo-
+
+      - name: fixtures
+        run: bash tests/fixtures/gen.sh
+
+      - name: cargo test (include ignored)
+        run: >
+          cargo test --locked --no-fail-fast --
+          --include-ignored
+          --skip analyze::tests::analyze_run_produces_trim_list_with_real_tools
