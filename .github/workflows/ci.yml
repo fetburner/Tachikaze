@@ -5,8 +5,8 @@ on:
     branches: [master]
   pull_request:
 
-# 本 CI は docs-lint（textlint）、test（fmt / clippy / 単体テスト）、e2e の3ジョブ。
-# docs-lint と test は ubuntu-slim で動かす。ジョブ上限は 15 分で、特権操作（Docker-in-Docker 等）はできない。
+# 本 CI は actionlint（ワークフロー検査）、docs-lint（textlint）、test（fmt / clippy / 単体テスト）、e2e の4ジョブ。
+# actionlint、docs-lint、test は ubuntu-slim で動かす。ジョブ上限は 15 分で、特権操作（Docker-in-Docker 等）はできない。
 # コールドビルドが 15 分に近づくようなら ubuntu-latest に戻す。
 # test は TACHIKAZE_REQUIRE_TEST_PREREQS を設定せず、外部ツールもフィクスチャもない環境で通ることを検査する。
 # TACHIKAZE_REQUIRE_TEST_PREREQS は e2e だけで設定する。
@@ -19,6 +19,29 @@ on:
 # フィクスチャはコミットせず毎回生成する。ffmpeg の導入と生成には合わせて約1分かかる。
 # 実ツールを使うテストは、上流起因の失敗と本体のデグレを見分けるため、e2e では --skip で除外して別ジョブで扱う。
 jobs:
+  # 公式スクリプトに OS とアーキテクチャの判定を任せ、取得元のタグとバイナリの版を固定する。
+  actionlint:
+    runs-on: ubuntu-slim
+    steps:
+      - uses: actions/checkout@v7
+      - name: ShellCheck
+        shell: bash
+        run: |
+          if ! command -v shellcheck; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends shellcheck
+          fi
+          shellcheck --version
+      - name: actionlint
+        shell: bash
+        run: |
+          curl --fail --silent --show-error --location \
+            --output "$RUNNER_TEMP/download-actionlint.bash" \
+            https://raw.githubusercontent.com/rhysd/actionlint/v1.7.12/scripts/download-actionlint.bash
+          bash "$RUNNER_TEMP/download-actionlint.bash" 1.7.12 "$RUNNER_TEMP"
+          "$RUNNER_TEMP/actionlint" -version
+          "$RUNNER_TEMP/actionlint" -shellcheck "$(command -v shellcheck)"
+
   # 日本語ドキュメントの文面検査（ルールは .textlintrc.json、版は package-lock.json で固定）。
   # no-doubled-joshi / ja-no-mixed-period 等は技術文書では誤検知が多いため無効化し、
   # 文長(120字)・読点数など読みやすさに直結する規則だけを効かせている。
