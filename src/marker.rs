@@ -20,12 +20,14 @@
 //! - **時刻を秒の浮動小数で持ち回さない。** ffmetadata には pts の整数をそのまま書き、丸め誤差を
 //!   持ち込まない。秒に直すのは EDL を書くときだけ（小数点以下3桁）。
 //! - **切らないので境界をキーフレームに丸めない。** 境界は指定どおりのフレームの pts になる。
-//! - **time_base は `.dtvi` ヘッダから整数で読む。** [`crate::report::time_base`] は使わない。
+//! - **隣接する保持区間は1つにまとめる。** `Trim(0,4) ++ Trim(5,9)` は本編が途切れない1区間
+//!   なので、チャプターも1つにする。本編 / CM の交互列を保つため。
+//! - **time_base は `.dtvi` ヘッダから整数で読む。** `crate::report::time_base` は使わない。
 //!   あちらはキーが欠けると黙って `1/1` を返し、f64 を返すため整数の ffmetadata に合わないから。
 //!
 //! 次の場合はエラーにする（黙って別の値を書かない）:
 //! - time_base が欠けている、0 以下、または整数としてパースできない
-//! - Trim の終端が `frame_count` を超える
+//! - Trim の最終フレーム（両端を含む。trim.avs の `Trim(s,e)` の `e`）が `.dtvi` の範囲を超える
 //! - 境界に使うフレームの pts が無効（`has_valid_pts()` が false）
 
 use std::fmt;
@@ -52,8 +54,12 @@ pub enum MarkerError {
         key: &'static str,
         value: Option<String>,
     },
-    /// Trim の終端（含まない）がフレーム数を超えている。
-    TrimBeyondFrames { end: usize, frame_count: usize },
+    /// Trim の最終フレーム（両端を含む）が `.dtvi` のフレーム範囲 `0..frame_count` を超えている。
+    /// `last_frame` は trim.avs の `Trim(s,e)` の `e` と同じ値。
+    TrimBeyondFrames {
+        last_frame: usize,
+        frame_count: usize,
+    },
     /// 境界に使うフレームの pts が無効。`frame_number` は表示順の添字。
     InvalidPts { frame_number: usize },
 }
@@ -65,10 +71,19 @@ impl fmt::Display for MarkerError {
                 Some(v) => write!(f, ".dtvi の {key} が正の整数ではない: {v:?}"),
                 None => write!(f, ".dtvi に {key} がない"),
             },
-            MarkerError::TrimBeyondFrames { end, frame_count } => write!(
-                f,
-                "Trim の終端 {end} がフレーム数 {frame_count} を超えている"
-            ),
+            MarkerError::TrimBeyondFrames {
+                last_frame,
+                frame_count,
+            } => match frame_count.checked_sub(1) {
+                Some(max) => write!(
+                    f,
+                    "Trim の最終フレーム {last_frame} が .dtvi のフレーム範囲 0..={max} を超えている"
+                ),
+                None => write!(
+                    f,
+                    "Trim の最終フレーム {last_frame} があるが .dtvi にフレームがない"
+                ),
+            },
             MarkerError::InvalidPts { frame_number } => {
                 write!(f, "表示順 {frame_number} のフレームの pts が無効")
             }
@@ -142,7 +157,11 @@ fn segments(trim: &TrimList, frame_count: usize) -> Result<Vec<Segment>, MarkerE
         let start = range.start().0 as usize;
         let end = range.end().0 as usize;
         if end > frame_count {
-            return Err(MarkerError::TrimBeyondFrames { end, frame_count });
+            // end は半開なので end >= 1（start < end）。最終フレームは end - 1。
+            return Err(MarkerError::TrimBeyondFrames {
+                last_frame: end - 1,
+                frame_count,
+            });
         }
         if start > cursor {
             out.push(Segment {
@@ -151,11 +170,15 @@ fn segments(trim: &TrimList, frame_count: usize) -> Result<Vec<Segment>, MarkerE
                 is_cm: true,
             });
         }
-        out.push(Segment {
-            start,
-            end,
-            is_cm: false,
-        });
+        match out.last_mut() {
+            // 隣接する本編は1区間に統合する（直前が本編で、ちょうど続いている場合）。
+            Some(last) if !last.is_cm && last.end == start => last.end = end,
+            _ => out.push(Segment {
+                start,
+                end,
+                is_cm: false,
+            }),
+        }
         cursor = end;
     }
     if cursor < frame_count {
@@ -282,7 +305,41 @@ mod tests {
         let m = markers(&trim("Trim(0,4)"), &dtvi).unwrap();
         assert_eq!(m.cm_count, 1);
         assert_eq!(m.edl, "0.050\t0.100\t3\n");
-        assert!(m.ffmetadata.contains("START=0\nEND=50\ntitle=本編\n"));
+        assert_eq!(
+            m.ffmetadata,
+            ";FFMETADATA1\n\
+             [CHAPTER]\nTIMEBASE=1/1000\nSTART=0\nEND=50\ntitle=本編\n\
+             [CHAPTER]\nTIMEBASE=1/1000\nSTART=50\nEND=100\ntitle=CM\n"
+        );
+    }
+
+    #[test]
+    fn adjacent_trims_merge_into_one_section() {
+        // Trim(0,4) = [0,5), Trim(5,9) = [5,10) は途切れない1区間として扱う。
+        let dtvi = ten_frames();
+        let m = markers(&trim("Trim(0,4) ++ Trim(5,9)"), &dtvi).unwrap();
+        assert_eq!(m.cm_count, 0);
+        assert_eq!(m.edl, "");
+        assert_eq!(
+            m.ffmetadata,
+            ";FFMETADATA1\n[CHAPTER]\nTIMEBASE=1/1000\nSTART=0\nEND=100\ntitle=本編\n"
+        );
+    }
+
+    #[test]
+    fn adjacent_trims_after_leading_cm_merge_into_one_section() {
+        // CM [0,2), 本編 [2,5)+[5,7) = [2,7), CM [7,10)
+        let dtvi = ten_frames();
+        let m = markers(&trim("Trim(2,4) ++ Trim(5,6)"), &dtvi).unwrap();
+        assert_eq!(m.cm_count, 2);
+        assert_eq!(m.edl, "0.000\t0.020\t3\n0.070\t0.100\t3\n");
+        assert_eq!(
+            m.ffmetadata,
+            ";FFMETADATA1\n\
+             [CHAPTER]\nTIMEBASE=1/1000\nSTART=0\nEND=20\ntitle=CM\n\
+             [CHAPTER]\nTIMEBASE=1/1000\nSTART=20\nEND=70\ntitle=本編\n\
+             [CHAPTER]\nTIMEBASE=1/1000\nSTART=70\nEND=100\ntitle=CM\n"
+        );
     }
 
     #[test]
@@ -291,7 +348,12 @@ mod tests {
         let m = markers(&trim("Trim(3,9)"), &dtvi).unwrap();
         assert_eq!(m.cm_count, 1);
         assert_eq!(m.edl, "0.000\t0.030\t3\n");
-        assert!(m.ffmetadata.ends_with("START=30\nEND=100\ntitle=本編\n"));
+        assert_eq!(
+            m.ffmetadata,
+            ";FFMETADATA1\n\
+             [CHAPTER]\nTIMEBASE=1/1000\nSTART=0\nEND=30\ntitle=CM\n\
+             [CHAPTER]\nTIMEBASE=1/1000\nSTART=30\nEND=100\ntitle=本編\n"
+        );
     }
 
     #[test]
@@ -346,9 +408,18 @@ mod tests {
         assert_eq!(
             markers(&trim("Trim(5,10)"), &dtvi),
             Err(MarkerError::TrimBeyondFrames {
-                end: 11,
+                last_frame: 10,
                 frame_count: 10
             })
+        );
+    }
+
+    #[test]
+    fn trim_beyond_frame_count_message_uses_trim_avs_notation() {
+        let err = markers(&trim("Trim(5,10)"), &ten_frames()).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Trim の最終フレーム 10 が .dtvi のフレーム範囲 0..=9 を超えている"
         );
     }
 

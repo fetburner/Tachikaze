@@ -49,12 +49,9 @@ pub const FLAG_KEY_PACKET: u8 = 0x01;
 /// 最初のランダムアクセス可能な PTS より前に提示される先行サンプル。
 /// オープン GOP の判定に使う（[`Dtvi::leading_frame_count`] 参照）。
 pub const FLAG_LEADING_SAMPLE: u8 = 0x02;
-// 現在の cut/analyze パイプラインは PTS・DTS・バイト位置の有効性を利用しない
-// （キーパケット判定とオープン GOP 判定にしか flags を使わない）ため、以下の
-// 3つのフラグとその判定メソッドはどこからも呼ばれない。`.dtvi` の仕様を
-// 完全な形で残す（将来デバッグや詳細な報告に使う可能性がある）ためのフラグ
-// 定義として意図的に残す。
-#[allow(dead_code)]
+// 有効な PTS の判定はマーカー生成（`marker` モジュール）が使う。DTS とバイト位置の2つは
+// 現在のパイプラインでは使われないため、仕様を完全な形で残す目的で定義だけ置いている
+// （`#[allow(dead_code)]` 付き）。
 /// 有効な PTS を持つ。
 pub const FLAG_VALID_PTS: u8 = 0x04;
 #[allow(dead_code)]
@@ -106,7 +103,6 @@ impl DtviFrame {
         self.flags & FLAG_LEADING_SAMPLE != 0
     }
 
-    #[allow(dead_code)]
     /// 有効な PTS を持つかどうか。
     pub fn has_valid_pts(&self) -> bool {
         self.flags & FLAG_VALID_PTS != 0
