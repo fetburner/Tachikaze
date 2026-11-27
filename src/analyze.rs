@@ -3606,10 +3606,18 @@ mod tests {
     /// analyze パイプライン全体が `Trim(...)` を含む `TrimList` を返すことを
     /// 確認する統合テスト。
     ///
+    /// 検査する不変条件: 各区間が `start < end`、全区間が `[0, フレーム数)` に収まる、
+    /// 区間が昇順で互いに重ならない。
+    ///
+    /// 期待値の完全一致（ゴールデン）にはしない。手元の macOS では `docs/toolchain-macos.md`
+    /// の手順で upstream HEAD をビルドするため、CI の SHA 固定版と出力がずれうる。
+    /// ゴールデンにすると「3ツールが有る環境でも通る」が版次第で崩れるので、構造だけを見る。
+    ///
     /// 3ツールの実バイナリはリポジトリに含まれず、用意にも時間がかかる
     /// （`docs/toolchain-macos.md` 参照）ため既定では無視する。実行する場合は
     /// 該当手順でビルドし、`PATH` から引けるようにした上で、`tests/fixtures/gen.sh`
-    /// でフィクスチャを生成し `cargo test -- --ignored` で回すこと。
+    /// でフィクスチャを生成し `cargo test -- --ignored` で回すこと。CI では
+    /// `e2e-tools` ジョブがこのテストを `--skip` なしで回す。
     #[test]
     #[ignore = "dtvindex/chapter_exe/join_logo_scp の実バイナリと実サンプルmp4が必要（docs/toolchain-macos.md）"]
     fn analyze_run_produces_trim_list_with_real_tools() {
@@ -3639,13 +3647,7 @@ mod tests {
 
         let output = run(&config).expect("analyze パイプラインが成功するはず");
 
-        // 期待値の完全一致（ゴールデン）にはしない。手元の macOS では docs/toolchain-macos.md
-        // の手順で upstream HEAD をビルドするため、CI の SHA 固定版と出力がずれうる。
-        // ゴールデンにすると「3ツールが有る環境でも通る」が版次第で崩れるので、
-        // 構造の不変条件だけを検査する。
-        //
-        // 区間は表示順の半開区間 [start, end)。フレーム数は実際に使った .dtvi から取る
-        // （fixture は 20 秒・599 フレーム。値を直書きすると fixture 更新時に壊れる）。
+        // フレーム数は実際に使った .dtvi から取る。区間は表示順の半開区間 [start, end)。
         let frame_count =
             u32::try_from(output.dtvi.frames.len()).expect("フレーム数が u32 に収まる");
         let ranges = output.trim.ranges();

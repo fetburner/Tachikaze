@@ -10,17 +10,16 @@ on:
 # docs-lint と test は ubuntu-slim で動かす。ジョブ上限は 15 分で、特権操作（Docker-in-Docker 等）はできない。
 # コールドビルドが 15 分に近づくようなら ubuntu-latest に戻す。
 # test は TACHIKAZE_REQUIRE_TEST_PREREQS を設定せず、外部ツールもフィクスチャもない環境で通ることを検査する。
-# TACHIKAZE_REQUIRE_TEST_PREREQS は e2e だけで設定する。
-# ubuntu-slim は container ジョブに使えないため、e2e は ubuntu-24.04 と ubuntu-24.04-arm で動かす。
+# TACHIKAZE_REQUIRE_TEST_PREREQS は e2e と e2e-tools で設定する。
+# ubuntu-slim は container ジョブに使えないため、e2e と e2e-tools は ubuntu-24.04 と ubuntu-24.04-arm で動かす。
 # 主な実行環境は Linux で、arm64 は事前検証済みだが x86_64 は未検証のため、両方で実行する。
-# e2e は rust:1-trixie を使い、runtime と同じ Debian 13 の ffmpeg を apt で入れる。
+# e2e と e2e-tools は rust:1-trixie を使い、runtime と同じ Debian 13 の ffmpeg を apt で入れる。
 # Debian 13 は stable のため、ffmpeg のマイナー版は変わらない。
-# apt のネットワーク取得に起因する一時的な失敗を減らすため、パッケージ一覧と .deb をキャッシュする。
+# e2e は apt のネットワーク取得に起因する一時的な失敗を減らすため、パッケージ一覧と .deb をキャッシュする。
 # キャッシュが当たったら、まずネットワークに接続せず ffmpeg の導入を試す。
 # フィクスチャはコミットせず毎回生成する。ffmpeg の導入と生成には合わせて約1分かかる。
-# 実ツールを使うテストは、上流起因の失敗と本体のデグレを見分けるため、e2e では --skip で除外して別ジョブで扱う。
-# e2e-tools は外部3ツール（chapter_exe / join_logo_scp / dtvindex）を scripts/build-external-tools.sh で SHA 固定ビルドして、
-# 実ツールを使うテストを --skip なしで回す。3ツールのビルド失敗（上流起因）と本体のデグレを、ジョブ単位で見分けられるようにする。
+# 実ツールを使うテストは、上流起因の失敗と本体のデグレを見分けるため、e2e では --skip で除外し、
+# e2e-tools では --skip なしで回す。3ツールは scripts/build-external-tools.sh で SHA 固定ビルドする。
 jobs:
   # actionlint の実行と PR への行コメントに reviewdog/action-actionlint を使う。
   # 上流 rhysd/actionlint 1.7.12 と ShellCheck 0.11.0 を同梱し、GHCR イメージを digest で固定した v1.74.0 を SHA で参照する。
@@ -136,8 +135,7 @@ jobs:
           --include-ignored
           --skip analyze::tests::analyze_run_produces_trim_list_with_real_tools
 
-  # 外部3ツールを実際に起動するテストを回す。e2e とは別ジョブにして、上流のビルド失敗と本体のデグレを見分ける。
-  # container・matrix・TACHIKAZE_REQUIRE_TEST_PREREQS は e2e と揃える。3ツールの版は scripts/build-external-tools.sh の SHA だけで決まる。
+  # 3ツールの版は scripts/build-external-tools.sh の SHA だけで決まる。
   e2e-tools:
     strategy:
       fail-fast: false
@@ -183,9 +181,9 @@ jobs:
             /usr/local/cargo/registry
             /usr/local/cargo/git
             target
-          key: ${{ runner.os }}-${{ runner.arch }}-e2e-tools-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-e2e-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-${{ runner.arch }}-e2e-tools-cargo-
+            ${{ runner.os }}-${{ runner.arch }}-e2e-cargo-
 
       - name: fixtures
         run: bash tests/fixtures/gen.sh
