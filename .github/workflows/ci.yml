@@ -15,8 +15,10 @@ on:
 # 主な実行環境は Linux で、arm64 は事前検証済みだが x86_64 は未検証のため、両方で実行する。
 # e2e と e2e-tools は rust:1-trixie を使い、runtime と同じ Debian 13 の ffmpeg を apt で入れる。
 # Debian 13 は stable のため、ffmpeg のマイナー版は変わらない。
-# e2e は apt のネットワーク取得に起因する一時的な失敗を減らすため、パッケージ一覧と .deb をキャッシュする。
-# キャッシュが当たったら、まずネットワークに接続せず ffmpeg の導入を試す。
+# container ジョブの run は shell 未指定だと sh（Debian では dash）で動く。
+# actionlint は bash として検査するため、bash 固有の構文は検出されない。
+# e2e と e2e-tools は apt のネットワーク取得に起因する一時的な失敗を減らすため、パッケージ一覧と .deb をキャッシュする。
+# キャッシュが当たったら、まずネットワークに接続せず導入を試す。
 # フィクスチャはコミットせず毎回生成する。ffmpeg の導入と生成には合わせて約1分かかる。
 # 実ツールを使うテストは、上流起因の失敗と本体のデグレを見分けるため、e2e では --skip で除外し、
 # e2e-tools では --skip なしで回す。3ツールは scripts/build-external-tools.sh で SHA 固定ビルドする。
@@ -149,16 +151,33 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # 3ツールの実行時に libav の共有ライブラリが要るため、キャッシュが当たっても ffmpeg は必ず入れる。
+      # key は e2e と分ける。ビルド依存を含むためパッケージの集合が違い、同じ key だと先に保存した側の中身で固定される。
+      # パッケージ一覧を変えたら key の v を上げる。上げないと、キャッシュに新しいパッケージがなく --no-download が毎回失敗する。
+      # key が既にあるためキャッシュは上書きされず、エラーも出ないまま効果だけが失われる。
+      - name: apt cache for ffmpeg and build dependencies
+        id: apt-cache
+        uses: actions/cache@v6
+        with:
+          path: |
+            /var/cache/apt/archives
+            /var/lib/apt/lists
+          key: ${{ runner.os }}-${{ runner.arch }}-apt-tools-v1
+
+      # 3ツールの実行時に libav の共有ライブラリが要るため、external tools cache が当たってビルドを飛ばしても ffmpeg は必ず入れる。
       # ビルド依存は scripts/build-external-tools.sh 冒頭のコメントと同じ。
       - name: ffmpeg and build dependencies
         env:
+          APT_CACHE_HIT: ${{ steps.apt-cache.outputs.cache-hit }}
           DEBIAN_FRONTEND: noninteractive
         run: |
-          apt-get -o Acquire::Retries=3 update -qq
-          apt-get -o Acquire::Retries=3 install -y -qq --no-install-recommends \
-            ffmpeg build-essential pkg-config git ca-certificates libavformat-dev \
+          rm -f /etc/apt/apt.conf.d/docker-clean
+          printf '%s\n' 'APT::Keep-Downloaded-Packages "true";' > /etc/apt/apt.conf.d/keep-downloaded-packages
+          set -- ffmpeg build-essential pkg-config git ca-certificates libavformat-dev \
             libavcodec-dev libavutil-dev libswscale-dev libswresample-dev
+          if [ "$APT_CACHE_HIT" != "true" ] || ! apt-get install -y -qq --no-install-recommends --no-download "$@"; then
+            apt-get -o Acquire::Retries=3 update -qq
+            apt-get -o Acquire::Retries=3 install -y -qq --no-install-recommends "$@"
+          fi
           ffmpeg -version | head -1
 
       - name: external tools cache
