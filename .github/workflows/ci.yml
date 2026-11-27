@@ -30,7 +30,7 @@ jobs:
       pull-requests: write
     steps:
       - uses: actions/checkout@v7
-      - uses: reviewdog/action-actionlint@8b682e1e7e512151d73a6b9449cbff173846226e  # v1.74.0
+      - uses: reviewdog/action-actionlint@ae857e78c1b42b3d0a49637181b09d3d56d402b4  # v1.84.1
         with:
           # github-pr-review は PR がないと指摘を処理せずに成功で終わるため、push では Actions の注釈を使う。
           reporter: ${{ github.event_name == 'pull_request' && 'github-pr-review' || 'github-annotations' }}
