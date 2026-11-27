@@ -606,6 +606,69 @@ TOKYO MX の実録画（54019フレーム、キーフレーム451個、`prepare`
 - 目視で、サムネイルをクリックした先が何フレームずれるかは測っていない
 - 確認画面の JS は動かしていない。切り出しの比較は手元で再現した `Trim(...)` で行い、画面が出すコマンドそのものは比べていない
 
+## mark の出力とプレイヤーでの着地位置（#217）
+
+`mark` の出力（チャプター付き mp4 と `.edl`）を、実録画6本で ffprobe・AVFoundation・mpv・Kodi から確かめた。測定日は 2026 年 11 月 27 日。
+
+### 測定の条件
+
+- 録画: 同じ日に録画された6本。局は TOKYO MX・BS11・TBS・テレ東・BS-TBS・BS 日テレが1本ずつ。番組名は著作物なので書かない
+- 形式: H.264（29.97 fps）と Opus。長さは約 29〜60 分（52219〜107964 フレーム）
+- elst: 6本とも映像は1エディットで `media_time` が 1001（30000 timescale で1フレーム）。音声は5本が「空エディット 672 の後に `media_time` 0」で、BS-TBS の1本は「空エディットなしで `media_time` 312」。元の録画の mvhd timescale は 1000。`prepare` が elst を除く入力にあたる
+- 手順: `tachikaze auto IN.mp4 --mark -o OUT.mp4`。TOKYO MX の1本には `--mark --edl-only` も実行した（入力を ASCII 名の symlink にして、`.edl` を録画のディレクトリではなく symlink の隣へ書かせた）
+- gate: 3回止まり、`--ignore-gate` で続けた。TOKYO MX の再実行2回と BS-TBS の初回。この測定は `mark` が trim に忠実かを見るもので、CM 検出が当たったかは見ていない
+- 同じ入力の再実行で trim が変わった例が1本あった（TOKYO MX）。初回はロゴを学習し、`Trim(65,21852) ++ Trim(24550,45618)` で gate は止まらなかった。辞書に保存した結果を使う2回目以降は、末尾に `Trim(48316,48615)` が増え、見逃し候補2件で gate が止まった。原因は調べていない
+- 環境: macOS 27.2.1（arm64）、ffmpeg 9.1、mpv 0.42.0、Kodi 21.3-Omega、QuickTime Player 10.5。QuickTime Player は GUI を操作せず、AVFoundation を Swift から直接呼んだ
+
+### ffprobe での差（実測）
+
+- チャプター境界（6本で39個）と、`trim.avs` のフレーム番号から ffprobe で引いた OUT の表示順フレームの pts の差は、最大も平均も 0.0000 ms
+- チャプター境界と `.dtvi` の pts の差は、39個すべてで −33.3667 ms。`.dtvi` の `start_time`（1001/30000 s、1フレーム）に等しい。`.dtvi` は elst の無い `prepare` 後のファイルから作るため、`mark` の elst 補正が39個すべてで効いている。補正が無ければチャプターは1フレーム遅れる
+- EDL とチャプターの差は最大 0.467 ms。EDL は小数3桁なので、四捨五入の範囲に収まる
+- 元の録画と OUT で、`format=start_time`（0）、各ストリームの `start_pts`（映像 0、音声 672 または 0）、`time_base`、フレーム数が一致した。elst の `media_time` と空エディットも一致した
+- elst の `segment_duration` は一致しない。元の録画は mvhd timescale が 1000 で ms 丸め、OUT は 240000 で書き直される。映像は −1〜−23 ティック（1/30000 s、最大 0.77 ms）、音声は −40〜+16 ティック（1/48000 s、最大 0.83 ms）違った。ffprobe の `duration_ts` は5本で一致し、BS-TBS の音声だけが 16 ティック（0.33 ms）違った
+- 映像と音声のパケットは、ストリームごとに pts・dts・duration・size・flags・CRC32 が6本すべてで一致した。ストリームの並び（インターリーブ）は元と変わるため、全体の並びではなくストリームごとに比べた
+- OUT のストリームは入力に章トラックを1本足したもの（`data`、自身の elst を持つ）。映像・音声のトラックから `tref/chap` で参照され、`udta/chpl` も書かれる。ffprobe はこの章トラックのパケットを出さない
+
+### AVFoundation（QuickTime Player と同じ再生エンジン）
+
+- 章の言語は `und`。`chapterMetadataGroups(bestMatchingPreferredLanguages: ["ja", "en"])` は0件を返した。`availableChapterLocales`（`und`）から読むと全章が読め、開始時刻は ffprobe のチャプターと一致した
+- 各章の先頭へシークした（6本で45章）。`AVPlayer`（許容 0）と `AVAssetImageGenerator`（許容 0）は、着地した pts が期待フレームの pts に45章すべてで一致した（0フレーム）
+- 画素でも確かめた。AVFoundation が出した 64×36 の輝度シグネチャを、ffmpeg でデコードした着地フレーム前後のシグネチャと相関で比べた。前のフレームと区別できる37章では、着地フレームのほうが前のフレームより近かった。残る8章は、前のフレームが無い先頭の章が6章と、単色（黒）で相関が定義できない2章だった
+- `AVPlayer` の既定の許容（`seek(to:)`）では、最も近いキーフレームへ飛ぶ。期待フレームとの差は最大 58 フレーム（1.9 秒）で、手前が22章、先が17章、一致が6章（先頭の章）だった。QuickTime Player のチャプター送りが許容 0 か既定かは見ていない
+
+### mpv 0.42.0
+
+- 既定の設定では、チャプターへの移動は45章すべてで0フレームのずれだった。`time-pos` が期待フレームの pts に一致し、画素でも37章で着地フレームが前のフレームより近かった
+- `--hr-seek=no`（キーフレームだけで飛ぶ）では、直前のキーフレームに着地した。期待フレームとの差は最大 114 フレーム（3.8 秒）、平均 46.5 フレームで、先頭の章を除く39章すべてで手前だった
+
+### Kodi 21.3-Omega（既定の設定）
+
+EDL は6本で25区間ある。Kodi の `time`（ミリ秒精度）を ffprobe の表示順 pts に当てて、着地したフレームを求めた。Kodi が書いたスクリーンショットには映像が写らず（ffmpeg のフレームとの相関が 0.05〜0.16）、画素では確かめられなかった。
+
+- 先頭の CM: 5 秒未満の3本（1.74・2.17・2.44 秒）は飛ばされなかった。5 秒以上の3本（10.21・17.45・127.49 秒）は飛ばされた。
+  短い3本では、Kodi のログに次の行が出ていた。短い先頭の CM は、読み込み時に捨てられている
+
+  ```
+  MergeShortCommBreaks - Removing short commercial break at start [00:00:00.000 - 00:00:02.169]. <5 seconds
+  ```
+
+- 先頭以外の CM は19個すべてが飛ばされた。ファイルの終わりまで続く末尾の CM（5個）は、ファイルの終わりへ飛んで再生が終わった
+- 飛んだ先: 飛ばされる17個の終端（先頭の短い CM を除く）へ、一時停止したまま同じ時刻にシークして着地したフレームを求めた。EDL の終端が最寄りフレームの pts より後なら +1 フレーム（7個）、前なら 0 フレーム（10個）で、例外はなかった。先頭の短い3個を含む20個でも同じ規則だった
+- 規則の理由: EDL は小数3桁に丸める。pts が 819.151667 s のフレームの終端は `819.152` と書かれ、Kodi は pts が指定時刻以上の最初のフレーム（pts 819.185 s）を表示する。ずれは本編の最初の1フレーム（33 ms）が見えないだけだが、`mark` の EDL に由来する再現するずれである
+- 再生中のスキップでも確かめた。実際にスキップさせた直後に一時停止した5境界（+1 が3、0 が2）は、一時停止中のシークと同じ着地だった
+- 先頭の長い CM を飛ばした直後に、位置が 0.6 秒ほど戻って読めた例が2本あった（TBS: 127.496 → 126.889 s、BS 日テレ: 17.452 → 16.889 s）。もう1本（BS-TBS）と途中の CM では起きなかった。原因は調べていない
+
+### 見ていないこと
+
+- QuickTime Player.app の GUI（チャプター送りのキー、章メニューへの表示）。章の言語が `und` なので、GUI に章が出るかは **未検証**
+- VLC と、mpv・Kodi 以外のプレイヤー。VLC はこの Mac に入れていない
+- Kodi の設定を変えた場合（`advancedsettings.xml` の `edl` 節など）。短い先頭の CM を飛ばす設定があるかも調べていない。途中の CM が短い場合（最短は 30.00 秒）と、CM の間の本編が短い場合（最短は 5.0 秒）は、録画に無く見ていない
+- 音声と映像の同期。パケットが一致することは確かめたが、プレイヤー上の同期は見ていない
+- 目視。すべて数値による確認で、人の目では見ていない。Kodi の着地フレームは映像ではなく `time` から求めた
+- 録画の構成。6本はいずれも Opus で、AAC の録画では測っていない。elst の形は2種類（音声の空エディットの有無）だけ
+- CM 検出の当たり外れ。`mark` が trim に忠実かだけを見ている
+
 ## 測定コマンド
 
 キーフレーム間隔の統計（デコードしないので速い）:
@@ -623,4 +686,18 @@ ffprobe -v error -select_streams v:0 -show_entries packet=pts_time,flags \
 ```bash
 ffprobe -v error -select_streams v:0 -show_entries packet=pts,flags \
         -of csv=p=0 IN.mp4 | awk -F, '$2 ~ /K/ {print int($1/1001)}' | sort -n
+```
+
+`mark` の出力のチャプターと、elst の `media_time`（`Processing st:` の行）:
+
+```bash
+ffprobe -v error -show_chapters -of json OUT.mp4
+ffprobe -v trace -i IN.mp4 2>&1 | grep 'edit list'
+```
+
+映像・音声のパケットの CRC32 比較（元の録画と `mark` の出力をストリームごとに比べる。OUT には章トラックが1本増える）:
+
+```bash
+ffprobe -v error -show_entries packet=stream_index,pts,dts,duration,size,flags,data_hash \
+        -show_data_hash CRC32 -of csv=p=0 FILE.mp4
 ```
