@@ -5,7 +5,7 @@ on:
     branches: [master]
   pull_request:
 
-# 本 CI は actionlint（ワークフロー検査）、docs-lint（textlint）、test（fmt / clippy / 単体テスト）、e2e の4ジョブ。
+# 本 CI は actionlint（ワークフロー検査）、docs-lint（textlint）、test（fmt / clippy / 単体テスト）、e2e、e2e-tools の5ジョブ。
 # actionlint は Docker コンテナ action を使うため ubuntu-latest で動かす。
 # docs-lint と test は ubuntu-slim で動かす。ジョブ上限は 15 分で、特権操作（Docker-in-Docker 等）はできない。
 # コールドビルドが 15 分に近づくようなら ubuntu-latest に戻す。
@@ -19,6 +19,8 @@ on:
 # キャッシュが当たったら、まずネットワークに接続せず ffmpeg の導入を試す。
 # フィクスチャはコミットせず毎回生成する。ffmpeg の導入と生成には合わせて約1分かかる。
 # 実ツールを使うテストは、上流起因の失敗と本体のデグレを見分けるため、e2e では --skip で除外して別ジョブで扱う。
+# e2e-tools は外部3ツール（chapter_exe / join_logo_scp / dtvindex）を scripts/build-external-tools.sh で SHA 固定ビルドして、
+# 実ツールを使うテストを --skip なしで回す。3ツールのビルド失敗（上流起因）と本体のデグレを、ジョブ単位で見分けられるようにする。
 jobs:
   # actionlint の実行と PR への行コメントに reviewdog/action-actionlint を使う。
   # 上流 rhysd/actionlint 1.7.12 と ShellCheck 0.11.0 を同梱し、GHCR イメージを digest で固定した v1.74.0 を SHA で参照する。
@@ -133,3 +135,61 @@ jobs:
           cargo test --locked --no-fail-fast --
           --include-ignored
           --skip analyze::tests::analyze_run_produces_trim_list_with_real_tools
+
+  # 外部3ツールを実際に起動するテストを回す。e2e とは別ジョブにして、上流のビルド失敗と本体のデグレを見分ける。
+  # container・matrix・TACHIKAZE_REQUIRE_TEST_PREREQS は e2e と揃える。3ツールの版は scripts/build-external-tools.sh の SHA だけで決まる。
+  e2e-tools:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    container: rust:1-trixie
+    env:
+      TACHIKAZE_REQUIRE_TEST_PREREQS: "1"
+      TOOLS_PREFIX: /opt/tachikaze-tools
+    steps:
+      - uses: actions/checkout@v7
+
+      # 3ツールの実行時に libav の共有ライブラリが要るため、キャッシュが当たっても ffmpeg は必ず入れる。
+      # ビルド依存は scripts/build-external-tools.sh 冒頭のコメントと同じ。
+      - name: ffmpeg and build dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          apt-get -o Acquire::Retries=3 update -qq
+          apt-get -o Acquire::Retries=3 install -y -qq --no-install-recommends \
+            ffmpeg build-essential pkg-config git ca-certificates libavformat-dev \
+            libavcodec-dev libavutil-dev libswscale-dev libswresample-dev
+          ffmpeg -version | head -1
+
+      - name: external tools cache
+        id: tools-cache
+        uses: actions/cache@v6
+        with:
+          path: ${{ env.TOOLS_PREFIX }}
+          key: ${{ runner.os }}-${{ runner.arch }}-external-tools-${{ hashFiles('scripts/build-external-tools.sh') }}
+
+      - name: build external tools
+        if: steps.tools-cache.outputs.cache-hit != 'true'
+        run: bash scripts/build-external-tools.sh "$RUNNER_TEMP/tachikaze-tools-build" "$TOOLS_PREFIX"
+
+      - name: add external tools to PATH
+        run: echo "$TOOLS_PREFIX/bin" >> "$GITHUB_PATH"
+
+      - uses: actions/cache@v6
+        with:
+          path: |
+            /usr/local/cargo/registry
+            /usr/local/cargo/git
+            target
+          key: ${{ runner.os }}-${{ runner.arch }}-e2e-tools-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-e2e-tools-cargo-
+
+      - name: fixtures
+        run: bash tests/fixtures/gen.sh
+
+      # --skip を付けない。全件を回すのは、テストが3ツールの有る環境でも通ることを検査するため。
+      - name: cargo test (include ignored, with external tools)
+        run: cargo test --locked --no-fail-fast -- --include-ignored

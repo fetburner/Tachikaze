@@ -3638,7 +3638,36 @@ mod tests {
         };
 
         let output = run(&config).expect("analyze パイプラインが成功するはず");
-        assert!(!output.trim.ranges().is_empty());
+
+        // 期待値の完全一致（ゴールデン）にはしない。手元の macOS では docs/toolchain-macos.md
+        // の手順で upstream HEAD をビルドするため、CI の SHA 固定版と出力がずれうる。
+        // ゴールデンにすると「3ツールが有る環境でも通る」が版次第で崩れるので、
+        // 構造の不変条件だけを検査する。
+        //
+        // 区間は表示順の半開区間 [start, end)。フレーム数は実際に使った .dtvi から取る
+        // （fixture は 20 秒・599 フレーム。値を直書きすると fixture 更新時に壊れる）。
+        let frame_count =
+            u32::try_from(output.dtvi.frames.len()).expect("フレーム数が u32 に収まる");
+        let ranges = output.trim.ranges();
+        assert!(!ranges.is_empty());
+        for range in ranges {
+            assert!(
+                range.start() < range.end(),
+                "空または逆向きの区間: {range:?}"
+            );
+            assert!(
+                range.end().0 <= frame_count,
+                "区間がフレーム数 {frame_count} を超える: {range:?}"
+            );
+        }
+        for pair in ranges.windows(2) {
+            assert!(
+                pair[0].end() <= pair[1].start(),
+                "区間が昇順でないか重なっている: {:?} と {:?}",
+                pair[0],
+                pair[1]
+            );
+        }
 
         fs::remove_dir_all(&output_dir).ok();
         fs::remove_dir_all(&cache_root).ok();
