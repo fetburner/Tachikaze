@@ -98,6 +98,16 @@ $ gh issue create --template sub-issue --title '[E11-1] ...' --parent 56 --label
 
 **実測** / **未検証** の使い分けは [docs/overview.md](docs/overview.md) の「記述の約束」。
 
+## リリース
+
+`v` 付きのタグを push すると、`.github/workflows/release.yml` が本体バイナリの下書きリリースを作る。公開は人が行う。
+
+1. `Cargo.toml` と `Cargo.lock` の版を上げる PR を出し、マージする
+2. `git tag vX.Y.Z` と `git push origin vX.Y.Z`
+3. ワークフローが成功したことを確かめ、下書きの中身（3 つの tar.gz と `.sha256`、生成されたノート）を見てから公開する
+
+タグと `Cargo.toml` の版が違うと、ワークフローはビルドもリリースもせずに失敗する。
+
 ## 前提
 
 - 映像は H.264（avc1）。avc3 は `cut` / `prepare` で拒否する（[docs/architecture.md](docs/architecture.md)「未対応の入力」）。
