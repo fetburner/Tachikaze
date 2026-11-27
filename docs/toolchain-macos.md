@@ -137,7 +137,7 @@ chapter_exe -v work.mp4 -o scp.txt      # work.mp4.dtvi が作業ディレクト
 
 ## ビルド後の配置とインストール
 
-3 ツールと `JL/` は本リポジトリに含まれないため、`tachikaze` 側の `make install`（後述）の対象にはならない。配置先は `tachikaze` 本体の探索仕様（[architecture.md](architecture.md)「パス解決」節）に合わせる。
+3 ツールと `JL/` は本リポジトリに含まれないため、`tachikaze` 側の `make install`（後述）の対象にはならない。配置先は `tachikaze` 本体の探索仕様（[architecture.md](architecture.md)「パス解決」節）に合わせる。本体は自分でビルドせず、GitHub Releases のビルド済みバイナリでも入れられる（[README](../README.md)「ビルド済みバイナリ」）。
 
 | もの | 配置先 |
 |---|---|

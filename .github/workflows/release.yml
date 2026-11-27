@@ -1,0 +1,146 @@
+name: Release
+
+# v* タグの push で本体バイナリの下書きリリースを作る。公開は人が行う。
+# ビルドは各ターゲットのネイティブランナーで行い、クロスコンパイルはしない。
+# Linux は musl で静的リンクし、glibc の版に左右されないようにする。
+# 外部3ツール・JL・ffmpeg は GPL のソース提供条件が付くため配らない（README「ライセンスと帰属」）。
+# 既定の権限は読み取りだけ。書き込みはリリースを作るジョブだけに与える。
+# タグを push する前に Cargo.toml と Cargo.lock の版を上げておくこと（CLAUDE.md「リリース」）。
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  # タグの版（v を除く）と Cargo.toml の版が違えば、ビルドもリリースも作らずに止める。
+  check-version:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: タグと Cargo.toml の版を比べる
+        run: |
+          tag_version=${GITHUB_REF_NAME#v}
+          cargo_version=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "tachikaze") | .version')
+          if [ "$tag_version" != "$cargo_version" ]; then
+            printf 'タグ %s と Cargo.toml の版 %s が違います\n' "$GITHUB_REF_NAME" "$cargo_version" >&2
+            exit 1
+          fi
+
+  # THIRD-PARTY-LICENSES.md は3ターゲットで同じなので、1回だけ作って各ビルドに渡す。
+  licenses:
+    needs: check-version
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      # 版は scripts/gen-third-party-licenses.sh の CARGO_ABOUT_VERSION と揃える。
+      - name: cargo-about
+        run: cargo install --locked --features cli cargo-about@0.9.3
+      - name: THIRD-PARTY-LICENSES.md
+        run: |
+          mkdir -p out
+          bash scripts/gen-third-party-licenses.sh out/THIRD-PARTY-LICENSES.md
+      - uses: actions/upload-artifact@v7
+        with:
+          name: third-party-licenses
+          path: out/THIRD-PARTY-LICENSES.md
+          if-no-files-found: error
+
+  build:
+    needs: [check-version, licenses]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            runner: macos-15
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-24.04
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    env:
+      TARGET: ${{ matrix.target }}
+      ARCHIVE: tachikaze-${{ github.ref_name }}-${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: musl-tools
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq musl-tools
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # TACHIKAZE_REQUIRE_TEST_PREREQS は設定しない。フィクスチャも外部ツールも無いランナーでは、
+      # それらを要するテストはスキップして成功扱いになる。ここでの検査は単体テストが通ること。
+      - name: cargo test
+        run: cargo test --locked --target "$TARGET"
+
+      - name: cargo build
+        run: cargo build --release --locked --target "$TARGET"
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: third-party-licenses
+          path: licenses
+
+      - name: package
+        run: |
+          set -euo pipefail
+          stage="stage/$ARCHIVE"
+          rm -rf stage dist
+          mkdir -p "$stage" dist
+          install -m 755 "target/$TARGET/release/tachikaze" "$stage/"
+          install -m 644 LICENSE THIRD-PARTY-NOTICES.md README.md licenses/THIRD-PARTY-LICENSES.md "$stage/"
+          # COPYFILE_DISABLE=1 は macOS の tar が AppleDouble（._*）を入れるのを防ぐ。Linux の tar では無視される。
+          COPYFILE_DISABLE=1 tar -C stage -czf "dist/$ARCHIVE.tar.gz" "$ARCHIVE"
+          cd dist
+          shasum -a 256 "$ARCHIVE.tar.gz" > "$ARCHIVE.tar.gz.sha256"
+
+      # 配ったアーカイブを展開し、タグの版が出るかを確かめる。
+      - name: check the archive
+        run: |
+          set -euo pipefail
+          check="$RUNNER_TEMP/check"
+          rm -rf "$check"
+          mkdir -p "$check"
+          tar -xzf "dist/$ARCHIVE.tar.gz" -C "$check"
+          got=$("$check/$ARCHIVE/tachikaze" --version)
+          if [ "$got" != "tachikaze ${GITHUB_REF_NAME#v}" ]; then
+            printf '版の表示が違います: %s\n' "$got" >&2
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist/
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+      # --verify-tag で、タグが push 済みであることを確かめる。下書きなので公開は人が行う。
+      - name: 下書きリリースを作る
+        run: |
+          gh release create "$GITHUB_REF_NAME" --draft --verify-tag --generate-notes \
+            dist/*.tar.gz dist/*.tar.gz.sha256
