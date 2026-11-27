@@ -197,7 +197,13 @@ fn assert_chapters_match(out: &Path, dtvi_text: &str) {
     let chapters = chapters_of(out);
     let frames = frame_pts_sorted(out);
     assert_eq!(chapters.len(), expected_starts.len(), "{chapters:?}");
-    for (i, (start, _)) in chapters.iter().enumerate() {
+    let expected_titles: Vec<&str> = expected
+        .ffmetadata
+        .lines()
+        .filter_map(|l| l.strip_prefix("title="))
+        .collect();
+    for (i, (start, title)) in chapters.iter().enumerate() {
+        assert_eq!(title, expected_titles[i], "チャプター {i} のタイトル");
         assert!(
             (start - expected_starts[i]).abs() <= CHAPTER_TOLERANCE_SECS,
             "チャプター {i}: {start} と .dtvi の期待値 {} の差が許容幅を超えた",

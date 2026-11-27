@@ -195,9 +195,9 @@ tachikaze mark IN.mp4 [--trim trim.avs|-] [--dtvi X.dtvi] [--cache-dir DIR] (-o 
 - `--trim` / `--dtvi` を省略すると、キャッシュの `trim.avs` / `work.mp4.dtvi` を使う。無ければ `analyze` の実行例を添えて止まる。`--trim -` は標準入力から読む
 - 時刻の決め方は `src/marker.rs` のモジュール doc comment に従う。境界は `.dtvi` の**表示順**フレームの pts（デコード順で引くと B フレームぶんずれる、罠3）。キーフレームへの丸めはしない。切らないので、`cut` のような境界ごとの残り（2.1〜2.5 秒）は生じない
 - チャプターの START / END は pts の整数のまま ffmetadata に書き、muxer の timescale に丸められる。実測（`sample.mp4` の5境界）では ffprobe の表示精度（1/240000 s）の範囲で一致した（`tests/mark_e2e.rs`）
-- **時刻系の補正（elst）**: `.dtvi` の時刻系は2通りある。
-  `analyze` は elst の無い入力（prepare 後の `input_prepared.mp4` など）に対して `.dtvi` を作るため、その pts は elst を適用しない composition 時刻になる。
-  一方 `dtvindex` を elst 付きの入力に直接かけると、elst を適用した表示時刻が返る。
+- **時刻系の補正（elst）**: `.dtvi` の時刻系は、その `.dtvi` を作ったファイルに elst があるかで決まる。
+  elst の無いファイル（`prepare` 後の `input_prepared.mp4` など）から作った `.dtvi` は composition 時刻系になる。
+  elst 付きのファイル（`analyze` にそのまま渡した場合を含む）から作った `.dtvi` は表示時刻系になる（`dtvindex` が表示時刻を返すため）。
   `mark` は入力の elst から表示のずれ（`shift`、空エディットの長さから最初の media エディットの媒体時刻を引いたもの）を求める。
   そのうえで、`.dtvi` の先頭フレームの pts がどちらの時刻系に一致するかで補正量を決める（`src/marker.rs::timeline_offset`）。
   どちらにも一致しなければ、別の録画か別の時刻系の `.dtvi` としてエラーにする。補正量は `.dtvi` の全 pts に足す。

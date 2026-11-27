@@ -19,9 +19,9 @@
 //!   B フレームの並べ替えぶんずれた時刻になる。
 //! - **時刻を秒の浮動小数で持ち回さない。** ffmetadata には pts の整数をそのまま書き、丸め誤差を
 //!   持ち込まない。秒に直すのは EDL を書くときだけ（小数点以下3桁）。
-//! - **時刻系の補正は `markers` の外で行う。** `.dtvi` の pts が elst 付き入力の表示時刻とずれる
-//!   場合（`analyze` は elst 無しの入力に対して作る。`dtvindex` は表示時刻を返す）は、`run` が
-//!   [`timeline_offset`] で補正量を決め、pts に足してから `markers` に渡す。`markers` は補正を知らない。
+//! - **時刻系の補正は `markers` の外で行う。** `.dtvi` の時刻系は、その `.dtvi` を作ったファイルに
+//!   elst があるかで決まる。elst 付きの入力と時刻系の違う `.dtvi` の組み合わせは、`run` が
+//!   [`timeline_offset`] で補正量を決めて pts に足してから `markers` に渡す。`markers` は補正を知らない。
 //! - **切らないので境界をキーフレームに丸めない。** 境界は指定どおりのフレームの pts になる。
 //! - **隣接する保持区間は1つにまとめる。** `Trim(0,4) ++ Trim(5,9)` は本編が途切れない1区間
 //!   なので、チャプターも1つにする。本編 / CM の交互列を保つため。
@@ -391,10 +391,11 @@ struct TimelineInput {
 
 /// `.dtvi` の時刻系と入力の時刻系の対応を決め、`.dtvi` の pts に足す補正量（`.dtvi` の time_base 単位）を返す。
 ///
-/// `.dtvi` が取りうる時刻系は2つ。`analyze` が elst 無しの入力に対して作ったものは elst を適用しない
-/// composition 時刻（`raw_first`）。`dtvindex` が elst 付きの入力に直接かけたものは elst を適用した
-/// 表示時刻（`raw_first + shift`）。先頭フレームの pts が表示時刻に一致すれば補正は 0。composition 時刻に
-/// 一致すれば `shift` を足す。どちらにも一致しなければ、別の録画か別の時刻系の `.dtvi` としてエラーにする。
+/// `.dtvi` の時刻系は、その `.dtvi` を作ったファイルに elst があるかで決まる。elst の無いファイル
+/// （`prepare` 後の `input_prepared.mp4` など）から作った `.dtvi` は elst を適用しない composition 時刻系
+/// （`raw_first`）。elst 付きのファイルから作った `.dtvi` は elst を適用した表示時刻系（`raw_first + shift`）。
+/// 先頭フレームの pts が表示時刻に一致すれば補正は 0。composition 時刻に一致すれば `shift` を足す。
+/// どちらにも一致しなければ、別の録画か別の時刻系の `.dtvi` としてエラーにする。
 ///
 /// 一致判定は秒に直して行い、許容幅は入力の mdhd timescale の1ティック（`1/mdhd_ts` 秒）。
 /// 補正量は `shift`（mdhd 単位）を `.dtvi` の time_base 単位に直し、`f64::round`（最も近い整数、
