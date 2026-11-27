@@ -1034,6 +1034,7 @@ fn auto_mark_flag_combinations_are_usage_errors() {
 /// 完了条件: `--mark` で gate が止める入力は exit code 3 で止まり、`mark` のコマンド例を出し、
 /// mp4 も `.edl` も書かない（`cut` の例は出さない）。
 #[test]
+#[ignore = "tests/fixtures/sample.mp4 と tests/data/sample_no_logo.dtvi、ffprobe が必要。tests/fixtures/gen.sh を先に実行すること"]
 fn auto_mark_gate_stop_exits_3_and_writes_nothing() {
     if common::skip_if_fixture_missing() {
         return;
@@ -1095,9 +1096,14 @@ fn auto_mark_gate_stop_exits_3_and_writes_nothing() {
 
 /// 完了条件: `--mark -o OUT.mp4` の出力（チャプターと `.edl`）が、同じ Trim と `.dtvi` で
 /// `tachikaze mark <元の録画> -o` を実行した結果と同じ。
+///
+/// 入力は elst 付きの `sample_elst.mp4`。elst 無しの入力では prepare 後のファイルが元の
+/// 録画と同じパスになり、「prepare 後のファイルを渡す」誤りを検出できないため。
 #[test]
+#[ignore = "tests/fixtures/sample_elst.mp4 と tests/data/sample_no_logo.dtvi、ffprobe（と ffmpeg）が必要。tests/fixtures/gen.sh を先に実行すること"]
 fn auto_mark_video_matches_mark_subcommand() {
-    if common::skip_if_fixture_missing() {
+    let fixture = common::fixture_path_named("sample_elst.mp4");
+    if common::skip_if_fixture_missing_at(&fixture) {
         return;
     }
     if !ffprobe_available() {
@@ -1107,7 +1113,7 @@ fn auto_mark_video_matches_mark_subcommand() {
 
     let tmp_dir = make_tmp_dir("mark-video-match");
     let input = tmp_dir.join("IN.mp4");
-    std::fs::copy(common::fixture_path(), &input).expect("フィクスチャをコピーできること");
+    std::fs::copy(&fixture, &input).expect("フィクスチャをコピーできること");
     let bin_dir = setup_fake_tools_with(
         &tmp_dir,
         &common::no_logo_dtvi_path(),
@@ -1128,17 +1134,18 @@ fn auto_mark_video_matches_mark_subcommand() {
         .env("PATH", common::prepend_path(&bin_dir))
         .output()
         .expect("tachikaze auto の起動に失敗した");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "完走するはず: stderr={stderr}");
     assert!(
-        output.status.success(),
-        "完走するはず: stderr={}",
-        String::from_utf8_lossy(&output.stderr)
+        stderr.contains("[auto] prepare 完了"),
+        "elst 付きなので prepare が別ファイルを作るはず（この経路を通すのが目的）: {stderr}"
     );
 
     // 参照: 同じ入力・同じ Trim・同じ .dtvi で mark サブコマンドを直接実行する。
     // 別ディレクトリに置き、EDL の書き出し先が衝突しないようにする。
     let ref_dir = make_tmp_dir("mark-video-match-ref");
     let ref_input = ref_dir.join("IN.mp4");
-    std::fs::copy(common::fixture_path(), &ref_input).expect("フィクスチャをコピーできること");
+    std::fs::copy(&fixture, &ref_input).expect("フィクスチャをコピーできること");
     let trim = ref_dir.join("trim.avs");
     std::fs::write(&trim, MARK_TRIM_AVS_CONTENT).expect("trim を書けること");
     let ref_out = ref_dir.join("REF.mp4");
@@ -1179,6 +1186,7 @@ fn auto_mark_video_matches_mark_subcommand() {
 /// elst 付きフィクスチャで `prepare` が別ファイル（キャッシュ内の媒体）を作る経路を通す。
 /// 中身は同じ Trim と `.dtvi` で `mark --edl-only` を元の録画に対して実行した結果と一致する。
 #[test]
+#[ignore = "tests/fixtures/sample_elst.mp4 と tests/data/sample_no_logo.dtvi、ffprobe（と ffmpeg）が必要。tests/fixtures/gen.sh を先に実行すること"]
 fn auto_mark_edl_only_writes_next_to_original_input_with_elst() {
     let fixture = common::fixture_path_named("sample_elst.mp4");
     if common::skip_if_fixture_missing_at(&fixture) {
@@ -1199,6 +1207,8 @@ fn auto_mark_edl_only_writes_next_to_original_input_with_elst() {
         DETAIL_JLS_ALL_L,
     );
     let cache = tmp_dir.join("cache");
+    // 既存の EDL を置いておき、`-f` で上書きされることを確かめる（無しだと skip する）。
+    std::fs::write(tmp_dir.join("IN.edl"), b"stale edl").expect("既存の EDL を書けること");
 
     let output = Command::new(env!("CARGO_BIN_EXE_tachikaze"))
         .arg("--cache-dir")
@@ -1208,6 +1218,7 @@ fn auto_mark_edl_only_writes_next_to_original_input_with_elst() {
         .arg("--mark")
         .arg("--edl-only")
         .arg("--no-logo")
+        .arg("-f")
         .env("PATH", common::prepend_path(&bin_dir))
         .output()
         .expect("tachikaze auto の起動に失敗した");
