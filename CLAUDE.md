@@ -2,13 +2,14 @@
 
 mp4 に変換済みの録画ファイルを、**再エンコードせずに CM カット**するツール。CM 検出は既存ツール（chapter_exe → join_logo_scp）に任せ、本ツールは「Trim リスト → ロスレス出力」だけを担う。
 
-**状態**: `analyze` / `cut` / `prepare` / `remap-subs` / `auto` は**実装完了**。`review`（#181）も実装済み。エピック E1〜E11 とそれぞれのサブ issue はすべてクローズ済み（経緯は `git log` の `[E1-1]`〜`[E11-7]`。E11 は字幕の保持と `auto`、#56）。E18（ロゴ矩形の自動推定とロゴ辞書、`[E18-1]`〜`[E18-6]`、#130）も実装完了。言語は Rust、mp4 の読み書きは `mp4-atom` クレート。
+**状態**: `analyze` / `cut` / `prepare` / `remap-subs` / `auto` は**実装完了**。`review`（#181）も実装済み。`mark`（#215）も実装済み（CM 位置を `.edl` とチャプター付き mp4 に書き出す。切らない）。エピック E1〜E11 とそれぞれのサブ issue はすべてクローズ済み（経緯は `git log` の `[E1-1]`〜`[E11-7]`。E11 は字幕の保持と `auto`、#56）。E18（ロゴ矩形の自動推定とロゴ辞書、`[E18-1]`〜`[E18-6]`、#130）も実装完了。言語は Rust、mp4 の読み書きは `mp4-atom` クレート。
 
 ```console
 $ tachikaze analyze IN.mp4 -o trim.avs --report
 $ tachikaze cut IN.mp4 --trim trim.avs -o OUT.mp4
 $ tachikaze auto IN.mp4 -o OUT.mp4   # prepare → analyze → gate → cut → remap-subs を対話なしで合成
 $ tachikaze review IN.mp4            # analyze のキャッシュから確認画面（review/index.html）を作る。ブラウザは開かない
+$ tachikaze mark IN.mp4 -o OUT.mp4   # 切らずに CM 位置を記録する。OUT.mp4 の隣に OUT.edl（--edl-only なら IN.edl のみ）
 $ for f in *.mp4; do case "$f" in *_CMcut.mp4) continue;; esac; tachikaze auto "$f" -o "${f%.mp4}_CMcut.mp4"; done   # 複数ファイルはシェルのループで（出力を *_CMcut.mp4 に固定して glob の再取り込みを避ける）
 ```
 

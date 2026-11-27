@@ -30,10 +30,20 @@
 //! - Trim の最終フレーム（両端を含む。trim.avs の `Trim(s,e)` の `e`）が `.dtvi` の範囲を超える
 //! - 境界に使うフレームの pts が無効（`has_valid_pts()` が false）
 
+use std::ffi::OsString;
 use std::fmt;
+use std::fs;
+use std::io::{self, Read};
+use std::path::{Path, PathBuf};
 
-use crate::dtvi::Dtvi;
+use anyhow::{anyhow, bail, Context, Result};
+
+use crate::analyze::dtvi_frame_count;
+use crate::commands::reject_dash_output;
+use crate::dtvi::{self, Dtvi};
+use crate::errctx::PathContext;
 use crate::trim::TrimList;
+use crate::{external, mp4io, tools, workdir};
 
 /// [`markers`] の出力。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -133,6 +143,232 @@ pub fn markers(trim: &TrimList, dtvi: &Dtvi) -> Result<Markers, MarkerError> {
         ffmetadata,
         cm_count,
     })
+}
+
+/// `mark` の出力先。`-o` と `--edl-only` は clap の排他グループで、どちらか一方だけが来る。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MarkTarget {
+    /// チャプター付き mp4 を書き、その隣に `.edl` を書く。
+    Video(PathBuf),
+    /// mp4 は作らず、入力の隣に `<入力の stem>.edl` だけを書く（再生するのは元の録画）。
+    EdlOnly,
+}
+
+/// [`run`] の入力。`trim` / `dtvi` が `None` のときはキャッシュから解決する。
+/// `trim` が `-` のときは標準入力から読む（`cut --trim -` と同じ）。
+#[derive(Debug, Clone)]
+pub struct MarkConfig {
+    pub input: PathBuf,
+    pub trim: Option<PathBuf>,
+    pub dtvi: Option<PathBuf>,
+    pub cache_dir: Option<PathBuf>,
+    pub target: MarkTarget,
+}
+
+/// [`run`] の結果。`video` は `MarkTarget::Video` のときだけ `Some`。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MarkOutcome {
+    pub video: Option<PathBuf>,
+    pub edl: PathBuf,
+    pub cm_count: usize,
+}
+
+/// `mark` 本体。Trim と `.dtvi` から [`markers`] で EDL と ffmetadata を作り、ファイルに書く。
+///
+/// 書く前に次を検査し、満たさなければ何も書かずに止める（CLAUDE.md 罠3: 別の録画の `.dtvi`
+/// はフレーム数が違えばエラーにしないと時刻が黙ってずれる）:
+/// - `.dtvi` ヘッダの `frame_count` とフレーム表の行数が一致する
+/// - 入力 mp4 の映像サンプル数が `.dtvi` の行数と一致する
+/// - `-o` が入力と同じファイルではない（ffmpeg は入力を読みながら出力を書くため、同じだと壊す）
+///
+/// mp4 は `-map 0` で全ストリームを残し（字幕を黙って落とさない）、`-c copy` でチャプターだけを
+/// 足す。一時ファイルへ書いてから rename し、失敗した場合は一時ファイルを消す。
+pub fn run(config: &MarkConfig) -> Result<MarkOutcome> {
+    let cache = config.cache_dir.as_deref();
+    let input =
+        fs::canonicalize(&config.input).path_ctx("入力ファイルの絶対パス解決", &config.input)?;
+    let analyze_cmd = || workdir::analyze_command(cache, &config.input);
+
+    if let MarkTarget::Video(out) = &config.target {
+        reject_dash_output(out, "-o")?;
+        let out_abs = output_identity(out)?;
+        if out_abs == input {
+            bail!(
+                "-o が入力と同じファイルです（元の録画は上書きしません）: {}",
+                out.display()
+            );
+        }
+    }
+
+    let trim_text = match &config.trim {
+        Some(path) if path == Path::new("-") => {
+            let mut buf = String::new();
+            io::stdin()
+                .read_to_string(&mut buf)
+                .context("trim の標準入力からの読み込みに失敗しました")?;
+            buf
+        }
+        Some(path) => fs::read_to_string(path).path_ctx("trim ファイルの読み込み", path)?,
+        None => {
+            let cached = workdir::cached_trim_path(cache, &input)
+                .path_ctx("`trim.avs` の自動解決", &input)?;
+            read_cached(&cached, &analyze_cmd)?
+        }
+    };
+    let trim = TrimList::parse(&trim_text)
+        .map_err(|err| anyhow!("trim ファイルのパースに失敗しました: {err}"))?;
+
+    let dtvi_path = match &config.dtvi {
+        Some(path) => path.clone(),
+        None => workdir::cached_dtvi_path(cache, &input).path_ctx("`.dtvi` の自動解決", &input)?,
+    };
+    let dtvi_text = match &config.dtvi {
+        Some(path) => fs::read_to_string(path).path_ctx("`.dtvi` の読み込み", path)?,
+        None => read_cached(&dtvi_path, &analyze_cmd)?,
+    };
+    let dtvi =
+        dtvi::parse(&dtvi_text).map_err(|err| anyhow!("`.dtvi` のパースに失敗しました: {err}"))?;
+
+    let header = dtvi_frame_count(&dtvi)?;
+    let rows = dtvi.frames.len() as u64;
+    if header != rows {
+        bail!(
+            "mark: .dtvi のヘッダの frame_count（{header}）とフレーム表の行数（{rows}）が一致しません: {}\n\
+             .dtvi が途中で切れている可能性があります。次を実行して作り直してください:\n  {}",
+            dtvi_path.display(),
+            analyze_cmd()
+        );
+    }
+
+    let moov = mp4io::read::read_moov(&input).path_ctx("入力 mp4 の読み込み", &input)?;
+    let (video_trak, _) = mp4io::read::find_video_track(&moov)
+        .ok_or_else(|| anyhow!("入力に映像トラックがありません: {}", input.display()))?;
+    let file_len = fs::metadata(&input)
+        .path_ctx("入力ファイルのサイズ取得", &input)?
+        .len();
+    let samples = mp4io::read::samples(&video_trak.mdia.minf.stbl, file_len)?.len();
+    if samples != dtvi.frames.len() {
+        bail!(
+            "mark: 入力 mp4 の映像サンプル数（{samples}）と .dtvi のフレーム数（{}）が一致しません。\
+             別の録画の .dtvi を指定していないか確認してください: {}",
+            dtvi.frames.len(),
+            dtvi_path.display()
+        );
+    }
+
+    let markers = markers(&trim, &dtvi).map_err(|err| anyhow!("mark: {err}"))?;
+
+    match &config.target {
+        MarkTarget::EdlOnly => {
+            let edl = input.with_extension("edl");
+            fs::write(&edl, &markers.edl).path_ctx("EDL の書き出し", &edl)?;
+            Ok(MarkOutcome {
+                video: None,
+                edl,
+                cm_count: markers.cm_count,
+            })
+        }
+        MarkTarget::Video(out) => {
+            let out_abs = output_identity(out)?;
+            let name = out_abs
+                .file_name()
+                .ok_or_else(|| anyhow!("-o からファイル名を取れません: {}", out.display()))?;
+            let ffmpeg = tools::resolve_tool(tools::FFMPEG)
+                .context("mark: チャプターの埋め込みに ffmpeg が必要です")?;
+
+            let chapters = workdir::cached_chapters_path(cache, &input)
+                .path_ctx("チャプターのキャッシュパスの解決", &input)?;
+            let chapters_dir = chapters.parent().ok_or_else(|| {
+                anyhow!(
+                    "チャプターのキャッシュパスが不正です: {}",
+                    chapters.display()
+                )
+            })?;
+            fs::create_dir_all(chapters_dir)
+                .path_ctx("キャッシュディレクトリの作成", chapters_dir)?;
+            fs::write(&chapters, &markers.ffmetadata)
+                .path_ctx("ffmetadata の書き出し", &chapters)?;
+
+            // 一時ファイルは出力と同じディレクトリに置く（rename を同一ファイルシステム内に保つため）。
+            // 拡張子は .mp4 のまま残す（ffmpeg が出力形式を拡張子で決めるため）。
+            let parent = out_abs
+                .parent()
+                .ok_or_else(|| anyhow!("-o の親ディレクトリが不正です: {}", out.display()))?;
+            let mut tmp_name = OsString::from(".");
+            tmp_name.push(name);
+            tmp_name.push(".tmp.mp4");
+            let tmp = parent.join(tmp_name);
+
+            let mut args: Vec<OsString> = ["-hide_banner", "-loglevel", "error", "-y", "-i"]
+                .iter()
+                .map(OsString::from)
+                .collect();
+            args.push(input.clone().into_os_string());
+            args.extend(["-f", "ffmetadata", "-i"].iter().map(OsString::from));
+            args.push(chapters.clone().into_os_string());
+            args.extend(
+                [
+                    "-map",
+                    "0",
+                    "-map_metadata",
+                    "0",
+                    "-map_chapters",
+                    "1",
+                    "-c",
+                    "copy",
+                ]
+                .iter()
+                .map(OsString::from),
+            );
+            args.push(tmp.clone().into_os_string());
+            let args_ref: Vec<&std::ffi::OsStr> = args.iter().map(AsRef::as_ref).collect();
+
+            let result = external::run(&ffmpeg, &args_ref, chapters_dir).and_then(|_| {
+                fs::rename(&tmp, &out_abs).path_ctx("出力 mp4 への rename", &out_abs)
+            });
+            if let Err(err) = result {
+                let _ = fs::remove_file(&tmp);
+                return Err(err);
+            }
+
+            let edl = out_abs.with_extension("edl");
+            fs::write(&edl, &markers.edl).path_ctx("EDL の書き出し", &edl)?;
+            Ok(MarkOutcome {
+                video: Some(out_abs),
+                edl,
+                cm_count: markers.cm_count,
+            })
+        }
+    }
+}
+
+/// `-o` の比較用の絶対パス。存在するなら正規化し、無ければ親ディレクトリを正規化してファイル名を足す。
+fn output_identity(out: &Path) -> Result<PathBuf> {
+    if out.exists() {
+        return fs::canonicalize(out).path_ctx("-o の絶対パス解決", out);
+    }
+    let parent = match out.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    let parent = fs::canonicalize(parent).path_ctx("-o の親ディレクトリの解決", parent)?;
+    let name = out
+        .file_name()
+        .ok_or_else(|| anyhow!("-o からファイル名を取れません: {}", out.display()))?;
+    Ok(parent.join(name))
+}
+
+/// キャッシュのファイルを読む。無ければ `analyze` のコマンド例を添えて止める。
+fn read_cached(path: &Path, analyze_cmd: &dyn Fn() -> String) -> Result<String> {
+    if !path.is_file() {
+        bail!(
+            "キャッシュに必要なファイルが見つかりませんでした: {}\n\
+             先に次を実行してください:\n  {}",
+            path.display(),
+            analyze_cmd()
+        );
+    }
+    fs::read_to_string(path).path_ctx("キャッシュファイルの読み込み", path)
 }
 
 /// `.dtvi` ヘッダから time_base を整数で読む。0 以下は不正とする。

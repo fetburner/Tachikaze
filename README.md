@@ -33,6 +33,13 @@ $ tachikaze review IN.mp4   # 確認画面（キャッシュ内の review/index.
 $ tachikaze cut IN.mp4 --trim trim.avs -o OUT.mp4
 ```
 
+切らずに CM の位置だけを残す場合は `mark` を使います。`-o` はチャプターを足した mp4 と隣の `.edl` を作り、`--edl-only` は `.edl` だけを元の録画の隣に作ります:
+
+```console
+$ tachikaze mark IN.mp4 --trim trim.avs -o OUT.mp4
+$ tachikaze mark IN.mp4 --trim trim.avs --edl-only
+```
+
 複数ファイルはシェルのループに任せます（出力を `*_CMcut.mp4` に固定して glob の再取り込みを避ける）:
 
 ```console
