@@ -412,6 +412,54 @@ TOKYO MX の ED 区間（90秒）は、ロゴ自体は出ているのに段差�
 詳細は `src/analyze.rs` の `REQUIRED_STABLE_ROUNDS`/
 `HIER_FALLBACK_GOP_FRACTION_THRESHOLD` の doc comment、自己検証12参照。
 
+### Kodi が `.edl` の終端で1フレーム後に着地する
+
+実測（[measurements.md](measurements.md)「mark の出力とプレイヤーでの着地位置（#217）」）。EDL の秒は小数3桁に丸めて書く。終端（本編の先頭）の丸めが、そのフレームの pts より後になると、Kodi は pts が指定時刻以上の最初のフレームを表示する。そのため本編の最初の1フレーム（33 ms）が見えない。
+
+6本・20個の終端では、丸めが pts より後の9個で +1 フレーム、前の11個で 0 フレームだった。例外はない。
+
+再現手順:
+
+1. 録画に `tachikaze auto IN.mp4 --mark -o OUT.mp4` を実行する
+2. Kodi 21.3（web server 有効）で `OUT.mp4` を開いて一時停止し、`OUT.edl` の終端と同じ時刻へ JSON-RPC の `Player.Seek` でシークする
+3. `Player.GetProperties` の `time` を読み、`ffprobe -select_streams v:0 -show_entries packet=pts` で得た表示順 pts と比べる
+
+例: pts が 819.151667 s のフレームの終端は `819.152` と書かれ、Kodi の位置は 819.185 s（次のフレーム）になった。
+
+直す方向の案は、終端を小数3桁へ切り捨てて書くこと。終端が pts 以下になるので、Kodi は本編の先頭のフレームを表示するはずである。この案は**未検証**。始端の丸めの影響は見ていない。
+
+追跡: #226。
+
+### Kodi は先頭の 5 秒未満の CM を飛ばさない
+
+実測（同上）。Kodi は読み込み時に、先頭の短い CM を EDL から捨てる。ログには `MergeShortCommBreaks - Removing short commercial break at start [...]. <5 seconds` が出る。先頭の CM が 5 秒未満の3本（1.74〜2.44 秒）は飛ばされず、5 秒以上の3本（10.21 秒以上）は飛ばされた。
+
+先頭の CM が 5 秒未満の録画では、その CM が Kodi では残る。残る長さは `cut` が許容する境界ごとの残り（2.1〜2.5 秒）と同程度である。
+
+`mark` の出力を変えて避けられるかは**未検証**。Kodi の設定（`advancedsettings.xml`）で変えられるかも調べていない。
+
+追跡: #227。
+
+再現手順: 先頭の CM が 5 秒未満の録画に `mark` を実行し、Kodi で開いた直後の位置を読む。0 秒付近から再生される。
+
+### チャプターの言語が `und` で、QuickTime Player に出るか未確認
+
+ffmpeg が書く章トラックの言語は `und`。AVFoundation で言語を絞る読み方 `chapterMetadataGroups(bestMatchingPreferredLanguages: ["ja", "en"])` は0件を返した。`availableChapterLocales` から読むと全章が読め、開始時刻も正しい。QuickTime Player.app の章メニューに出るかは**未検証**（GUI を見ていない）。
+
+再現手順: `mark -o` の出力を `AVURLAsset` で開き、上の読み方を呼ぶ。出力が空であることを確かめる。
+
+出ない場合は、章トラックの言語を設定する方法を調べる。
+
+追跡: #228。
+
+### 同じ入力の `auto` を再実行すると trim が変わることがある
+
+実測（同上「測定の条件」）。TOKYO MX の1本で、辞書に無い初回と、辞書に保存した後の2回目以降とで trim が変わり、gate の判定も変わった。初回は2区間で gate が止まらず、2回目以降は末尾に1区間が増えて見逃し候補2件で止まった。原因は調べていない。
+
+再現手順: `--logo-dir` に空のディレクトリを渡して `auto IN.mp4 --mark -o OUT.mp4 --analyze-only` を実行し、同じコマンドをもう一度実行して `trim.avs` を比べる。実測では、1回目が exit code 0 で `Trim(65,21852) ++ Trim(24550,45618)`、2回目が exit code 3 で末尾に `Trim(48316,48615)` が増えた。
+
+追跡: #229。
+
 ## 方針として作らないもの
 
 | 項目 | 理由 |
