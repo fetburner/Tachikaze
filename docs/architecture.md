@@ -16,7 +16,7 @@
 | `analyze` | 外部3ツールを走らせて Trim リストを作る。`--report` で診断と gate 判定。`--logo`/`--no-logo` 省略時はロゴ矩形を自動推定、`--no-logo` でロゴ無しに固定、`--logo-dir` で辞書の場所を変更 |
 | `cut` | Trim をキーフレーム境界へスナップし、mp4 をサンプル単位でロスレスカット |
 | `remap-subs` | 字幕サイドカーの時刻を cut 後タイムラインへ張り替える |
-| `auto` | `prepare`→`analyze`→gate→`cut`→`remap-subs` を対話なしで合成 |
+| `auto` | `prepare`→`analyze`→gate→`cut`→`remap-subs` を対話なしで合成（`--mark` のときは `cut` の代わりに `mark`） |
 | `make-logo` | 入力とロゴ矩形から `.lgd`（ロゴデータ）を作る |
 | `review` | `analyze` のキャッシュから、CM 検出結果を確認・修正する HTML（キーフレームのサムネイル付き）を作る。`analyze` も `prepare` も走らせない |
 | `mark` | 録画を切らず、CM 区間の位置を `.edl`（Kodi 形式）と、チャプターを足した mp4 に書き出す |
@@ -123,7 +123,7 @@ tachikaze remap-subs IN.mp4 [--segment-map PATH] [--subs PATH] [-o OUT.ass|OUT.s
 
 ```
 tachikaze auto IN.mp4 -o OUT.mp4 [--cm-output CM.mp4] [--ignore-gate] [-f|--force]
-                     [--analyze-only] [--no-subtitles] [--snap] [--verify]
+                     [--mark [--edl-only]] [--analyze-only] [--no-subtitles] [--snap] [--verify]
                      [--jl-file] [--jls-set] [--cache-dir]
                      [--logo FILE.lgd | --no-logo] [--logo-dir DIR]
                      [--logo-ffmpeg-input-arg=<ARG>]... [--logo-ffmpeg-vf=<FILTER>]
@@ -132,7 +132,9 @@ tachikaze auto IN.mp4 -o OUT.mp4 [--cm-output CM.mp4] [--ignore-gate] [-f|--forc
 `prepare` → `analyze` → gate 判定 → `cut` → `remap-subs` を対話なしで合成する（`src/auto.rs`）。アルゴリズムは持たず、各ステップは上記の関数・処理をそのまま呼ぶ（`commands::execute_cut` を `cut` サブコマンドと共有。詳細は `src/commands.rs` / `src/auto.rs` の doc comment）。
 
 - gate が「疑わしいので止める」と判定したら cut せず exit code 3 で停止し、trim.avs のパスと、確認画面を開く `review` のコマンド例、「直して cut する」コマンド例を出す。`auto` は `review` を自動実行しない（対話なしで完結する性質を保つため）。`review` の例の入力は `cut` の例と同じ `prepare` 後のパス、`--cache-dir` は `auto` が使ったもの、`-o` は `cut` の例と同じ出力先を渡す（`review` の既定の出力先はキャッシュ内になるため）。`--analyze-only` で止まったときも同じ 2 つの例を出す
+- `--mark` のときは 2 つ目が `mark` の例になる。`--mark --edl-only` の `review` の `-o` は、元の録画基準の既定名 `<stem>_CMcut.mp4` を渡す（`review` の既定の出力先はキャッシュ内になるため）
 - `--ignore-gate` で無視できるのは gate の判定だけで、自己検証や `.dtvi` 必須は変わらない
+- `--mark` を付けると、`cut` と `remap-subs` の代わりに [`mark`](#mark) と同じ処理を元の録画に対して行う（`src/auto.rs` の doc comment「`--mark`」）。`-o OUT.mp4` はチャプター付き mp4 と隣の `OUT.edl`、`--mark --edl-only` は入力の隣の `<stem>.edl` だけを書く。`--cm-output`・`--snap`・`--verify`・`--no-subtitles` とは併用できない（exit code 2）。gate 停止時の案内も `mark` のコマンド例になり、`cut` の例は出さない。`mark` へ渡す trim と `.dtvi` は `analyze` が書いたものを明示する。`mark` の対象を `prepare` 後のファイルにしないのは、字幕トラックとチャプターを元の録画から失わないため。
 - `--analyze-only` は `--ignore-gate` の有無に関わらず cut へ進まない。gate が疑わしいと判定していれば exit code は 3 のまま（無視の対象は「cut へ進むかどうか」で、停止コードそのものではない）
 - 1プロセスにつき入力は1本。複数ファイルはシェルのループに任せる。1入力1プロセスにすることで、exit code の意味が「その1本に対する答え」に一意になる（下記「exit code」）
 - `--logo`、`--no-logo`、`--logo-dir` とロゴ用 ffmpeg の上書き設定は、そのまま `analyze` へ渡す（`auto` 独自のロジックは持たない）。挙動は上記「analyze」の「自動推定」節と同じ
@@ -143,8 +145,9 @@ tachikaze auto IN.mp4 -o OUT.mp4 [--cm-output CM.mp4] [--ignore-gate] [-f|--forc
 
     出力名を `_CMcut.mp4` に固定し、`*.mp4` の glob が前回の出力を再び入力として取り込まないよう `case` で弾いている。
 
-- `-o` は必須（出力先を暗黙に決めない）。CM側は `--cm-output` を指定したときだけ出す
+- `-o` は必須（出力先を暗黙に決めない）。`--mark --edl-only` だけは mp4 を作らないので `-o` を取らない。CM側は `--cm-output` を指定したときだけ出す
 - 本編・CM側・字幕サイドカー（`-o` と同じ stem の `.ass`/`.srt`）のいずれかが既に存在すれば、既定でその入力をスキップする。上書きしたい場合は `-f`/`--force`（`cp -f` の慣習に合わせている）
+- `--mark` のときの既存判定の対象は `OUT.mp4` と `OUT.edl`（`--edl-only` は `<stem>.edl`）。字幕サイドカーは対象外で、字幕の再試行の例外も適用しない（元の録画の字幕トラックが mp4 に残るため）
 - スキップ判定には例外が2つある。字幕トラックがある入力で字幕サイドカーだけ欠けている場合は、本編/CM側が揃っていてもスキップせず再試行する。前回 `remap-subs` が失敗した状態を、次回実行で自動的に直すため（`src/auto.rs` の doc comment「既存出力のスキップと -f/--force」参照）。また `analyze` はキャッシュがあっても毎回実行する。キャッシュキーが入力の絶対パスのハッシュだけで、内容の変化を検出できないため（同 doc comment 参照）
 
 ### make-logo
@@ -233,7 +236,7 @@ tachikaze mark IN.mp4 [--trim trim.avs|-] [--dtvi X.dtvi] [--cache-dir DIR] (-o 
 
 - **`auto` の入力を1本に絞っている理由**: 1プロセスで複数入力を受けると exit code が「N本中M本失敗」に潰れ、スクリプトから「その入力がどうなったか」を一意に読めない。1プロセス1入力にして繰り返しをシェル（`for` / `xargs -n1`）に任せることで、exit code の意味を一意にしている
 - **`-f`/`--force` が上書きの意味である理由**: `cp -f` / `rm -f` の慣習では `-f`/`--force` は「上書き」を指すため、上書きに割り当てている。gate 判定の無視は別に `--ignore-gate` を用意している
-- **`auto -o` が必須である理由**: 出力先は暗黙に決めるより明示させる方が自然。CM側も `--cm-output` の指定有無だけで決まるので、CM側出力の有無を切り替える専用フラグは要らない
+- **`auto -o` が必須である理由**: 出力先は暗黙に決めるより明示させる方が自然。CM側も `--cm-output` の指定有無だけで決まるので、CM側出力の有無を切り替える専用フラグは要らない。`--mark --edl-only` だけは例外で、mp4 を作らないので出力先を取らない（EDL の場所は `mark --edl-only` と同じく元の録画の隣に固定する）
 - **診断を stderr に寄せている理由**: UNIX の作法（stdout はデータ、stderr は診断）に合わせ、進捗・警告・レポートはすべて stderr に出す。空いた stdout は `analyze -o -` で `trim.avs` をパイプに流すために使える
 
 **`analyze` と `cut` を分けたまま `auto` も併設している理由**。検出には見逃しがあるため、`analyze` と `cut` のあいだに人手を挟める設計は崩さない。その上で対話なしの一括処理（`auto`）を安全に足せるのは、次の3つが揃っているから:
@@ -274,7 +277,7 @@ tachikaze mark IN.mp4 [--trim trim.avs|-] [--dtvi X.dtvi] [--cache-dir DIR] (-o 
 
 **蓄積データ**（`src/logo/dict.rs`）。学習済み `.lgd` を貯める辞書ディレクトリ。既定は `$XDG_DATA_HOME/tachikaze/logos`。`XDG_DATA_HOME` が未設定または空文字列なら `<ホームディレクトリ>/.local/share/tachikaze/logos` になる（`dict::resolve_dict_dir`）。キャッシュとは別分類にした理由、環境変数を読む理由は下記「なぜこの形にしたか」参照。
 
-**出力**。`cut -o` / `auto -o`（本編、必須）と `--cm-output`（CM側、`auto` は指定時のみ）はすべて明示指定させる。`mark -o` も明示指定させる。`mark --edl-only` は例外で、入力の隣に `<stem>.edl` を書く（Kodi が再生する動画と同名の EDL を探すため、EDL は再生する録画の隣になければならない）。その他の例外は2つ。`remap-subs` を単体で使うときだけ、入力の隣に `*_CMcut.ass` / `*_CMcut.srt` を既定で置く（`src/commands.rs::default_remap_subs_output_path`）。`auto` の字幕サイドカーは `-o` と同じ stem・別拡張子で書く（`src/auto.rs::subs_sidecar_path`。本編出力と揃えることでプレイヤーが自動で字幕を読み込める）。
+**出力**。`cut -o` / `auto -o`（本編、必須）と `--cm-output`（CM側、`auto` は指定時のみ）はすべて明示指定させる。`mark -o` も明示指定させる。`mark --edl-only`（`auto --mark --edl-only` も同じ）は例外で、入力の隣に `<stem>.edl` を書く（Kodi が再生する動画と同名の EDL を探すため、EDL は再生する録画の隣になければならない）。その他の例外は2つ。`remap-subs` を単体で使うときだけ、入力の隣に `*_CMcut.ass` / `*_CMcut.srt` を既定で置く（`src/commands.rs::default_remap_subs_output_path`）。`auto` の字幕サイドカーは `-o` と同じ stem・別拡張子で書く（`src/auto.rs::subs_sidecar_path`。本編出力と揃えることでプレイヤーが自動で字幕を読み込める）。
 
 なぜこの形にしたか:
 
@@ -433,7 +436,7 @@ TOKYO MX の ED 区間（90秒）は、ロゴ自体は出ているのに段差�
 |---|---|---|
 | `cli.rs` | サブコマンドとオプションの定義 | — |
 | `commands.rs` | 各モジュールを繋ぐ組み立て（アルゴリズムは持たない） | — |
-| `auto.rs` | `auto` コマンドの組み立て（`prepare`→`analyze`→gate→`cut`→`remap-subs`、アルゴリズムは持たない） | 上記「auto」 |
+| `auto.rs` | `auto` コマンドの組み立て（`prepare`→`analyze`→gate→`cut`→`remap-subs`、`--mark` のときは `cut` の代わりに `marker::run`。アルゴリズムは持たない） | 上記「auto」 |
 | `tools.rs` | 外部ツールと JL ファイルの探索 | 上記「パス解決」、[toolchain-macos.md](toolchain-macos.md) |
 | `external.rs` | 外部プロセスの起動と出力の回収 | [pipeline.md](pipeline.md) |
 | `ffprobe.rs` | ffprobe への問い合わせ（CSV 行を返す `csv_rows` / 単一スカラー値を返す `scalar_entry`。`-show_entries` / `-show_data_hash CRC32`）を1か所に集約する責務 | 罠2（md5 ではなくパケット単位の CRC32）、[lossless-cut.md](lossless-cut.md) |

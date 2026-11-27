@@ -397,7 +397,7 @@ fn extract_keyframe_thumbnails(input: &Path, cwd: &Path, thumbs_dir: &Path) -> R
 }
 
 /// 入力と同じディレクトリの `<stem>_CMcut.mp4`。
-fn output_path(input: &Path) -> Result<PathBuf> {
+pub(crate) fn output_path(input: &Path) -> Result<PathBuf> {
     let stem = input
         .file_stem()
         .ok_or_else(|| anyhow!("入力ファイル名から出力名を作れません: {}", input.display()))?;

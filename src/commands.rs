@@ -112,6 +112,8 @@ fn run_auto(cache_dir: Option<PathBuf>, args: AutoArgs) -> anyhow::Result<ExitOu
     let AutoArgs {
         input,
         output,
+        mark,
+        edl_only,
         cm_output,
         ignore_gate,
         force,
@@ -127,9 +129,18 @@ fn run_auto(cache_dir: Option<PathBuf>, args: AutoArgs) -> anyhow::Result<ExitOu
         logo_ffmpeg,
     } = args;
 
+    // `-o` の必須・排他は `cli::AutoArgs` が clap で保証する（`--mark --edl-only` のみ `-o` 無し）。
+    // 組み合わせの残りは到達しない想定のため、念のため同じ規則で弾く。
+    let mode = match (mark, output, edl_only) {
+        (false, Some(output), _) => auto::AutoMode::Cut { output },
+        (true, Some(out), false) => auto::AutoMode::Mark(marker::MarkTarget::Video(out)),
+        (true, None, true) => auto::AutoMode::Mark(marker::MarkTarget::EdlOnly),
+        _ => anyhow::bail!("auto: -o が必要です（--mark --edl-only のときを除く）"),
+    };
+
     let config = auto::AutoConfig {
         cache_dir,
-        output,
+        mode,
         cm_output,
         ignore_gate,
         force,
