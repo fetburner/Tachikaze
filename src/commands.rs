@@ -80,7 +80,7 @@ fn run_mark(cache_dir: Option<PathBuf>, args: MarkArgs) -> anyhow::Result<()> {
         trim,
         dtvi,
         output,
-        // `-o` と `--edl-only` は clap の排他グループ（required）で、どちらか一方が必ず来る。
+        // `-o` と `--edl-only` のどちらか一方が必ず来る（`cli::MarkArgs::output` の `required_unless_present` で保証）。
         edl_only: _,
     } = args;
     let target = match output {

@@ -320,7 +320,7 @@ pub struct MarkArgs {
     )]
     pub output: Option<PathBuf>,
     /// mp4 を作らず、入力の隣に `<stem>.edl` だけを書く。
-    #[arg(long, conflicts_with = "output")]
+    #[arg(long)]
     pub edl_only: bool,
 }
 
