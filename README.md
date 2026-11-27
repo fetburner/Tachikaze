@@ -95,7 +95,15 @@ $ make install          # 既定は /usr/local。PREFIX=$HOME/.local も可
 
 ### ビルド済みバイナリ
 
-GitHub Releases には本体のビルド済みバイナリを添付しています（macOS arm64・Linux x86_64・Linux arm64）。Intel Mac と Windows は対象外です。
+[GitHub Releases](https://github.com/fetburner/Tachikaze/releases) には本体のビルド済みバイナリを添付しています。Intel Mac と Windows は対象外です。
+
+| 環境 | TARGET |
+|---|---|
+| macOS（Apple Silicon） | `aarch64-apple-darwin` |
+| Linux（x86_64） | `x86_64-unknown-linux-musl` |
+| Linux（arm64） | `aarch64-unknown-linux-musl` |
+
+Releases から `tachikaze-vX.Y.Z-TARGET.tar.gz` と `tachikaze-vX.Y.Z-TARGET.tar.gz.sha256` を取得し、次のように検査して入れます。
 
 ```console
 $ shasum -a 256 -c tachikaze-vX.Y.Z-TARGET.tar.gz.sha256   # 同じディレクトリで実行
@@ -104,7 +112,7 @@ $ install -m 755 tachikaze-vX.Y.Z-TARGET/tachikaze /usr/local/bin/
 ```
 
 - macOS でブラウザから取得した場合は、`xattr -d com.apple.quarantine /usr/local/bin/tachikaze` が要ります。バイナリに署名と公証をしていないためです。curl で取得した場合は不要です。
-- 外部3ツールと ffmpeg は別に用意してください（前述「依存」）。
+- 外部3ツールと ffmpeg は別に用意してください（[依存](#依存)）。
 
 ## 既知の制限
 

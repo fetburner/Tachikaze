@@ -36,6 +36,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      # 版は scripts/gen-third-party-licenses.sh の CARGO_ABOUT_VERSION と揃える。
       - name: cargo-about
         run: cargo install --locked --features cli cargo-about@0.9.3
       - name: THIRD-PARTY-LICENSES.md
@@ -73,8 +75,9 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq musl-tools
 
-      - name: rustup target
-        run: rustup target add "$TARGET"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
 
       # TACHIKAZE_REQUIRE_TEST_PREREQS は設定しない。フィクスチャも外部ツールも無いランナーでは、
       # それらを要するテストはスキップして成功扱いになる。ここでの検査は単体テストが通ること。
