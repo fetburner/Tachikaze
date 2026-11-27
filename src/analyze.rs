@@ -3606,10 +3606,18 @@ mod tests {
     /// analyze パイプライン全体が `Trim(...)` を含む `TrimList` を返すことを
     /// 確認する統合テスト。
     ///
+    /// 検査する不変条件: 各区間が `start < end`、全区間が `[0, フレーム数)` に収まる、
+    /// 区間が昇順で互いに重ならない。
+    ///
+    /// 期待値の完全一致（ゴールデン）にはしない。手元の macOS では `docs/toolchain-macos.md`
+    /// の手順で upstream HEAD をビルドするため、CI の SHA 固定版と出力がずれうる。
+    /// ゴールデンにすると「3ツールが有る環境でも通る」が版次第で崩れるので、構造だけを見る。
+    ///
     /// 3ツールの実バイナリはリポジトリに含まれず、用意にも時間がかかる
     /// （`docs/toolchain-macos.md` 参照）ため既定では無視する。実行する場合は
     /// 該当手順でビルドし、`PATH` から引けるようにした上で、`tests/fixtures/gen.sh`
-    /// でフィクスチャを生成し `cargo test -- --ignored` で回すこと。
+    /// でフィクスチャを生成し `cargo test -- --ignored` で回すこと。CI では
+    /// `e2e-tools` ジョブがこのテストを `--skip` なしで回す。
     #[test]
     #[ignore = "dtvindex/chapter_exe/join_logo_scp の実バイナリと実サンプルmp4が必要（docs/toolchain-macos.md）"]
     fn analyze_run_produces_trim_list_with_real_tools() {
@@ -3638,7 +3646,30 @@ mod tests {
         };
 
         let output = run(&config).expect("analyze パイプラインが成功するはず");
-        assert!(!output.trim.ranges().is_empty());
+
+        // フレーム数は実際に使った .dtvi から取る。区間は表示順の半開区間 [start, end)。
+        let frame_count =
+            u32::try_from(output.dtvi.frames.len()).expect("フレーム数が u32 に収まる");
+        let ranges = output.trim.ranges();
+        assert!(!ranges.is_empty());
+        for range in ranges {
+            assert!(
+                range.start() < range.end(),
+                "空または逆向きの区間: {range:?}"
+            );
+            assert!(
+                range.end().0 <= frame_count,
+                "区間がフレーム数 {frame_count} を超える: {range:?}"
+            );
+        }
+        for pair in ranges.windows(2) {
+            assert!(
+                pair[0].end() <= pair[1].start(),
+                "区間が昇順でないか重なっている: {:?} と {:?}",
+                pair[0],
+                pair[1]
+            );
+        }
 
         fs::remove_dir_all(&output_dir).ok();
         fs::remove_dir_all(&cache_root).ok();
