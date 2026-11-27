@@ -1,12 +1,12 @@
 # Third-Party Licenses
 
-このファイルは `scripts/gen-third-party-licenses.sh` が `cargo-about` で生成する。コミットしない。
+このファイルは `scripts/gen-third-party-licenses.sh` が `cargo-about` で生成する。
 Tachikaze 本体（MIT、[LICENSE](LICENSE)）以外の、静的リンクされる依存クレートの著作権表示とライセンス文を並べる。
 
 ## ライセンスの一覧
 
 {{#each overview}}
-- [{{name}}](#{{id}}) ({{count}})
+- {{name}} ({{count}})
 {{/each}}
 
 {{#each licenses}}

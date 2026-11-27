@@ -15,13 +15,6 @@ fi
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 
-# cargo-about は相対パスを呼び出し元のディレクトリ基準で扱うので、出力先を絶対パスにする。
-out=$1
-case "$out" in
-    /*) ;;
-    *) out="$PWD/$out" ;;
-esac
-
 installed=$(cargo about --version 2>/dev/null | awk '{print $2}') || installed=
 if [ "$installed" != "$CARGO_ABOUT_VERSION" ]; then
     printf 'cargo-about %s が必要です（検出: %s）。次で入れてください:\n' \
@@ -34,6 +27,7 @@ cargo about generate \
     --manifest-path "$root/Cargo.toml" \
     -c "$root/about.toml" \
     "$root/about.hbs" \
-    -o "$out"
+    --locked --fail \
+    -o "$1"
 
-printf '生成: %s\n' "$out"
+printf '生成: %s\n' "$1"

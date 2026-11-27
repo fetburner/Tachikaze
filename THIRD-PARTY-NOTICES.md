@@ -15,14 +15,7 @@ Tachikaze は次の外部ツールを**別プロセスとして起動するだ�
 
 これらは `src/tools.rs::resolve_tool` が `PATH` から実体（バイナリのパス）を見つけ、`src/external.rs::run` が子プロセスとして起動する。受け渡しはファイルとコマンドライン引数のみで、リンクも同一アドレス空間の共有もない。JL コマンドファイル（`join_logo_scp` の判定ルール）もリポジトリには同梱していない。`src/tools.rs::default_jl_command_file` が `join_logo_scp` のインストール先から実行時に解決するだけである。したがって GPL の派生物条件は Tachikaze 本体には及ばない。
 
-Cargo 依存（`cargo metadata` で確認した tachikaze 自身を除く全 51 パッケージ）はすべて permissive で、GPL のクレートは無い。内訳は `MIT OR Apache-2.0` 39 / `MIT` 7 / `Apache-2.0 OR MIT` 3 / `Unlicense OR MIT` 1 / `(MIT OR Apache-2.0) AND Unicode-3.0` 1。
-
-依存は更新されるため、この一覧は手で直さない。バイナリを配布する場合は、`scripts/gen-third-party-licenses.sh OUTPUT_PATH` で `THIRD-PARTY-LICENSES.md` を生成し、配布物に同梱する。
-生成には `cargo-about` を使う。版は script 内の `CARGO_ABOUT_VERSION` で固定している。
-生成物には各クレートの名前・版・ライセンス全文が入る。生成物はコミットしない（`.gitignore` 済み）。
-対象は `about.toml` の `targets` で使われるクレートである。
-その3ターゲットは `aarch64-apple-darwin`、`x86_64-unknown-linux-musl`、`aarch64-unknown-linux-musl`。Windows 専用のクレートは含まれない。
-`about.toml` の `accepted` にないライセンスの依存が入ると生成は失敗する。その場合は依存のライセンスを確かめてから `accepted` に足す。
+Cargo 依存（2026-11-27 時点、`cargo metadata` で数えた tachikaze 自身を除く全 51 パッケージ。全プラットフォームを対象にした記録）はすべて permissive で、GPL のクレートは無い。内訳は `MIT OR Apache-2.0` 39 / `MIT` 7 / `Apache-2.0 OR MIT` 3 / `Unlicense OR MIT` 1 / `(MIT OR Apache-2.0) AND Unicode-3.0` 1。配布物の正は生成物である。バイナリを配布する場合は、`scripts/gen-third-party-licenses.sh OUTPUT_PATH` で `THIRD-PARTY-LICENSES.md` を生成して配布物に同梱する。`cargo-about` の版はスクリプト冒頭で固定している。生成物はコミットしない（`.gitignore` 済み）。対象は `about.toml` の `targets` で使われるクレートである。その3ターゲット（`aarch64-apple-darwin`、`x86_64-unknown-linux-musl`、`aarch64-unknown-linux-musl`）に Windows 専用の4クレートは入らない。二重ライセンスのクレートは `about.toml` の `accepted` の並び順で選ばれ、MIT を先頭にしている。MIT のクレートは LICENSE-MIT に著作権表示が入っていて、表示義務をそのまま満たせるため。`accepted` にないライセンスの依存が入ると生成は失敗する。その場合は依存のライセンスを確かめてから `accepted` に足す。
 
 **Docker イメージを配布する場合は条件が付く。** 詳細と対応（commit SHA 固定の必要性）は [docs/docker.md](docs/docker.md)「既知の制約」。
 
