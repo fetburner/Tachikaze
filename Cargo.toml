@@ -3,6 +3,8 @@ name = "tachikaze"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
+# cargo-about の [private] ignore で本体を THIRD-PARTY-LICENSES.md から外すため。crates.io に公開するときは別の除外方法が要る。
+publish = false
 description = "Lossless CM cutting for already-converted mp4 recordings (no re-encode)"
 repository = "https://github.com/fetburner/Tachikaze"
 readme = "README.md"

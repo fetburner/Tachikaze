@@ -1,0 +1,20 @@
+# accepted のライセンスは、ここで列挙した順に優先して選ばれる（二重ライセンスの依存は先頭から見て最初に一致したものを使う）。
+# MIT を先頭にする理由: MIT のクレートは LICENSE-MIT に著作権表示が入っていて、表示義務をそのまま満たせる。
+# Apache-2.0 を入れていない理由: Apache-2.0 だけのクレートが入ったら NOTICE の扱いを確かめるべきなので、
+#   生成が失敗するほうが望ましい。Unlicense も入れない（Unlicense OR MIT は MIT で足りる）。
+# 広げると、意図しないライセンスの依存が入ったときに生成が失敗して気付けなくなる。
+# 失敗したら、そのライセンスを確かめてから1つずつ足す。
+accepted = [
+    "MIT",
+    "Unicode-3.0",
+]
+
+# 配布する3ターゲットだけ。Windows 専用クレートなど配布物に入らないものを含めない。
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-musl",
+]
+
+[private]
+ignore = true
