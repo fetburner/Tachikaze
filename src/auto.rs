@@ -42,6 +42,24 @@
 //! `source_size`/`source_mtime_ns`/`source_fingerprint`（入力ファイルの実体を
 //! 識別する値）を鍵に追加し、入力の実体が変われば必ず別キーになるよう修正した。
 //!
+//! ## `--mark`（切らずに CM 位置を記録する）
+//!
+//! `--mark` は `cut` と `remap-subs` の代わりに [`marker::run`] を呼ぶ。`prepare` →
+//! `analyze` → gate 判定までは同じ。
+//!
+//! - **入力は元の録画（`auto` に渡された `input`）**。`prepare` 後のファイル（`media_path`）を
+//!   渡すと、チャプター付き mp4 から字幕トラックが消え、`--edl-only` の `.edl` がキャッシュ内に
+//!   置かれて再生機から見えなくなる（どちらもエラーにならない）。
+//! - **`trim` と `.dtvi` は `analyze` が書いたもの（`prepare` 後の入力のキャッシュ）を明示して渡す。**
+//!   `marker::run` に任せると元の録画のキャッシュを探しにいってしまう。`prepare` は elst と字幕トラック
+//!   を除くだけでフレームを変えないので、フレーム番号は元の録画と共通。elst 付きの元の録画との時刻系の
+//!   違いは `marker::run` 内の `timeline_offset` が補正する。
+//! - **gate 停止時の `review` の例の `-o`**: `--edl-only` は mp4 を作らないので `-o` が無い。`review` の
+//!   既定（入力と同じディレクトリの `<stem>_CMcut.mp4`）は `prepare` 後の入力を基準にするとキャッシュ内に
+//!   なるため、元の録画を基準にした既定の名前（[`review::output_path`]）を渡す。
+//! - **既存出力のスキップ**の対象は `OUT.mp4` と `OUT.edl`（`--edl-only` は `<入力の stem>.edl`）。字幕は
+//!   対象外で、字幕サイドカーの再試行（下記）も適用しない（元の録画の字幕トラックが mp4 に残るため）。
+//!
 //! ## `--ignore-gate` の範囲
 //!
 //! `--ignore-gate` は gate の「疑わしいので止める」判定だけを無視する。自己検証
@@ -82,15 +100,28 @@ use anyhow::{anyhow, bail, Context};
 
 use crate::errctx::PathContext;
 use crate::logo::frames::FfmpegOverrides;
-use crate::{analyze, cli, commands, gate, mp4io, prepare, report, segmap, subtitle, workdir};
+use crate::marker::{self, MarkTarget};
+use crate::{
+    analyze, cli, commands, gate, mp4io, prepare, report, review, segmap, subtitle, workdir,
+};
+
+/// `auto` の出力の種類。`-o` / `--mark` / `--edl-only` の組み合わせは `cli::AutoArgs` が
+/// 制限する（`-o` は `cut` と `--mark` で必須、`--mark --edl-only` では無い）。
+#[derive(Debug, Clone)]
+pub enum AutoMode {
+    /// 本編を `output` に cut する（既定）。
+    Cut { output: PathBuf },
+    /// 切らずに CM 位置を記録する（`--mark`）。
+    Mark(MarkTarget),
+}
 
 /// `auto` サブコマンドの設定（`src/cli.rs::Commands::Auto` の CLI 引数と1対1）。
 #[derive(Debug, Clone)]
 pub struct AutoConfig {
     /// `--cache-dir`（キャッシュの根）。
     pub cache_dir: Option<PathBuf>,
-    /// 本編の出力先（必須）。字幕サイドカーの stem もここから導出する。
-    pub output: PathBuf,
+    /// 出力の種類（`cut` で本編を出すか、`--mark` で CM 位置を記録するか）。
+    pub mode: AutoMode,
     /// CM 側の出力先。指定したときだけ CM 側ファイルを出す。
     pub cm_output: Option<PathBuf>,
     /// gate の判定だけを無視する（`--ignore-gate`。自己検証1〜8 と `.dtvi` 必須は
@@ -133,7 +164,12 @@ pub fn run(config: &AutoConfig, input: &Path) -> anyhow::Result<InputStatus> {
     // の doc comment参照）。`execute_cut` も同じ検証をするが、`prepare`/`analyze`
     // という重い処理が走ってから初めて設定ミスが分かる事態を避けるため、ここでも
     // 事前に検証する。
-    commands::reject_dash_output(&config.output, "-o/--output")?;
+    match &config.mode {
+        AutoMode::Cut { output } | AutoMode::Mark(MarkTarget::Video(output)) => {
+            commands::reject_dash_output(output, "-o/--output")?;
+        }
+        AutoMode::Mark(MarkTarget::EdlOnly) => {}
+    }
     if let Some(path) = &config.cm_output {
         commands::reject_dash_output(path, "--cm-output")?;
     }
@@ -179,37 +215,53 @@ fn process_one(
 ) -> anyhow::Result<InputStatus> {
     anyhow::ensure!(input.is_file(), "入力がありません: {}", input.display());
 
-    let out_path = config.output.clone();
     let cm_out_path = config.cm_output.clone();
+    let mark_target = match &config.mode {
+        AutoMode::Mark(target) => Some(target),
+        AutoMode::Cut { .. } => None,
+    };
 
     // 既存出力のスキップ判定（本モジュール冒頭の doc comment参照）。実処理を始める
     // 前に行うことで、800MB級の重い処理を無駄にしない。
     let mut existing = Vec::new();
-    if out_path.is_file() {
-        existing.push(out_path.clone());
-    }
-    if let Some(cm) = &cm_out_path {
-        if cm.is_file() {
-            existing.push(cm.clone());
+    let mut subs_existing: Vec<PathBuf> = Vec::new();
+    match &config.mode {
+        AutoMode::Cut { output } => {
+            if output.is_file() {
+                existing.push(output.clone());
+            }
+            if let Some(cm) = &cm_out_path {
+                if cm.is_file() {
+                    existing.push(cm.clone());
+                }
+            }
+            if !config.no_subtitles {
+                subs_existing = ["ass", "srt"]
+                    .into_iter()
+                    .map(|ext| subs_sidecar_path(output, ext))
+                    .filter(|p| p.is_file())
+                    .collect();
+            }
+        }
+        AutoMode::Mark(target) => {
+            existing.extend(
+                mark_outputs(target, input)
+                    .into_iter()
+                    .filter(|p| p.is_file()),
+            );
         }
     }
-    let subs_existing: Vec<PathBuf> = if config.no_subtitles {
-        Vec::new()
-    } else {
-        ["ass", "srt"]
-            .into_iter()
-            .map(|ext| subs_sidecar_path(&out_path, ext))
-            .filter(|p| p.is_file())
-            .collect()
-    };
     existing.extend(subs_existing.iter().cloned());
 
     // 「字幕が必要なのに字幕サイドカー出力が無い」場合は、他の出力(本編/CM側)が
     // 揃っていてもスキップしない（本モジュール冒頭 doc comment「既存出力のスキップと
     // -f/--force」の例外）。前回 remap-subs が失敗して本編/CM側だけ
-    // 残った状態を、次回再実行で自動的に再試行できるようにするため。
-    let subs_missing_but_expected =
-        !config.no_subtitles && subs_existing.is_empty() && input_has_subtitle_track(input);
+    // 残った状態を、次回再実行で自動的に再試行できるようにするため。`--mark` は字幕を
+    // 扱わないので対象外。
+    let subs_missing_but_expected = mark_target.is_none()
+        && !config.no_subtitles
+        && subs_existing.is_empty()
+        && input_has_subtitle_track(input);
 
     if subs_missing_but_expected {
         eprintln!(
@@ -285,29 +337,51 @@ fn process_one(
     );
     eprintln!("{}", gate::format_gate_report(&verdict));
 
-    let cut_hint = || {
-        let cm_flag = cm_out_path
-            .as_ref()
-            .map(|p| format!(" --cm-output {}", shell_quote(p)))
-            .unwrap_or_default();
-        format!(
-            "tachikaze cut {} --trim {} --dtvi {} -o {}{cm_flag}",
-            shell_quote(&media_path),
-            shell_quote(&trim_path),
-            shell_quote(&dtvi_path),
-            shell_quote(&out_path),
-        )
+    // gate 停止・`--analyze-only` の案内に出す `review` の `-o`（`review_hint` の doc comment参照）。
+    let review_output = match &config.mode {
+        AutoMode::Cut { output } | AutoMode::Mark(MarkTarget::Video(output)) => output.clone(),
+        AutoMode::Mark(MarkTarget::EdlOnly) => review::output_path(input)?,
+    };
+    let verb = if mark_target.is_some() { "mark" } else { "cut" };
+    // 続きのコマンド例。`cut` と `mark` のどちらも `analyze` の trim / dtvi を明示する。
+    let next_hint = || match &config.mode {
+        AutoMode::Cut { output } => {
+            let cm_flag = cm_out_path
+                .as_ref()
+                .map(|p| format!(" --cm-output {}", shell_quote(p)))
+                .unwrap_or_default();
+            format!(
+                "tachikaze cut {} --trim {} --dtvi {} -o {}{cm_flag}",
+                shell_quote(&media_path),
+                shell_quote(&trim_path),
+                shell_quote(&dtvi_path),
+                shell_quote(output),
+            )
+        }
+        AutoMode::Mark(target) => {
+            // mark の対象は元の録画（`input`）。trim / dtvi は analyze のキャッシュ（media_path 側）。
+            let target_arg = match target {
+                MarkTarget::Video(out) => format!("-o {}", shell_quote(out)),
+                MarkTarget::EdlOnly => "--edl-only".to_string(),
+            };
+            format!(
+                "tachikaze mark {} --trim {} --dtvi {} {target_arg}",
+                shell_quote(input),
+                shell_quote(&trim_path),
+                shell_quote(&dtvi_path),
+            )
+        }
     };
 
     if config.analyze_only {
         eprintln!(
-            "[auto] --analyze-only のため、ここで停止します（cut / remap-subs は実行しません）。"
+            "[auto] --analyze-only のため、ここで停止します（cut / remap-subs / mark は実行しません）。"
         );
         eprintln!("  trim: {}", trim_path.display());
         eprintln!("  dtvi: {}", dtvi_path.display());
-        print_review_hint(&media_path, config.cache_dir.as_deref(), &out_path);
-        eprintln!("  続きは次のコマンドで cut できます:");
-        eprintln!("    {}", cut_hint());
+        print_review_hint(&media_path, config.cache_dir.as_deref(), &review_output);
+        eprintln!("  続きは次のコマンドで {verb} できます:");
+        eprintln!("    {}", next_hint());
         return Ok(if verdict.stop {
             InputStatus::GateStopped
         } else {
@@ -321,14 +395,22 @@ fn process_one(
                 "[auto] --ignore-gate が指定されているため、gate の停止判定を無視して続行します。"
             );
         } else {
-            eprintln!("[auto] gate が疑わしいと判定したため、cut を実行せず停止します。");
+            eprintln!("[auto] gate が疑わしいと判定したため、{verb} を実行せず停止します。");
             eprintln!("  trim: {}", trim_path.display());
-            print_review_hint(&media_path, config.cache_dir.as_deref(), &out_path);
-            eprintln!("  trim.avs を直接直す場合は、直してから次のコマンドで cut してください:");
-            eprintln!("    {}", cut_hint());
+            print_review_hint(&media_path, config.cache_dir.as_deref(), &review_output);
+            eprintln!("  trim.avs を直接直す場合は、直してから次のコマンドで {verb} してください:");
+            eprintln!("    {}", next_hint());
             return Ok(InputStatus::GateStopped);
         }
     }
+
+    // 4. の前に出力の種類を分ける。`--mark` はここで終わる（cut と remap-subs は行わない）。
+    let out_path = match &config.mode {
+        AutoMode::Cut { output } => output.clone(),
+        AutoMode::Mark(target) => {
+            return run_mark_step(config, input, target, &trim_path, &dtvi_path);
+        }
+    };
 
     // 4. cut（区間マップ込み）。`commands::execute_cut` をそのまま呼ぶ
     // （本モジュール冒頭の doc comment「cut のロジックを複製しない」）。
@@ -404,6 +486,41 @@ fn process_one(
          （見逃し候補ヒューリスティックの限界、gate.rs の doc comment参照）。"
     );
 
+    Ok(InputStatus::Completed)
+}
+
+/// `--mark` の最終成果物。`Video` は mp4 と隣の `.edl`、`EdlOnly` は入力の隣の
+/// `<stem>.edl`（[`marker::run`] が書く場所と同じ規則）。既存判定にだけ使う。
+fn mark_outputs(target: &MarkTarget, input: &Path) -> Vec<PathBuf> {
+    match target {
+        MarkTarget::Video(out) => vec![out.clone(), out.with_extension("edl")],
+        MarkTarget::EdlOnly => vec![input.with_extension("edl")],
+    }
+}
+
+/// `--mark` の本体（[`marker::run`] を呼ぶだけ）。`trim` と `.dtvi` は `analyze` が書いた
+/// ものを明示し、対象は元の録画（`input`）のまま（モジュール冒頭の doc comment「`--mark`」参照）。
+fn run_mark_step(
+    config: &AutoConfig,
+    input: &Path,
+    target: &MarkTarget,
+    trim_path: &Path,
+    dtvi_path: &Path,
+) -> anyhow::Result<InputStatus> {
+    eprintln!("[auto] mark: {}", input.display());
+    let outcome = marker::run(&marker::MarkConfig {
+        input: input.to_path_buf(),
+        trim: Some(trim_path.to_path_buf()),
+        dtvi: Some(dtvi_path.to_path_buf()),
+        cache_dir: config.cache_dir.clone(),
+        target: target.clone(),
+    })
+    .with_context(|| format!("mark に失敗しました: {}", input.display()))?;
+    if let Some(video) = &outcome.video {
+        eprintln!("[auto] mark 完了: {}", video.display());
+    }
+    eprintln!("[auto] EDL を書きました: {}", outcome.edl.display());
+    eprintln!("[auto] CM区間数: {}", outcome.cm_count);
     Ok(InputStatus::Completed)
 }
 
@@ -544,7 +661,8 @@ fn shell_quote(path: &Path) -> String {
 /// 入力は `cut` の例と同じ `prepare` 後のパスにする（元の入力を渡すと elst 除去前の
 /// 位置を見てしまう）。`--cache-dir` は `auto` が使ったものをそのまま渡す。`-o` は
 /// `cut` の例と同じ出力先を渡す（`review` の既定はキャッシュ内になり、`auto -o` と
-/// 食い違うため）。
+/// 食い違うため）。`--edl-only` では `-o` を元の録画基準の既定名にする
+/// （[`review::output_path`]、モジュール冒頭の doc comment「`--mark`」参照）。
 fn review_hint(input: &Path, cache_dir: Option<&Path>, output: &Path) -> String {
     let cache = cache_dir
         .map(|dir| format!(" --cache-dir {}", shell_quote(dir)))
@@ -652,7 +770,9 @@ mod tests {
     #[test]
     fn run_rejects_snap_inward_with_explicit_cm_output() {
         let config = AutoConfig {
-            output: PathBuf::from("/tmp/out.mp4"),
+            mode: AutoMode::Cut {
+                output: PathBuf::from("/tmp/out.mp4"),
+            },
             cm_output: Some(PathBuf::from("/tmp/cm.mp4")),
             ignore_gate: false,
             force: false,
@@ -680,7 +800,9 @@ mod tests {
         // 実在しないため別のエラー（"入力がありません"）にはなるが、
         // 「--snap inward」を理由にした事前拒否ではないことを確認する。
         let config = AutoConfig {
-            output: PathBuf::from("/tmp/out.mp4"),
+            mode: AutoMode::Cut {
+                output: PathBuf::from("/tmp/out.mp4"),
+            },
             cm_output: None,
             ignore_gate: false,
             force: false,
@@ -707,7 +829,9 @@ mod tests {
     #[test]
     fn run_rejects_dash_as_output() {
         let config = AutoConfig {
-            output: PathBuf::from("-"),
+            mode: AutoMode::Cut {
+                output: PathBuf::from("-"),
+            },
             cm_output: None,
             ignore_gate: false,
             force: false,
@@ -730,7 +854,9 @@ mod tests {
     #[test]
     fn run_rejects_dash_as_cm_output() {
         let config = AutoConfig {
-            output: PathBuf::from("/tmp/out.mp4"),
+            mode: AutoMode::Cut {
+                output: PathBuf::from("/tmp/out.mp4"),
+            },
             cm_output: Some(PathBuf::from("-")),
             ignore_gate: false,
             force: false,
@@ -753,7 +879,9 @@ mod tests {
     #[test]
     fn run_rejects_invalid_jls_set_before_processing_input() {
         let config = AutoConfig {
-            output: PathBuf::from("/tmp/out.mp4"),
+            mode: AutoMode::Cut {
+                output: PathBuf::from("/tmp/out.mp4"),
+            },
             cm_output: None,
             ignore_gate: false,
             force: false,
@@ -781,7 +909,9 @@ mod tests {
         // 実在しない入力でエラーになる（＝「入力がありません」ではなく
         // このバリデーションで先に失敗する）ことで確認する。
         let config = AutoConfig {
-            output: PathBuf::from("/tmp/out.mp4"),
+            mode: AutoMode::Cut {
+                output: PathBuf::from("/tmp/out.mp4"),
+            },
             cm_output: None,
             ignore_gate: false,
             force: false,
@@ -812,7 +942,9 @@ mod tests {
     #[test]
     fn build_analyze_config_forwards_no_logo_and_logo_dir() {
         let config = AutoConfig {
-            output: PathBuf::from("/tmp/out.mp4"),
+            mode: AutoMode::Cut {
+                output: PathBuf::from("/tmp/out.mp4"),
+            },
             cm_output: None,
             ignore_gate: false,
             force: false,
@@ -849,7 +981,9 @@ mod tests {
     #[test]
     fn build_analyze_config_forwards_explicit_logo_and_ffmpeg_overrides() {
         let config = AutoConfig {
-            output: PathBuf::from("/tmp/out.mp4"),
+            mode: AutoMode::Cut {
+                output: PathBuf::from("/tmp/out.mp4"),
+            },
             cm_output: None,
             ignore_gate: false,
             force: false,

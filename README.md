@@ -40,6 +40,13 @@ $ tachikaze mark IN.mp4 --trim trim.avs -o OUT.mp4
 $ tachikaze mark IN.mp4 --trim trim.avs --edl-only
 ```
 
+`auto` に `--mark` を付けると、gate を通した後に同じ処理を1回で行えます（`cut` の代わりに CM 位置を記録する）:
+
+```console
+$ tachikaze auto IN.mp4 --mark -o OUT.mp4
+$ tachikaze auto IN.mp4 --mark --edl-only
+```
+
 複数ファイルはシェルのループに任せます（出力を `*_CMcut.mp4` に固定して glob の再取り込みを避ける）:
 
 ```console

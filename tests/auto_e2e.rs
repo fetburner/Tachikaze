@@ -96,10 +96,28 @@ fn make_tmp_dir(label: &str) -> PathBuf {
 /// （`resolve_tool` が canonicalize 済みで返す）から `../../share/...` を1段で
 /// 導出するため（`src/tools.rs` の doc comment参照）、追加の環境変数は不要。
 fn setup_fake_analyze_tools(tmp_dir: &Path) -> PathBuf {
+    // ヘッダ行 + 総フレームを覆う単一の `:L` 行（`:CM` 無し）。
+    let detail_jls = "開始 終了 秒数 誤差 ロゴ秒 ラベル\n0 598 20 0 0 :L\n";
+    setup_fake_tools_with(
+        tmp_dir,
+        &common::dtvi_path(),
+        FULL_SUCCESS_TRIM_AVS_CONTENT,
+        detail_jls,
+    )
+}
+
+/// [`setup_fake_analyze_tools`] の一般化。`dtvindex` が書く `.dtvi` の元ファイル、
+/// `join_logo_scp` が書く trim と `detail.jls` を指定できる（`--mark` のテストは
+/// 全599フレームの `.dtvi` と、gate を止める `detail.jls` を使うため）。
+fn setup_fake_tools_with(
+    tmp_dir: &Path,
+    dtvi_src: &Path,
+    trim_avs: &str,
+    detail_jls: &str,
+) -> PathBuf {
     let bin_dir = tmp_dir.join("tools").join("bin");
     std::fs::create_dir_all(&bin_dir).expect("bin_dir を作れること");
 
-    let dtvi_src = common::dtvi_path();
     common::write_executable_script(
         &bin_dir.join("dtvindex"),
         &format!(
@@ -113,13 +131,11 @@ fn setup_fake_analyze_tools(tmp_dir: &Path) -> PathBuf {
         "#!/bin/sh\nprev=\"\"\nfor a in \"$@\"; do\n  if [ \"$prev\" = \"-o\" ]; then\n    printf 'scp placeholder\\n' > \"$a\"\n  fi\n  prev=\"$a\"\ndone\nexit 0\n",
     );
 
-    // ヘッダ行 + 総フレームを覆う単一の `:L` 行（`:CM` 無し）。
-    let detail_jls = "開始 終了 秒数 誤差 ロゴ秒 ラベル\n0 598 20 0 0 :L\n";
     common::write_executable_script(
         &bin_dir.join("join_logo_scp"),
         &format!(
             "#!/bin/sh\nprev=\"\"\nfor a in \"$@\"; do\n  case \"$prev\" in\n    -o) printf '{}' > \"$a\" ;;\n    -oscp) printf '{}' > \"$a\" ;;\n  esac\n  prev=\"$a\"\ndone\nexit 0\n",
-            FULL_SUCCESS_TRIM_AVS_CONTENT, detail_jls
+            trim_avs, detail_jls
         ),
     );
 
@@ -911,6 +927,402 @@ fn auto_analyze_only_stops_before_cut() {
     assert!(
         stderr.contains("analyze に失敗しました"),
         "analyze の段階で失敗した旨が出ていない: stderr={stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+// ---------------------------------------------------------------------
+// 3. `--mark`（切らずに CM 位置を記録する、issue #216）
+// ---------------------------------------------------------------------
+
+/// `--mark` のテストに使う Trim。`[0,20)` が本編、`[20,599)` が CM。
+const MARK_TRIM_AVS_CONTENT: &str = "Trim(0,19)";
+
+/// 全フレームを `:L`（未カット）として覆う `detail.jls`（`:CM` 無し、gate は止めない）。
+const DETAIL_JLS_ALL_L: &str = "開始 終了 秒数 誤差 ロゴ秒 ラベル\n0 598 20 0 0 :L\n";
+
+/// gate を止めるための Trim。除去区間が 100 フレームずつ2つ（同じ長さ帯が2個以上ないと
+/// 「既知の CM 長」にならない、`report/missed.rs` の `known_cm_lengths`）。
+const MARK_GATE_TRIM_AVS_CONTENT: &str = "Trim(0,99) ++ Trim(200,299) ++ Trim(400,499)";
+
+/// gate を止める `detail.jls`。保持区間 `[0,100)` に、既知の除去区間と同じ長さ（100 フレーム）の
+/// `:L` 区間があるため見逃し候補になる（`report::missed::find_missed_candidates`）。
+const DETAIL_JLS_WITH_MISSED_CANDIDATE: &str = "開始 終了 秒数 誤差 ロゴ秒 ラベル\n\
+     0 99 5 0 0 :L\n\
+     100 199 5 0 0 :CM\n\
+     200 299 5 0 0 :L\n\
+     300 399 5 0 0 :CM\n\
+     400 499 5 0 0 :L\n\
+     500 598 10 0 0 :CM\n";
+
+/// チャプターの JSON（`ffprobe -show_chapters`）。出力の mp4 同士を比べるために使う。
+fn chapters_json(path: &Path) -> String {
+    let output = Command::new("ffprobe")
+        .args(["-v", "error", "-show_chapters", "-of", "json"])
+        .arg(path)
+        .output()
+        .expect("ffprobe を起動できること");
+    assert!(
+        output.status.success(),
+        "ffprobe が失敗した: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+/// 完了条件: `--edl-only`（`--mark` 無し）・`--mark --edl-only -o`・`--mark` の
+/// `--cm-output` / `--snap inward` / `--no-subtitles` / `--verify` との併用・`--mark` だけ
+/// （`-o` も `--edl-only` も無い）は clap の usage error（exit code 2）。clap が実処理より前に
+/// 止めるので、入力も外部ツールも要らない。
+#[test]
+fn auto_mark_flag_combinations_are_usage_errors() {
+    let tmp_dir = make_tmp_dir("mark-usage");
+    let cases: &[&[&str]] = &[
+        &["/no/such/a.mp4", "--edl-only"],
+        &[
+            "/no/such/a.mp4",
+            "--mark",
+            "--edl-only",
+            "-o",
+            "/no/such/o.mp4",
+        ],
+        &[
+            "/no/such/a.mp4",
+            "--mark",
+            "-o",
+            "/no/such/o.mp4",
+            "--cm-output",
+            "/no/such/cm.mp4",
+        ],
+        &["/no/such/a.mp4", "--mark"],
+        &[
+            "/no/such/a.mp4",
+            "--mark",
+            "-o",
+            "/no/such/o.mp4",
+            "--snap",
+            "inward",
+        ],
+        &[
+            "/no/such/a.mp4",
+            "--mark",
+            "-o",
+            "/no/such/o.mp4",
+            "--no-subtitles",
+        ],
+        &[
+            "/no/such/a.mp4",
+            "--mark",
+            "-o",
+            "/no/such/o.mp4",
+            "--verify",
+        ],
+    ];
+    for args in cases {
+        let output = run_auto(args, &tmp_dir);
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "usage error のはず: {args:?}: stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+/// 完了条件: `--mark` で gate が止める入力は exit code 3 で止まり、`mark` のコマンド例を出し、
+/// mp4 も `.edl` も書かない（`cut` の例は出さない）。
+#[test]
+#[ignore = "tests/fixtures/sample.mp4 と tests/data/sample_no_logo.dtvi、ffprobe が必要。tests/fixtures/gen.sh を先に実行すること"]
+fn auto_mark_gate_stop_exits_3_and_writes_nothing() {
+    if common::skip_if_fixture_missing() {
+        return;
+    }
+    if !ffprobe_available() {
+        common::skip("ffprobe が無いためスキップします。");
+        return;
+    }
+
+    for edl_only in [false, true] {
+        let label = if edl_only { "edl-only" } else { "video" };
+        let tmp_dir = make_tmp_dir(&format!("mark-gate-{label}"));
+        let input = tmp_dir.join("IN.mp4");
+        std::fs::copy(common::fixture_path(), &input).expect("フィクスチャをコピーできること");
+        let bin_dir = setup_fake_tools_with(
+            &tmp_dir,
+            &common::no_logo_dtvi_path(),
+            MARK_GATE_TRIM_AVS_CONTENT,
+            DETAIL_JLS_WITH_MISSED_CANDIDATE,
+        );
+        let out_path = tmp_dir.join("OUT.mp4");
+
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_tachikaze"));
+        cmd.arg("--cache-dir")
+            .arg(tmp_dir.join("cache"))
+            .arg("auto")
+            .arg(&input)
+            .arg("--mark")
+            .arg("--no-logo")
+            .env("PATH", common::prepend_path(&bin_dir));
+        if edl_only {
+            cmd.arg("--edl-only");
+        } else {
+            cmd.arg("-o").arg(&out_path);
+        }
+        let output = cmd.output().expect("tachikaze auto の起動に失敗した");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        assert_eq!(
+            output.status.code(),
+            Some(3),
+            "gate 停止は exit 3 のはず: {stderr}"
+        );
+        assert!(
+            stderr.contains("tachikaze mark "),
+            "mark のコマンド例が出るはず: {stderr}"
+        );
+        assert!(
+            !stderr.contains("tachikaze cut "),
+            "--mark では cut の例を出さないはず: {stderr}"
+        );
+        assert!(!out_path.exists(), "mp4 を書かないはず");
+        assert!(!tmp_dir.join("OUT.edl").exists(), "EDL を書かないはず");
+        assert!(!tmp_dir.join("IN.edl").exists(), "EDL を書かないはず");
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+}
+
+/// 完了条件: `--mark -o OUT.mp4` の出力（チャプターと `.edl`）が、同じ Trim と `.dtvi` で
+/// `tachikaze mark <元の録画> -o` を実行した結果と同じ。
+///
+/// 入力は elst 付きの `sample_elst.mp4`。elst 無しの入力では prepare 後のファイルが元の
+/// 録画と同じパスになり、「prepare 後のファイルを渡す」誤りを検出できないため。
+#[test]
+#[ignore = "tests/fixtures/sample_elst.mp4 と tests/data/sample_no_logo.dtvi、ffprobe（と ffmpeg）が必要。tests/fixtures/gen.sh を先に実行すること"]
+fn auto_mark_video_matches_mark_subcommand() {
+    let fixture = common::fixture_path_named("sample_elst.mp4");
+    if common::skip_if_fixture_missing_at(&fixture) {
+        return;
+    }
+    if !ffprobe_available() {
+        common::skip("ffprobe が無いためスキップします。");
+        return;
+    }
+
+    let tmp_dir = make_tmp_dir("mark-video-match");
+    let input = tmp_dir.join("IN.mp4");
+    std::fs::copy(&fixture, &input).expect("フィクスチャをコピーできること");
+    let bin_dir = setup_fake_tools_with(
+        &tmp_dir,
+        &common::no_logo_dtvi_path(),
+        MARK_TRIM_AVS_CONTENT,
+        DETAIL_JLS_ALL_L,
+    );
+    let auto_out = tmp_dir.join("AUTO.mp4");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_tachikaze"))
+        .arg("--cache-dir")
+        .arg(tmp_dir.join("cache"))
+        .arg("auto")
+        .arg(&input)
+        .arg("--mark")
+        .arg("--no-logo")
+        .arg("-o")
+        .arg(&auto_out)
+        .env("PATH", common::prepend_path(&bin_dir))
+        .output()
+        .expect("tachikaze auto の起動に失敗した");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "完走するはず: stderr={stderr}");
+    assert!(
+        stderr.contains("[auto] prepare 完了"),
+        "elst 付きなので prepare が別ファイルを作るはず（この経路を通すのが目的）: {stderr}"
+    );
+
+    // 参照: 同じ入力・同じ Trim・同じ .dtvi で mark サブコマンドを直接実行する。
+    // 別ディレクトリに置き、EDL の書き出し先が衝突しないようにする。
+    let ref_dir = make_tmp_dir("mark-video-match-ref");
+    let ref_input = ref_dir.join("IN.mp4");
+    std::fs::copy(&fixture, &ref_input).expect("フィクスチャをコピーできること");
+    let trim = ref_dir.join("trim.avs");
+    std::fs::write(&trim, MARK_TRIM_AVS_CONTENT).expect("trim を書けること");
+    let ref_out = ref_dir.join("REF.mp4");
+    let output = Command::new(env!("CARGO_BIN_EXE_tachikaze"))
+        .arg("--cache-dir")
+        .arg(ref_dir.join("cache"))
+        .arg("mark")
+        .arg(&ref_input)
+        .arg("--trim")
+        .arg(&trim)
+        .arg("--dtvi")
+        .arg(common::no_logo_dtvi_path())
+        .arg("-o")
+        .arg(&ref_out)
+        .output()
+        .expect("tachikaze mark の起動に失敗した");
+    assert!(
+        output.status.success(),
+        "mark が完走するはず: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let auto_edl = std::fs::read_to_string(tmp_dir.join("AUTO.edl")).expect("AUTO.edl があること");
+    let ref_edl = std::fs::read_to_string(ref_dir.join("REF.edl")).expect("REF.edl があること");
+    assert!(auto_edl.contains("\t3\n"), "CM 区間があるはず: {auto_edl}");
+    assert_eq!(auto_edl, ref_edl, "EDL が mark サブコマンドと一致するはず");
+    assert_eq!(
+        chapters_json(&auto_out),
+        chapters_json(&ref_out),
+        "チャプターが mark サブコマンドと一致するはず"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    let _ = std::fs::remove_dir_all(&ref_dir);
+}
+
+/// 完了条件: `--mark --edl-only` の `.edl` は、キャッシュではなく元の録画の隣にできる。
+/// elst 付きフィクスチャで `prepare` が別ファイル（キャッシュ内の媒体）を作る経路を通す。
+/// 中身は同じ Trim と `.dtvi` で `mark --edl-only` を元の録画に対して実行した結果と一致する。
+#[test]
+#[ignore = "tests/fixtures/sample_elst.mp4 と tests/data/sample_no_logo.dtvi、ffprobe（と ffmpeg）が必要。tests/fixtures/gen.sh を先に実行すること"]
+fn auto_mark_edl_only_writes_next_to_original_input_with_elst() {
+    let fixture = common::fixture_path_named("sample_elst.mp4");
+    if common::skip_if_fixture_missing_at(&fixture) {
+        return;
+    }
+    if !ffprobe_available() {
+        common::skip("ffprobe が無いためスキップします。");
+        return;
+    }
+
+    let tmp_dir = make_tmp_dir("mark-edl-only-elst");
+    let input = tmp_dir.join("IN.mp4");
+    std::fs::copy(&fixture, &input).expect("フィクスチャをコピーできること");
+    let bin_dir = setup_fake_tools_with(
+        &tmp_dir,
+        &common::no_logo_dtvi_path(),
+        MARK_TRIM_AVS_CONTENT,
+        DETAIL_JLS_ALL_L,
+    );
+    let cache = tmp_dir.join("cache");
+    // 既存の EDL を置いておき、`-f` で上書きされることを確かめる（無しだと skip する）。
+    std::fs::write(tmp_dir.join("IN.edl"), b"stale edl").expect("既存の EDL を書けること");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_tachikaze"))
+        .arg("--cache-dir")
+        .arg(&cache)
+        .arg("auto")
+        .arg(&input)
+        .arg("--mark")
+        .arg("--edl-only")
+        .arg("--no-logo")
+        .arg("-f")
+        .env("PATH", common::prepend_path(&bin_dir))
+        .output()
+        .expect("tachikaze auto の起動に失敗した");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "完走するはず: {stderr}");
+    assert!(
+        stderr.contains("[auto] prepare 完了"),
+        "elst 付きなので prepare が別ファイルを作るはず（この経路を通すのが目的）: {stderr}"
+    );
+
+    let edl = tmp_dir.join("IN.edl");
+    assert!(edl.is_file(), "EDL は元の録画の隣に書かれるはず");
+    let found_in_cache = Command::new("find")
+        .arg(&cache)
+        .args(["-name", "*.edl"])
+        .output()
+        .expect("find を起動できること");
+    assert!(
+        String::from_utf8_lossy(&found_in_cache.stdout)
+            .trim()
+            .is_empty(),
+        "EDL をキャッシュ内に書かないはず"
+    );
+
+    // 参照: 同じ Trim と .dtvi で mark --edl-only を元の録画に対して直接実行する。
+    let ref_dir = make_tmp_dir("mark-edl-only-elst-ref");
+    let ref_input = ref_dir.join("IN.mp4");
+    std::fs::copy(&fixture, &ref_input).expect("フィクスチャをコピーできること");
+    let trim = ref_dir.join("trim.avs");
+    std::fs::write(&trim, MARK_TRIM_AVS_CONTENT).expect("trim を書けること");
+    let output = Command::new(env!("CARGO_BIN_EXE_tachikaze"))
+        .arg("--cache-dir")
+        .arg(ref_dir.join("cache"))
+        .arg("mark")
+        .arg(&ref_input)
+        .arg("--trim")
+        .arg(&trim)
+        .arg("--dtvi")
+        .arg(common::no_logo_dtvi_path())
+        .arg("--edl-only")
+        .output()
+        .expect("tachikaze mark の起動に失敗した");
+    assert!(output.status.success(), "mark が完走するはず");
+
+    assert_eq!(
+        std::fs::read_to_string(&edl).expect("IN.edl を読めること"),
+        std::fs::read_to_string(ref_dir.join("IN.edl")).expect("参照の IN.edl を読めること"),
+        "EDL が mark --edl-only と一致するはず"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    let _ = std::fs::remove_dir_all(&ref_dir);
+}
+
+/// 完了条件: `--mark` で既存の出力（`OUT.edl` / `<入力の stem>.edl`）があればスキップし、
+/// `-f` で実処理に進む。字幕サイドカーは判定の対象外。
+/// [`run_auto_without_tools`] を使うので、スキップされなかった場合は `analyze` が必ず失敗する。
+#[test]
+fn auto_mark_skips_existing_outputs_without_force() {
+    if common::skip_if_fixture_missing() {
+        return;
+    }
+
+    let tmp_dir = make_tmp_dir("mark-skip");
+    let input = tmp_dir.join("IN.mp4");
+    std::fs::copy(common::fixture_path(), &input).expect("フィクスチャをコピーできること");
+    let input_arg = input.to_str().unwrap();
+    let out_arg = tmp_dir.join("OUT.mp4");
+    let out_arg = out_arg.to_str().unwrap();
+    let cache = tmp_dir.join("cache");
+
+    // (a) `-o OUT.mp4` で、mp4 は無く `OUT.edl` だけがある → スキップ。
+    let existing_edl = tmp_dir.join("OUT.edl");
+    std::fs::write(&existing_edl, b"stale edl").expect("既存の EDL を書けること");
+    let out = run_auto_without_tools(&[input_arg, "--mark", "--no-logo", "-o", out_arg], &cache);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "スキップは成功扱いのはず: {stderr}");
+    assert!(stderr.contains("既存の出力があるためスキップ"), "{stderr}");
+    assert_eq!(std::fs::read(&existing_edl).unwrap(), b"stale edl");
+
+    // (b) `--edl-only` は `<入力の stem>.edl` を見る。
+    let existing_in_edl = tmp_dir.join("IN.edl");
+    std::fs::write(&existing_in_edl, b"stale edl").expect("既存の EDL を書けること");
+    let out = run_auto_without_tools(&[input_arg, "--mark", "--no-logo", "--edl-only"], &cache);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "スキップは成功扱いのはず: {stderr}");
+    assert!(stderr.contains("既存の出力があるためスキップ"), "{stderr}");
+    assert_eq!(std::fs::read(&existing_in_edl).unwrap(), b"stale edl");
+
+    // (c) `-f` を付けるとスキップせず analyze まで進み、外部ツールが無いので失敗する。
+    let out = run_auto_without_tools(
+        &[input_arg, "--mark", "--no-logo", "--edl-only", "-f"],
+        &cache,
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "実処理に進んで失敗するはず: {stderr}"
+    );
+    assert!(!stderr.contains("既存の出力があるためスキップ"), "{stderr}");
+    assert!(
+        stderr.contains("[auto] analyze:"),
+        "analyze まで進むはず: {stderr}"
     );
 
     let _ = std::fs::remove_dir_all(&tmp_dir);

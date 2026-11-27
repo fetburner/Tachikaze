@@ -52,6 +52,10 @@ pub enum Commands {
     /// 変わらない）。exit code は 0=完了 / 1=エラー / 2=引数の誤り（clap 既定） /
     /// 3=判定で停止 の4種類のみ。1プロセスにつき入力は1本
     /// （複数ファイルはシェルのループに任せる）。
+    ///
+    /// `--mark` を付けると `cut` と `remap-subs` の代わりに `mark` と同じ処理（切らずに CM 位置を
+    /// `.edl` とチャプター付き mp4 に書く）を行う。`--mark --edl-only` は mp4 を作らず入力の隣に
+    /// `<stem>.edl` だけを書く。
     #[command(
         after_help = "複数ファイルを処理するときはシェルでループする（出力を\n\
         _CMcut.mp4 サフィックス付きに固定し、case で前回の出力を glob に\n\
@@ -225,9 +229,30 @@ pub struct AutoArgs {
     /// （複数ファイルを回すときはシェルのループに任せる、`--help` の使用例参照）。
     pub input: PathBuf,
 
-    /// 本編の出力先。字幕サイドカーの stem もここから導出する。
-    #[arg(short, long)]
-    pub output: PathBuf,
+    /// 本編の出力先。字幕サイドカーの stem もここから導出する。`--mark` のときは
+    /// チャプター付き mp4 の出力先（隣に同名の `.edl` も書く）。`--mark --edl-only` では
+    /// 指定しない。
+    #[arg(
+        short,
+        long,
+        required_unless_present = "edl_only",
+        conflicts_with = "edl_only"
+    )]
+    pub output: Option<PathBuf>,
+
+    /// 切らずに CM 位置を記録する（`mark` と同じ処理。`cut` と `remap-subs` は行わない）。
+    /// `--cm-output` / `--snap` / `--verify` / `--no-subtitles` とは併用できない
+    /// （どれも `cut` か字幕の張り替えにしか効かないため）。
+    #[arg(
+        long,
+        conflicts_with_all = ["cm_output", "snap", "verify", "no_subtitles"]
+    )]
+    pub mark: bool,
+
+    /// `--mark` のとき、mp4 を作らず入力の隣に `<stem>.edl` だけを書く（`mark --edl-only` と同じ）。
+    /// `--mark` 無しでは使えない。
+    #[arg(long = "edl-only", requires = "mark")]
+    pub edl_only: bool,
 
     /// CM 側（保持区間の補集合）の出力先。指定したときだけ CM 側ファイルを出す
     /// （既定では出さない）。
