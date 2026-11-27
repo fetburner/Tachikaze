@@ -33,6 +33,7 @@ pub mod ffprobe;
 pub mod gate;
 pub mod jls;
 pub mod logo;
+pub mod marker;
 pub mod mp4io;
 pub mod order;
 pub mod plan;
