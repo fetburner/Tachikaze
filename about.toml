@@ -1,0 +1,18 @@
+# accepted は実際に使われているライセンスだけ。広げると、意図しないライセンスの依存が
+# 入ったときに生成が失敗して気付けなくなる。新ライセンスで失敗したら、確かめてから1つずつ足す。
+accepted = [
+    "Apache-2.0",
+    "MIT",
+    "Unicode-3.0",
+    "Unlicense",
+]
+
+# 配布する3ターゲットだけ。Windows 専用クレートなど配布物に入らないものを含めない。
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-musl",
+]
+
+[private]
+ignore = true

@@ -12,3 +12,4 @@
 /tests/fixtures/*_CMcut.mp4
 .claude/
 /node_modules
+/THIRD-PARTY-LICENSES.md
