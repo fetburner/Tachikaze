@@ -12,8 +12,8 @@ use anyhow::{anyhow, bail, Context};
 use mp4_atom::{Codec, Moov, Trak};
 
 use crate::cli::{
-    AnalyzeArgs, AutoArgs, Cli, Commands, CutArgs, MakeLogoArgs, PrepareArgs, RemapSubsArgs,
-    ReviewArgs,
+    AnalyzeArgs, AutoArgs, Cli, Commands, CutArgs, MakeLogoArgs, MarkArgs, PrepareArgs,
+    RemapSubsArgs, ReviewArgs,
 };
 use crate::dtvi::Dtvi;
 use crate::errctx::PathContext;
@@ -21,8 +21,8 @@ use crate::logo::frames::VideoSize;
 use crate::mp4io::read::SampleInfo;
 use crate::order::{DecodeIdx, DisplayIdx, OrderMap};
 use crate::{
-    analyze, audio, auto, cli, dtvi, gate, logo, mp4io, plan, prepare, report, review, segmap,
-    subtitle, tools, trim, verify, workdir,
+    analyze, audio, auto, cli, dtvi, gate, logo, marker, mp4io, plan, prepare, report, review,
+    segmap, subtitle, tools, trim, verify, workdir,
 };
 
 /// `main.rs` が終了コードを決めるための、サブコマンド実行結果。
@@ -56,6 +56,7 @@ pub fn run(cli: Cli) -> anyhow::Result<ExitOutcome> {
         // issue #95「解くべき問題」)ため、`--cache-dir` は受け取っても使わない。
         Commands::MakeLogo(args) => run_make_logo(args).map(|()| ExitOutcome::Success),
         Commands::Review(args) => run_review(cache_dir, args).map(|()| ExitOutcome::Success),
+        Commands::Mark(args) => run_mark(cache_dir, args).map(|()| ExitOutcome::Success),
     }
 }
 
@@ -68,6 +69,38 @@ fn run_review(cache_dir: Option<PathBuf>, args: ReviewArgs) -> anyhow::Result<()
         cache_dir,
     })?;
     println!("{}", index.display());
+    Ok(())
+}
+
+/// `mark` サブコマンドの実行。処理本体は [`marker::run`] に集約してあり、ここでは引数の
+/// 組み立てと結果の表示だけを行う。
+fn run_mark(cache_dir: Option<PathBuf>, args: MarkArgs) -> anyhow::Result<()> {
+    let MarkArgs {
+        input,
+        trim,
+        dtvi,
+        output,
+        // `-o` と `--edl-only` のどちらか一方が必ず来る（`cli::MarkArgs::output` の `required_unless_present` で保証）。
+        edl_only: _,
+    } = args;
+    let target = match output {
+        Some(out) => marker::MarkTarget::Video(out),
+        None => marker::MarkTarget::EdlOnly,
+    };
+
+    let outcome = marker::run(&marker::MarkConfig {
+        input,
+        trim,
+        dtvi,
+        cache_dir,
+        target,
+    })?;
+
+    if let Some(video) = &outcome.video {
+        eprintln!("mark 完了: {}", video.display());
+    }
+    eprintln!("EDL を書きました: {}", outcome.edl.display());
+    eprintln!("CM区間数: {}", outcome.cm_count);
     Ok(())
 }
 

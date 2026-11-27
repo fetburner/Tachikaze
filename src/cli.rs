@@ -73,6 +73,13 @@ pub enum Commands {
     /// `review/thumbs/` を書き出し、その絶対パスを標準出力に1行だけ出す（ブラウザは開かない）。
     /// 画面が出す `cut` のコマンドは `Trim(...)` 形式だけを使う（`cut --trim -`）。
     Review(ReviewArgs),
+    /// CM 区間の位置を、チャプター付き mp4 と `.edl`（Kodi 形式）に書き出す。
+    ///
+    /// 録画は切らず、`-o` で元と同じ内容のまま（無劣化で）チャプターだけを足した mp4 を作る。
+    /// `--edl-only` は mp4 を作らず、入力の隣に `<stem>.edl` だけを書く（再生するのは元の録画）。
+    /// Trim は `--trim` で `analyze` の出力（`trim.avs`）を、`.dtvi` は `--dtvi` で指定する。
+    /// 省略時はキャッシュから解決する（見つからなければ `analyze` の例を表示して止まる）。
+    Mark(MarkArgs),
 }
 
 #[derive(Debug, Args)]
@@ -290,6 +297,31 @@ pub struct AutoArgs {
 pub enum Snap {
     Outward,
     Inward,
+}
+
+/// `mark` サブコマンドの引数。`-o` と `--edl-only` はどちらか一方だけが必須（`output` の
+/// `required_unless_present` と `conflicts_with` で表す。struct 全体の group にすると入力も排他の対象になる）。
+#[derive(Debug, Args)]
+pub struct MarkArgs {
+    /// 対象の入力（`cut` に渡すのと同じパス）。
+    pub input: PathBuf,
+    /// Trim リスト。`-` で標準入力から読む（`cut --trim -` と同じ）。省略時はキャッシュの `trim.avs`。
+    #[arg(long)]
+    pub trim: Option<PathBuf>,
+    /// `.dtvi`。省略時はキャッシュの `.dtvi`。
+    #[arg(long)]
+    pub dtvi: Option<PathBuf>,
+    /// チャプター付き mp4 の出力先。隣に同名の `.edl` も書く。
+    #[arg(
+        short,
+        long,
+        required_unless_present = "edl_only",
+        conflicts_with = "edl_only"
+    )]
+    pub output: Option<PathBuf>,
+    /// mp4 を作らず、入力の隣に `<stem>.edl` だけを書く。
+    #[arg(long)]
+    pub edl_only: bool,
 }
 
 /// `review` サブコマンドの引数。

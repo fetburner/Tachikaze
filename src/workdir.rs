@@ -51,6 +51,8 @@ const INPUT_PREPARED_FILE_NAME: &str = "input_prepared.mp4";
 /// `prepare` が作る字幕サイドカーのベース名。拡張子（`ass` / `srt`）は
 /// 抽出元コーデックにより `prepare` 側が決めるため、ここでは持たない。
 const SUBS_BASE_NAME: &str = "subs";
+/// `mark` が書くチャプター（ffmetadata）のファイル名。ffmpeg に `-i` で渡して mp4 に埋め込む。
+const CHAPTERS_FILE_NAME: &str = "chapters.ffmeta";
 
 /// キャッシュディレクトリ名に使う stem の長さ上限（文字数）。
 const SAFE_STEM_MAX_CHARS: usize = 80;
@@ -361,6 +363,11 @@ pub fn cached_detail_jls_path(cache_dir: Option<&Path>, input: &Path) -> Result<
 /// パス規則は [`cached_dtvi_path`] 参照。
 pub fn cached_logoframe_path(cache_dir: Option<&Path>, input: &Path) -> Result<PathBuf> {
     Ok(cache_dir_for_input(cache_dir, input)?.join(LOGOFRAME_FILE_NAME))
+}
+
+/// `mark` が書く ffmetadata（チャプター）のキャッシュパスを返す。パス規則は [`cached_dtvi_path`] 参照。
+pub fn cached_chapters_path(cache_dir: Option<&Path>, input: &Path) -> Result<PathBuf> {
+    Ok(cache_dir_for_input(cache_dir, input)?.join(CHAPTERS_FILE_NAME))
 }
 
 /// `review` が確認画面（`index.html` とサムネイル）を書き出すキャッシュディレクトリを返す。

@@ -19,6 +19,9 @@
 //!   B フレームの並べ替えぶんずれた時刻になる。
 //! - **時刻を秒の浮動小数で持ち回さない。** ffmetadata には pts の整数をそのまま書き、丸め誤差を
 //!   持ち込まない。秒に直すのは EDL を書くときだけ（小数点以下3桁）。
+//! - **時刻系の補正は `markers` の外で行う。** `.dtvi` の時刻系は、その `.dtvi` を作ったファイルに
+//!   elst があるかで決まる。elst 付きの入力と時刻系の違う `.dtvi` の組み合わせは、`run` が
+//!   [`timeline_offset`] で補正量を決めて pts に足してから `markers` に渡す。`markers` は補正を知らない。
 //! - **切らないので境界をキーフレームに丸めない。** 境界は指定どおりのフレームの pts になる。
 //! - **隣接する保持区間は1つにまとめる。** `Trim(0,4) ++ Trim(5,9)` は本編が途切れない1区間
 //!   なので、チャプターも1つにする。本編 / CM の交互列を保つため。
@@ -30,10 +33,21 @@
 //! - Trim の最終フレーム（両端を含む。trim.avs の `Trim(s,e)` の `e`）が `.dtvi` の範囲を超える
 //! - 境界に使うフレームの pts が無効（`has_valid_pts()` が false）
 
+use std::ffi::OsString;
 use std::fmt;
+use std::fs;
+use std::io::{self, Read};
+use std::path::{Path, PathBuf};
 
-use crate::dtvi::Dtvi;
+use anyhow::{anyhow, bail, Context, Result};
+use mp4_atom::Elst;
+
+use crate::analyze::dtvi_frame_count;
+use crate::commands::reject_dash_output;
+use crate::dtvi::{self, Dtvi};
+use crate::errctx::PathContext;
 use crate::trim::TrimList;
+use crate::{external, mp4io, tools, workdir};
 
 /// [`markers`] の出力。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -133,6 +147,361 @@ pub fn markers(trim: &TrimList, dtvi: &Dtvi) -> Result<Markers, MarkerError> {
         ffmetadata,
         cm_count,
     })
+}
+
+/// `mark` の出力先。`-o` と `--edl-only` はどちらか一方だけが来る（clap 側で `output` の `required_unless_present` と `conflicts_with` により保証）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MarkTarget {
+    /// チャプター付き mp4 を書き、その隣に `.edl` を書く。
+    Video(PathBuf),
+    /// mp4 は作らず、入力の隣に `<入力の stem>.edl` だけを書く（再生するのは元の録画）。
+    EdlOnly,
+}
+
+/// [`run`] の入力。`trim` / `dtvi` が `None` のときはキャッシュから解決する。
+/// `trim` が `-` のときは標準入力から読む（`cut --trim -` と同じ）。
+#[derive(Debug, Clone)]
+pub struct MarkConfig {
+    pub input: PathBuf,
+    pub trim: Option<PathBuf>,
+    pub dtvi: Option<PathBuf>,
+    pub cache_dir: Option<PathBuf>,
+    pub target: MarkTarget,
+}
+
+/// [`run`] の結果。`video` は `MarkTarget::Video` のときだけ `Some`。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MarkOutcome {
+    pub video: Option<PathBuf>,
+    pub edl: PathBuf,
+    pub cm_count: usize,
+}
+
+/// `mark` 本体。Trim と `.dtvi` から [`markers`] で EDL と ffmetadata を作り、ファイルに書く。
+///
+/// 書く前に次を検査し、満たさなければ何も書かずに止める（CLAUDE.md 罠3: 別の録画の `.dtvi`
+/// はフレーム数が違えばエラーにしないと時刻が黙ってずれる）:
+/// - `.dtvi` ヘッダの `frame_count` とフレーム表の行数が一致する
+/// - 入力 mp4 の映像サンプル数が `.dtvi` の行数と一致する
+/// - `.dtvi` の先頭フレームの時刻が、入力の時刻系（[`timeline_offset`]）のどちらかと一致する
+/// - `-o` が入力と同じファイルではない（ffmpeg は入力を読みながら出力を書くため、同じだと壊す）
+///
+/// 時刻系の補正（[`timeline_offset`]）は `.dtvi` の pts に足してから [`markers`] に渡す。
+/// EDL は `--edl-only` なら `config.input` の隣、`-o` なら出力の隣に書く（symlink を辿らない）。
+///
+/// mp4 は `-map 0` で全ストリームを残し（字幕を黙って落とさない）、`-c copy` でチャプターだけを
+/// 足す。一時ファイルへ書いてから rename し、失敗した場合は一時ファイルを消す。
+pub fn run(config: &MarkConfig) -> Result<MarkOutcome> {
+    let cache = config.cache_dir.as_deref();
+    let input_identity =
+        fs::canonicalize(&config.input).path_ctx("入力ファイルの絶対パス解決", &config.input)?;
+    let analyze_cmd = || workdir::analyze_command(cache, &config.input);
+
+    let out_path = match &config.target {
+        MarkTarget::Video(out) => {
+            reject_dash_output(out, "-o")?;
+            if output_identity(out)? == input_identity {
+                bail!(
+                    "-o が入力と同じファイルです（元の録画は上書きしません）: {}",
+                    out.display()
+                );
+            }
+            Some(std::path::absolute(out).path_ctx("-o の絶対パス解決", out)?)
+        }
+        MarkTarget::EdlOnly => None,
+    };
+
+    let trim_text = match &config.trim {
+        Some(path) if path == Path::new("-") => {
+            let mut buf = String::new();
+            io::stdin()
+                .read_to_string(&mut buf)
+                .context("trim の標準入力からの読み込みに失敗しました")?;
+            buf
+        }
+        Some(path) => fs::read_to_string(path).path_ctx("trim ファイルの読み込み", path)?,
+        None => {
+            let cached = workdir::cached_trim_path(cache, &config.input)
+                .path_ctx("`trim.avs` の自動解決", &config.input)?;
+            read_cached(&cached, &analyze_cmd)?
+        }
+    };
+    let trim = TrimList::parse(&trim_text)
+        .map_err(|err| anyhow!("trim ファイルのパースに失敗しました: {err}"))?;
+
+    let (dtvi_path, dtvi_text) = match &config.dtvi {
+        Some(path) => (
+            path.clone(),
+            fs::read_to_string(path).path_ctx("`.dtvi` の読み込み", path)?,
+        ),
+        None => {
+            let cached = workdir::cached_dtvi_path(cache, &config.input)
+                .path_ctx("`.dtvi` の自動解決", &config.input)?;
+            let text = read_cached(&cached, &analyze_cmd)?;
+            (cached, text)
+        }
+    };
+    let mut dtvi =
+        dtvi::parse(&dtvi_text).map_err(|err| anyhow!("`.dtvi` のパースに失敗しました: {err}"))?;
+
+    let header = dtvi_frame_count(&dtvi)?;
+    let rows = dtvi.frames.len() as u64;
+    if header != rows {
+        bail!(
+            "mark: .dtvi のヘッダの frame_count（{header}）とフレーム表の行数（{rows}）が一致しません: {}\n\
+             .dtvi が途中で切れている可能性があります。次を実行して作り直してください:\n  {}",
+            dtvi_path.display(),
+            analyze_cmd()
+        );
+    }
+    anyhow::ensure!(
+        !dtvi.frames.is_empty(),
+        "mark: .dtvi にフレームがありません"
+    );
+
+    let moov =
+        mp4io::read::read_moov(&input_identity).path_ctx("入力 mp4 の読み込み", &input_identity)?;
+    let (video_trak, _) = mp4io::read::find_video_track(&moov)
+        .ok_or_else(|| anyhow!("入力に映像トラックがありません: {}", config.input.display()))?;
+    let file_len = fs::metadata(&input_identity)
+        .path_ctx("入力ファイルのサイズ取得", &input_identity)?
+        .len();
+    let samples = mp4io::read::samples(&video_trak.mdia.minf.stbl, file_len)?;
+    if samples.len() != dtvi.frames.len() {
+        bail!(
+            "mark: 入力 mp4 の映像サンプル数（{}）と .dtvi のフレーム数（{}）が一致しません。\
+             別の録画の .dtvi を指定していないか確認してください: {}",
+            samples.len(),
+            dtvi.frames.len(),
+            dtvi_path.display()
+        );
+    }
+
+    let (num, den) = time_base(&dtvi).map_err(|err| anyhow!("mark: {err}"))?;
+    let mdhd_ts = video_trak.mdia.mdhd.timescale;
+    let shift = presentation_shift(
+        video_trak.edts.as_ref().and_then(|e| e.elst.as_ref()),
+        moov.mvhd.timescale,
+        mdhd_ts,
+    )?;
+    let offset = timeline_offset(&TimelineInput {
+        raw_first: raw_first_pts(&samples),
+        shift,
+        mdhd_ts,
+        time_base: (num, den),
+        dtvi_first_pts: dtvi.frames[0].pts,
+    })?;
+    if offset != 0 {
+        for frame in &mut dtvi.frames {
+            frame.pts += offset;
+        }
+    }
+
+    let markers = markers(&trim, &dtvi).map_err(|err| anyhow!("mark: {err}"))?;
+
+    let Some(out) = out_path else {
+        let edl = config.input.with_extension("edl");
+        fs::write(&edl, &markers.edl).path_ctx("EDL の書き出し", &edl)?;
+        return Ok(MarkOutcome {
+            video: None,
+            edl,
+            cm_count: markers.cm_count,
+        });
+    };
+
+    let name = out
+        .file_name()
+        .ok_or_else(|| anyhow!("-o からファイル名を取れません: {}", out.display()))?;
+    let ffmpeg = tools::resolve_tool(tools::FFMPEG)
+        .context("mark: チャプターの埋め込みに ffmpeg が必要です")?;
+
+    let chapters = workdir::cached_chapters_path(cache, &config.input)
+        .path_ctx("チャプターのキャッシュパスの解決", &config.input)?;
+    let chapters_dir = chapters.parent().ok_or_else(|| {
+        anyhow!(
+            "チャプターのキャッシュパスが不正です: {}",
+            chapters.display()
+        )
+    })?;
+    fs::create_dir_all(chapters_dir).path_ctx("キャッシュディレクトリの作成", chapters_dir)?;
+    fs::write(&chapters, &markers.ffmetadata).path_ctx("ffmetadata の書き出し", &chapters)?;
+
+    // 一時ファイルは出力と同じディレクトリに置く（rename を同一ファイルシステム内に保つため）。
+    // 拡張子は .mp4 のまま残す（ffmpeg が出力形式を拡張子で決めるため）。
+    let parent = out
+        .parent()
+        .ok_or_else(|| anyhow!("-o の親ディレクトリが不正です: {}", out.display()))?;
+    let mut tmp_name = OsString::from(".");
+    tmp_name.push(name);
+    tmp_name.push(".tmp.mp4");
+    let tmp = parent.join(tmp_name);
+
+    let mut args: Vec<OsString> = ["-hide_banner", "-loglevel", "error", "-y", "-i"]
+        .iter()
+        .map(OsString::from)
+        .collect();
+    args.push(input_identity.into_os_string());
+    args.extend(["-f", "ffmetadata", "-i"].iter().map(OsString::from));
+    args.push(chapters.clone().into_os_string());
+    args.extend(
+        [
+            "-map",
+            "0",
+            "-map_metadata",
+            "0",
+            "-map_chapters",
+            "1",
+            "-c",
+            "copy",
+        ]
+        .iter()
+        .map(OsString::from),
+    );
+    args.push(tmp.clone().into_os_string());
+    let args_ref: Vec<&std::ffi::OsStr> = args.iter().map(AsRef::as_ref).collect();
+
+    let result = external::run(&ffmpeg, &args_ref, chapters_dir)
+        .and_then(|_| fs::rename(&tmp, &out).path_ctx("出力 mp4 への rename", &out));
+    if let Err(err) = result {
+        let _ = fs::remove_file(&tmp);
+        return Err(err);
+    }
+
+    let edl = out.with_extension("edl");
+    fs::write(&edl, &markers.edl).path_ctx("EDL の書き出し", &edl)?;
+    Ok(MarkOutcome {
+        video: Some(out),
+        edl,
+        cm_count: markers.cm_count,
+    })
+}
+
+/// [`timeline_offset`] の入力。時刻は映像トラックの mdhd timescale 単位（`time_base` 以外）。
+struct TimelineInput {
+    /// デコード順の全サンプルの `dts + cts_offset` の最小値（elst を適用しない composition 時刻）。
+    raw_first: i64,
+    /// [`presentation_shift`] の値。
+    shift: i64,
+    mdhd_ts: u32,
+    /// `.dtvi` ヘッダの `(time_base_num, time_base_den)`。
+    time_base: (i64, i64),
+    /// `.dtvi` の表示順先頭フレームの pts（`.dtvi` の time_base 単位）。
+    dtvi_first_pts: i64,
+}
+
+/// `.dtvi` の時刻系と入力の時刻系の対応を決め、`.dtvi` の pts に足す補正量（`.dtvi` の time_base 単位）を返す。
+///
+/// `.dtvi` の時刻系は、その `.dtvi` を作ったファイルに elst があるかで決まる。elst の無いファイル
+/// （`prepare` 後の `input_prepared.mp4` など）から作った `.dtvi` は elst を適用しない composition 時刻系
+/// （`raw_first`）。elst 付きのファイルから作った `.dtvi` は elst を適用した表示時刻系（`raw_first + shift`）。
+/// 先頭フレームの pts が表示時刻に一致すれば補正は 0。composition 時刻に一致すれば `shift` を足す。
+/// どちらにも一致しなければ、別の録画か別の時刻系の `.dtvi` としてエラーにする。
+///
+/// 一致判定は秒に直して行い、許容幅は入力の mdhd timescale の1ティック（`1/mdhd_ts` 秒）。
+/// 補正量は `shift`（mdhd 単位）を `.dtvi` の time_base 単位に直し、`f64::round`（最も近い整数、
+/// 半分は0から遠ざける）で整数にする。
+fn timeline_offset(input: &TimelineInput) -> Result<i64> {
+    let (num, den) = input.time_base;
+    let ts = i128::from(input.mdhd_ts);
+    let presented = input.raw_first + input.shift;
+    // 先頭 pts（秒 = pts*num/den）と時刻 t（秒 = t/ts）の差が 1/ts 以内か。両辺に den*ts を掛けて整数で比べる。
+    let matches = |t: i64| {
+        let diff = i128::from(input.dtvi_first_pts) * i128::from(num) * ts
+            - i128::from(t) * i128::from(den);
+        diff.abs() <= i128::from(den)
+    };
+    if matches(presented) {
+        Ok(0)
+    } else if matches(input.raw_first) {
+        let offset = input.shift as f64 * den as f64 / (f64::from(input.mdhd_ts) * num as f64);
+        Ok(offset.round() as i64)
+    } else {
+        let secs = |t: i64| t as f64 / f64::from(input.mdhd_ts);
+        bail!(
+            "mark: .dtvi の先頭フレームの時刻（{:.6} 秒）が入力と合いません。\
+             入力の表示時刻は {:.6} 秒、composition 時刻は {:.6} 秒です。\
+             別の録画の .dtvi か、別の時刻系の .dtvi の可能性があります",
+            input.dtvi_first_pts as f64 * num as f64 / den as f64,
+            secs(presented),
+            secs(input.raw_first),
+        )
+    }
+}
+
+/// 映像トラックの、表示順の先頭フレームの composition 時刻（mdhd timescale 単位）。
+///
+/// デコード順のサンプルを、`duration` の累積で dts を求めながら走り、`dts + cts_offset` の最小値を取る。
+fn raw_first_pts(samples: &[mp4io::read::SampleInfo]) -> i64 {
+    let mut dts = 0i64;
+    let mut first = i64::MAX;
+    for sample in samples {
+        first = first.min(dts + sample.cts_offset);
+        dts += i64::from(sample.duration);
+    }
+    first
+}
+
+/// elst による表示のずれ（mdhd timescale 単位）。elst が無ければ 0。
+///
+/// 空エディット（`media_time == None`）の長さ（mvhd timescale）を mdhd timescale に換算して足し、
+/// 最初の media エディット（`Some(m)`）で媒体時刻 `m` を引く。それ以降の空エディットは無視する。
+/// media エディットが無い、または2つ以上ある構成は対応外としてエラーにする（黙って誤った値を出さない）。
+/// mvhd → mdhd の換算は整数除算（切り捨て）。
+fn presentation_shift(elst: Option<&Elst>, mvhd_ts: u32, mdhd_ts: u32) -> Result<i64> {
+    let Some(elst) = elst else {
+        return Ok(0);
+    };
+    anyhow::ensure!(mvhd_ts > 0, "mark: mvhd の timescale が0です");
+    let mut shift = 0i128;
+    let mut media_seen = false;
+    for entry in &elst.entries {
+        match entry.media_time {
+            Some(media_time) if !media_seen => {
+                media_seen = true;
+                shift -= i128::from(media_time);
+            }
+            Some(_) => bail!("mark: elst に media エディットが2つ以上あります（対応外）"),
+            None if !media_seen => {
+                shift +=
+                    i128::from(entry.segment_duration) * i128::from(mdhd_ts) / i128::from(mvhd_ts);
+            }
+            None => {}
+        }
+    }
+    anyhow::ensure!(
+        media_seen,
+        "mark: elst に media エディットがありません（対応外）"
+    );
+    Ok(i64::try_from(shift)?)
+}
+
+/// `-o` の比較用の絶対パス。存在するなら正規化し、無ければ親ディレクトリを正規化してファイル名を足す。
+fn output_identity(out: &Path) -> Result<PathBuf> {
+    if out.exists() {
+        return fs::canonicalize(out).path_ctx("-o の絶対パス解決", out);
+    }
+    let parent = match out.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    let parent = fs::canonicalize(parent).path_ctx("-o の親ディレクトリの解決", parent)?;
+    let name = out
+        .file_name()
+        .ok_or_else(|| anyhow!("-o からファイル名を取れません: {}", out.display()))?;
+    Ok(parent.join(name))
+}
+
+/// キャッシュのファイルを読む。無ければ `analyze` のコマンド例を添えて止める。
+fn read_cached(path: &Path, analyze_cmd: &dyn Fn() -> String) -> Result<String> {
+    if !path.is_file() {
+        bail!(
+            "キャッシュに必要なファイルが見つかりませんでした: {}\n\
+             先に次を実行してください:\n  {}",
+            path.display(),
+            analyze_cmd()
+        );
+    }
+    fs::read_to_string(path).path_ctx("キャッシュファイルの読み込み", path)
 }
 
 /// `.dtvi` ヘッダから time_base を整数で読む。0 以下は不正とする。
@@ -431,5 +800,69 @@ mod tests {
             markers(&trim("Trim(3,9)"), &dtvi),
             Err(MarkerError::InvalidPts { frame_number: 3 })
         );
+    }
+
+    #[test]
+    fn timeline_alignment_decides_shift_from_elst_and_first_pts() {
+        // elst: 空エディット 67ms（mvhd 1000）→ 媒体時刻 2002（mdhd 30000）の media エディット。
+        // 空エディットは 67 * 30000 / 1000 = 2010 ティック、media 2002 を引くと shift = 8。
+        let elst = mp4_atom::Elst {
+            entries: vec![
+                mp4_atom::ElstEntry {
+                    segment_duration: 67,
+                    media_time: None,
+                    ..Default::default()
+                },
+                mp4_atom::ElstEntry {
+                    segment_duration: 0,
+                    media_time: Some(2002),
+                    ..Default::default()
+                },
+            ],
+        };
+        assert_eq!(presentation_shift(Some(&elst), 1000, 30000).unwrap(), 8);
+        assert_eq!(presentation_shift(None, 1000, 30000).unwrap(), 0);
+
+        // raw 先頭 2002、表示先頭 2010。
+        let input = |dtvi_first_pts| TimelineInput {
+            raw_first: 2002,
+            shift: 8,
+            mdhd_ts: 30000,
+            time_base: (1, 30000),
+            dtvi_first_pts,
+        };
+        assert_eq!(
+            timeline_offset(&input(2010)).unwrap(),
+            0,
+            "表示時刻に一致すれば補正なし"
+        );
+        assert_eq!(
+            timeline_offset(&input(2002)).unwrap(),
+            8,
+            "composition 時刻なら shift を足す"
+        );
+        assert!(
+            timeline_offset(&input(2012)).is_err(),
+            "1ティックを超えて外れたら止まる"
+        );
+
+        let samples = [
+            mp4io::read::SampleInfo {
+                file_offset: 0,
+                size: 0,
+                duration: 1001,
+                cts_offset: 1001,
+                is_sync: true,
+            },
+            mp4io::read::SampleInfo {
+                file_offset: 0,
+                size: 0,
+                duration: 1001,
+                cts_offset: -1001,
+                is_sync: false,
+            },
+        ];
+        // 1 本目 cts = 0 + 1001、2 本目 cts = 1001 - 1001 = 0。最小は 0。
+        assert_eq!(raw_first_pts(&samples), 0);
     }
 }

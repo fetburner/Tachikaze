@@ -19,6 +19,7 @@
 | `auto` | `prepare`→`analyze`→gate→`cut`→`remap-subs` を対話なしで合成 |
 | `make-logo` | 入力とロゴ矩形から `.lgd`（ロゴデータ）を作る |
 | `review` | `analyze` のキャッシュから、CM 検出結果を確認・修正する HTML（キーフレームのサムネイル付き）を作る。`analyze` も `prepare` も走らせない |
+| `mark` | 録画を切らず、CM 区間の位置を `.edl`（Kodi 形式）と、チャプターを足した mp4 に書き出す |
 
 各コマンドの入力は1本。繰り返しはシェルのループに任せる（下記「auto」参照）。手順番号はコマンドごとに 1 から振り、他所からは「cut の手順6」のように参照する。
 
@@ -179,6 +180,40 @@ tachikaze review IN.mp4 [-o OUT.mp4] [--cache-dir DIR]
 
 実測は [measurements.md](measurements.md)「確認画面（review）のサムネイルと時刻」。
 
+### mark
+
+```
+tachikaze mark IN.mp4 [--trim trim.avs|-] [--dtvi X.dtvi] [--cache-dir DIR] (-o OUT.mp4 | --edl-only)
+```
+
+録画を切らず、CM 区間の位置だけを残す。プレイヤーで CM を飛ばすための情報を作る。`-o` と `--edl-only` はどちらか一方が必須。
+
+- `-o OUT.mp4`: 入力の全ストリームを `-map 0` で残し、`-c copy` でチャプターを足した mp4 を作る。映像・音声は再エンコードしない。チャプターは本編 / CM の交互列
+- **出力に章トラックが1本増える**。ffmpeg の mp4 muxer はチャプターを QuickTime のテキストトラック（ffprobe では `codec_type` が `data`）としても書く。入力の映像・音声・字幕のパケットは CRC32 で一致するので、増えるのはこの1本だけ。`mark` は入力のストリーム数を保つ方針だったが、この差は避けられないため受け入れた（`tests/mark_e2e.rs` は増えた1本が末尾の `data` であることを確かめて比較から外す）
+- `--edl-only`: mp4 は作らず、入力の隣に `<入力の stem>.edl` だけを書く。再生するのは元の録画なので、EDL もその隣に置く必要がある
+- CM 区間は `3`（commercial break）で EDL に示す。Kodi は再生する動画と同名の `.edl` を読むため、`-o` の出力の隣、または `--edl-only` の入力の隣に置く。EDL の位置は symlink を辿らず、指定されたパスの隣に置く
+- `--trim` / `--dtvi` を省略すると、キャッシュの `trim.avs` / `work.mp4.dtvi` を使う。無ければ `analyze` の実行例を添えて止まる。`--trim -` は標準入力から読む
+- 時刻の決め方は `src/marker.rs` のモジュール doc comment に従う。境界は `.dtvi` の**表示順**フレームの pts（デコード順で引くと B フレームぶんずれる、罠3）。キーフレームへの丸めはしない。切らないので、`cut` のような境界ごとの残り（2.1〜2.5 秒）は生じない
+- チャプターの START / END は pts の整数のまま ffmetadata に書き、muxer の timescale に丸められる。実測（`sample.mp4` の5境界）では ffprobe の表示精度（1/240000 s）の範囲で一致した（`tests/mark_e2e.rs`）
+- **時刻系の補正（elst）**: `.dtvi` の時刻系は、その `.dtvi` を作ったファイルに elst があるかで決まる。
+  elst の無いファイル（`prepare` 後の `input_prepared.mp4` など）から作った `.dtvi` は composition 時刻系になる。
+  elst 付きのファイル（`analyze` にそのまま渡した場合を含む）から作った `.dtvi` は表示時刻系になる（`dtvindex` が表示時刻を返すため）。
+  `mark` は入力の elst から表示のずれ（`shift`、空エディットの長さから最初の media エディットの媒体時刻を引いたもの）を求める。
+  そのうえで、`.dtvi` の先頭フレームの pts がどちらの時刻系に一致するかで補正量を決める（`src/marker.rs::timeline_offset`）。
+  どちらにも一致しなければ、別の録画か別の時刻系の `.dtvi` としてエラーにする。補正量は `.dtvi` の全 pts に足す。
+  - 理由: `-c copy` の出力は elst を適用した時刻で再生される。補正しないとチャプターと EDL が実フレームより遅れる。
+  実測（`sample_elst.mp4` + `sample_no_logo.dtvi`）では、補正前のチャプターが 2.068733 / 10.076733 / 14.080733 / 18.084733 秒だった。
+  Trim は `Trim(60,299) ++ Trim(420,539)`。
+  出力の表示順フレーム 60/300/420/540 の pts は 2.002 / 10.010 / 14.014 / 18.018 秒で、チャプターは 67 ms（2 フレーム）遅れていた。エラーは出なかった。
+  補正後は両者が一致する。`prepare` 後の `.dtvi` を渡す運用（元の録画に対して `mark` する）ではこのずれが必ず起きる。
+  - 一致判定の許容幅は入力の mdhd timescale の1ティック（`1/mdhd_ts` 秒）。補正量は `.dtvi` の time_base に換算して `f64::round` で整数にする
+  - 対応外（エラー）: media エディットが0個または2個以上の elst
+- 書く前に次を検査し、満たさなければ何も書かずに止まる。`.dtvi` のヘッダの `frame_count` と行数、入力の映像サンプル数と `.dtvi` の行数、先頭フレームの時刻が入力の時刻系と一致すること、`-o` が入力と同じファイルでないこと。`.dtvi` は入力と対応するかを検査しないと分からない（別の録画の `.dtvi` でも時刻が黙ってずれる）
+- mp4 は出力と同じディレクトリの一時ファイルへ書いてから rename する。ffmpeg が失敗したら一時ファイルを消す。元の録画は読むだけで変更しない
+- チャプターの ffmetadata はキャッシュの `chapters.ffmeta` に残る
+
+**なぜ切らないのか**: 元の録画を残したまま、プレイヤーで CM を飛ばせるようにするため。`cut` は別ファイルを作るが、`mark` は元の録画の位置情報だけを増やす。
+
 ### exit code
 
 | code | 意味 |
@@ -235,10 +270,11 @@ tachikaze review IN.mp4 [-o OUT.mp4] [--cache-dir DIR]
 - `work.mp4.segmap.json` — `cut` が書く区間マップ（`src/segmap.rs`、`workdir::cached_segment_map_path`）。`cut --segment-map PATH` で任意の場所にも書ける
 - `input_prepared.mp4` — `prepare` が elst 除去・字幕除去後に書く前処理済み入力（`src/prepare.rs`、`workdir::prepared_input_path`）
 - `subs.ass` / `subs.srt` — `prepare` が mp4 内蔵字幕トラックから抽出した字幕サイドカー。`remap-subs` の入力（`workdir::subs_path`）
+- `chapters.ffmeta` — `mark -o` が書く ffmetadata（チャプター）。ffmpeg に渡して mp4 に埋め込む（`workdir::cached_chapters_path`）
 
 **蓄積データ**（`src/logo/dict.rs`）。学習済み `.lgd` を貯める辞書ディレクトリ。既定は `$XDG_DATA_HOME/tachikaze/logos`。`XDG_DATA_HOME` が未設定または空文字列なら `<ホームディレクトリ>/.local/share/tachikaze/logos` になる（`dict::resolve_dict_dir`）。キャッシュとは別分類にした理由、環境変数を読む理由は下記「なぜこの形にしたか」参照。
 
-**出力**。`cut -o` / `auto -o`（本編、必須）と `--cm-output`（CM側、`auto` は指定時のみ）はすべて明示指定させる。例外は2つ。`remap-subs` を単体で使うときだけ、入力の隣に `*_CMcut.ass` / `*_CMcut.srt` を既定で置く（`src/commands.rs::default_remap_subs_output_path`）。`auto` の字幕サイドカーは `-o` と同じ stem・別拡張子で書く（`src/auto.rs::subs_sidecar_path`。本編出力と揃えることでプレイヤーが自動で字幕を読み込める）。
+**出力**。`cut -o` / `auto -o`（本編、必須）と `--cm-output`（CM側、`auto` は指定時のみ）はすべて明示指定させる。`mark -o` も明示指定させる。`mark --edl-only` は例外で、入力の隣に `<stem>.edl` を書く（Kodi が再生する動画と同名の EDL を探すため、EDL は再生する録画の隣になければならない）。その他の例外は2つ。`remap-subs` を単体で使うときだけ、入力の隣に `*_CMcut.ass` / `*_CMcut.srt` を既定で置く（`src/commands.rs::default_remap_subs_output_path`）。`auto` の字幕サイドカーは `-o` と同じ stem・別拡張子で書く（`src/auto.rs::subs_sidecar_path`。本編出力と揃えることでプレイヤーが自動で字幕を読み込める）。
 
 なぜこの形にしたか:
 
@@ -387,7 +423,6 @@ TOKYO MX の ED 区間（90秒）は、ロゴ自体は出ているのに段差�
 
 ## 将来的な拡張候補
 
-- **チャプター出力**: dtvindex に `create_join_logo_scp_chapters` があるのでそれを呼ぶだけ
 - **局別 JL ファイルの選択**: 現状は `JL_標準.txt` 既定（`--jl-file` で差し替えは可能）
 
 ## モジュール構成
@@ -422,6 +457,7 @@ TOKYO MX の ED 区間（90秒）は、ロゴ自体は出ているのに段差�
 | `audio.rs` | 音声パケットの選択（区間のソース時刻から引き当て） | [lossless-cut.md](lossless-cut.md) |
 | `verify.rs` | 自己検証 | 下記「自己検証」 |
 | `segmap.rs` | `cut` が書く区間マップ（snap 後の境界と出力タイムライン上の開始時刻）の構造体、JSON への書き出しと読み込み | 上記「cut」手順8 |
+| `marker.rs` | `mark` 本体: Trim と `.dtvi` から EDL と ffmetadata を作る純関数（`markers`）と、入力の検査・ffmpeg によるチャプター埋め込み・EDL の書き出し（`run`） | 上記「mark」 |
 | `review.rs` | `review` 本体: キャッシュから確認画面（`index.html` とサムネイル）を作る。画面に埋める区間は表示順フレーム番号の半開区間。データの組み立て（純粋関数）と ffmpeg・ファイル書き出しを分ける。mp4 は読まず、フレームの情報はすべて `.dtvi` から取る。確認画面のテンプレートは `src/review.html` | 上記「review」 |
 | `subtitle.rs` | `remap-subs` 本体: ASS/SRT の Start/End を区間マップの区分的な線形写像で張り替える（シフト/破棄/クリップの分類、丸め方向） | 上記「remap-subs」 |
 | `logo/lgd.rs` | Amatsukaze 形式ロゴデータ `.lgd`（AviUtl 互換のベース部 + Amatsukaze 独自の float 部）の読み込み | [cm-detection.md](cm-detection.md) |
